@@ -1,0 +1,20 @@
+{
+  "name": "cutroom",
+  "version": "0.1.0",
+  "description": "A small video editor that does five things well and nothing else.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder",
+    "test": "node --test test/*.test.js"
+  },
+  "author": "Holiday Malepe",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^32.0.0"
+  },
+  "build": {
+    "appId": "com.holiday.cutroom",
+    "files": ["main.js", "preload.js", "shared/**", "src/**", "package.json"]
+  }
+}
