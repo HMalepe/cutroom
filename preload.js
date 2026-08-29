@@ -15,10 +15,13 @@ contextBridge.exposeInMainWorld('cutroom', {
   grabFrame: (filePath, atSec) => ipcRenderer.invoke('media:frame', { filePath, atSec }),
 
   // Drag-and-drop gives a File object, not a path. webUtils gets us the real
-  // path on disk, which is what ffmpeg needs.
+  // path on disk, which is what ffmpeg needs. It throws rather than returning
+  // empty for anything that is not a real File — a dragged directory, or a
+  // drag that came from a web page — so the catch is what keeps a stray drop
+  // from breaking the handler.
   pathForFile: (file) => {
     try { return webUtils.getPathForFile(file); }
-    catch { return file.path || null; }
+    catch { return null; }
   },
 
   previewCommand: (project) => ipcRenderer.invoke('export:preview-command', project),

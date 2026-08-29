@@ -6,7 +6,9 @@ timeline, ffmpeg does every frame of the actual work.
 
 ## Running it
 
-You need Node 18+ and ffmpeg.
+You need Node 22.12+ and ffmpeg. (Electron 44 fetches its binary through
+`@electron/get`, which is ESM-only, so `npm start` needs a Node that can
+`require()` an ES module — 22.12 is where that landed.)
 
 ```bash
 # ffmpeg
@@ -45,7 +47,7 @@ events. The second kind is what stops the undo wiring rotting when someone
 adds an edit and forgets to record it.
 
 Nothing here launches Electron or shells out to ffmpeg, so the suite runs in a
-couple of seconds. CI runs it on Node 18, 22 and 24.
+couple of seconds. CI runs it on Node 22.12, 22 and 24.
 
 ## What it does
 
