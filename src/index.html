@@ -18,6 +18,11 @@
     <button class="btn btn-sm btn-ghost" id="btnOpen">Open</button>
     <button class="btn btn-sm btn-ghost" id="btnSave">Save</button>
 
+    <span class="topbar-rule"></span>
+
+    <button class="btn btn-sm btn-ghost" id="btnUndo" disabled>Undo</button>
+    <button class="btn btn-sm btn-ghost" id="btnRedo" disabled>Redo</button>
+
     <span class="topbar-spacer"></span>
 
     <span class="env-pill" id="envPill" title="ffmpeg does the actual encoding">
@@ -213,6 +218,7 @@
 
 <div class="toast-stack" id="toasts"></div>
 
+<script src="history.js"></script>
 <script src="templates.js"></script>
 <script src="app.js"></script>
 </body>

@@ -93,6 +93,14 @@ button { cursor: pointer; }
 
 .topbar-spacer { flex: 1; }
 
+/* Separates the destructive-ish file actions from undo/redo. */
+.topbar-rule {
+  width: 1px;
+  height: 16px;
+  background: var(--line);
+  margin: 0 2px;
+}
+
 .env-pill {
   display: flex;
   align-items: center;
@@ -119,7 +127,9 @@ button { cursor: pointer; }
   color: var(--ink-mid);
   transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
 }
-.btn:hover { background: var(--line); color: var(--ink); }
+/* Hovers are scoped away from :disabled throughout, so a greyed-out Undo or
+   an Export mid-render stays inert under the cursor instead of lighting up. */
+.btn:hover:not(:disabled) { background: var(--line); color: var(--ink); }
 .btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .btn-primary {
@@ -128,10 +138,10 @@ button { cursor: pointer; }
   color: #221703;
   font-weight: 600;
 }
-.btn-primary:hover { background: #ffb84a; border-color: #ffb84a; color: #221703; }
+.btn-primary:hover:not(:disabled) { background: #ffb84a; border-color: #ffb84a; color: #221703; }
 
 .btn-ghost { background: transparent; }
-.btn-ghost:hover { background: var(--panel-high); }
+.btn-ghost:hover:not(:disabled) { background: var(--panel-high); }
 
 .btn-sm { padding: 3px 7px; font-size: 11px; }
 .btn-danger:hover { background: var(--rose); border-color: var(--rose); color: #1a0d0d; }

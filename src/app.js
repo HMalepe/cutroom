@@ -160,6 +160,125 @@ function trackTail(track) {
 }
 
 // ==========================================================================
+// Undo / redo
+// ==========================================================================
+
+/*
+ * What a snapshot covers is a judgement about what an undo should feel like.
+ *
+ * The project is in, obviously. Selection is in too: undoing a delete that
+ * does not give you the clip back selected feels like it only half worked.
+ *
+ * Everything else is deliberately out. The media bin is not an edit — undoing
+ * a trim should not un-import a file. Playhead, zoom and beat-snap are where
+ * you are looking, not what you have made; rewinding them under the user is
+ * disorienting rather than helpful.
+ */
+const history = createHistory({
+  read: () => ({
+    project: state.project,
+    selectedClipId: state.selectedClipId
+  }),
+  write: (snap) => {
+    state.project = snap.project;
+    state.selectedClipId = snap.selectedClipId;
+    // A restored project can be shorter than where the playhead was left.
+    state.playhead = Math.min(state.playhead, Math.max(projectDuration(), 0));
+    syncProjectInputs();
+    renderAll();
+    renderCaptions();
+    renderCaptionStyle();
+    renderTemplates();
+  },
+  limit: 100
+});
+
+/** Convenience for the common case: one discrete edit, one undo entry. */
+function edit(label, fn) {
+  history.run(label, fn);
+  updateHistoryButtons();
+}
+
+/**
+ * The project panel and caption checkbox are plain HTML inputs rather than
+ * re-rendered markup, so they need pushing back into sync after an undo.
+ */
+function syncProjectInputs() {
+  const p = state.project;
+  $('projectName').value = p.name || 'untitled';
+  $('projW').value = p.width;
+  $('projH').value = p.height;
+  $('projFps').value = p.fps;
+  $('projBpm').value = p.bpm;
+  $('projPreset').value = p.preset || 'medium';
+  $('capEnabled').checked = Boolean(p.captionsEnabled);
+}
+
+function updateHistoryButtons() {
+  const u = $('btnUndo');
+  const r = $('btnRedo');
+  u.disabled = !history.canUndo();
+  r.disabled = !history.canRedo();
+  u.title = history.canUndo() ? `Undo ${history.undoLabel()}` : 'Nothing to undo';
+  r.title = history.canRedo() ? `Redo ${history.redoLabel()}` : 'Nothing to redo';
+}
+
+/**
+ * Undo feedback replaces itself instead of stacking. Naming the edit is
+ * useful — an undo whose effect is off-screen otherwise looks like nothing
+ * happened — but holding the shortcut down would otherwise bury the window
+ * in a column of near-identical toasts.
+ */
+let lastHistoryToast = null;
+function historyToast(msg, kind = 'ok') {
+  if (lastHistoryToast) lastHistoryToast.remove();
+  const el = document.createElement('div');
+  el.className = `toast ${kind}`;
+  el.textContent = msg;
+  $('toasts').appendChild(el);
+  lastHistoryToast = el;
+  setTimeout(() => {
+    el.remove();
+    if (lastHistoryToast === el) lastHistoryToast = null;
+  }, 2500);
+}
+
+/*
+ * Both of these close any edit still open first. Pressing undo halfway
+ * through typing a caption should undo that typing, not skip over it to the
+ * edit before — and without the commit, the half-finished edit would be lost
+ * silently rather than recorded.
+ */
+function doUndo() {
+  history.commit();
+  const label = history.undo();
+  updateHistoryButtons();
+  historyToast(label ? `Undid ${label}.` : 'Nothing left to undo.', label ? 'ok' : 'warn');
+}
+
+function doRedo() {
+  history.commit();
+  const label = history.redo();
+  updateHistoryButtons();
+  historyToast(label ? `Redid ${label}.` : 'Nothing to redo.', label ? 'ok' : 'warn');
+}
+
+/**
+ * Wire a control whose value changes continuously — a slider, or a text box
+ * typed into character by character — so the whole gesture becomes one entry.
+ *
+ * Grabbing the control opens the edit; releasing it or leaving the field
+ * closes it. If the value ends up where it started, commit discards it.
+ */
+function trackContinuous(el, label) {
+  el.addEventListener('pointerdown', () => history.begin(label));
+  el.addEventListener('focus', () => history.begin(label));
+  el.addEventListener('change', () => { history.commit(); updateHistoryButtons(); });
+  el.addEventListener('blur', () => { history.commit(); updateHistoryButtons(); });
+  return el;
+}
+
+// ==========================================================================
 // Environment
 // ==========================================================================
 
@@ -250,21 +369,23 @@ function sendToTrack(trackId) {
   if (!track) return;
   if (!state.binSelection.length) { toast('Select something in the bin first.', 'warn'); return; }
 
-  let cursor = trackTail(track);
-  for (const p of state.binSelection) {
-    const media = state.bin.find(m => m.path === p);
-    if (!media) continue;
-    if (track.kind === 'audio' && !media.hasAudio) {
-      toast(`${media.name} has no audio stream.`, 'warn');
-      continue;
+  edit('add clips', () => {
+    let cursor = trackTail(track);
+    for (const p of state.binSelection) {
+      const media = state.bin.find(m => m.path === p);
+      if (!media) continue;
+      if (track.kind === 'audio' && !media.hasAudio) {
+        toast(`${media.name} has no audio stream.`, 'warn');
+        continue;
+      }
+      const clip = makeClip(media, cursor);
+      // On a video track, a clip's own audio is on by default. On an audio
+      // track only the audio matters.
+      if (track.kind === 'audio') clip.hasVideo = false;
+      track.clips.push(clip);
+      cursor = clipEnd(clip);
     }
-    const clip = makeClip(media, cursor);
-    // On a video track, a clip's own audio is on by default. On an audio track
-    // only the audio matters.
-    if (track.kind === 'audio') clip.hasVideo = false;
-    track.clips.push(clip);
-    cursor = clipEnd(clip);
-  }
+  });
   state.binSelection = [];
   renderBin();
   renderAll();
@@ -305,13 +426,13 @@ function renderHeads() {
     mute.className = 'chip' + (track.muted ? ' on' : '');
     mute.textContent = 'M';
     mute.title = 'Mute this track in the export';
-    mute.onclick = () => { track.muted = !track.muted; renderAll(); };
+    mute.onclick = () => { edit('mute', () => { track.muted = !track.muted; }); renderAll(); };
 
     const hide = document.createElement('button');
     hide.className = 'chip' + (track.hidden ? ' on' : '');
     hide.textContent = 'H';
     hide.title = 'Hide this track in the export';
-    hide.onclick = () => { track.hidden = !track.hidden; renderAll(); };
+    hide.onclick = () => { edit('hide track', () => { track.hidden = !track.hidden; }); renderAll(); };
 
     btns.append(mute);
     if (track.kind === 'video') btns.append(hide);
@@ -464,6 +585,9 @@ $('tlScroll').addEventListener('pointerdown', (e) => {
   loadPreview(clip.src);
 
   const handle = e.target.dataset.handle;
+  // Opened whether or not the pointer ends up moving. A click that only
+  // selects a clip leaves the project untouched, and commit drops it.
+  history.begin(handle ? 'trim' : 'move');
   drag = {
     mode: handle || 'move',
     id,
@@ -513,7 +637,8 @@ function endDrag(e) {
   drag = null;
   document.querySelectorAll('.clip.dragging').forEach(el => el.classList.remove('dragging'));
 
-  // Dropping a clip onto a different lane moves it between tracks.
+  // Dropping a clip onto a different lane moves it between tracks. This is
+  // part of the same gesture as the drag, so it lands in the same undo entry.
   if (wasMove && e) {
     const lane = document.elementFromPoint(e.clientX, e.clientY)?.closest('.track-lane');
     if (lane) {
@@ -528,6 +653,8 @@ function endDrag(e) {
       }
     }
   }
+  history.commit();
+  updateHistoryButtons();
   renderAll();
 }
 
@@ -548,18 +675,20 @@ function splitAtPlayhead() {
     return;
   }
 
-  // Convert timeline position back into source position through the speed.
-  const offsetIntoClip = (t - clip.startSec) * (clip.speed || 1);
-  const cutPoint = clip.inSec + offsetIntoClip;
+  edit('split', () => {
+    // Convert timeline position back into source position through the speed.
+    const offsetIntoClip = (t - clip.startSec) * (clip.speed || 1);
+    const cutPoint = clip.inSec + offsetIntoClip;
 
-  const right = { ...clip, id: uid('c'), inSec: cutPoint, startSec: t, fadeIn: 0 };
-  right.chroma = { ...clip.chroma };
-  right.filters = { ...clip.filters };
-  clip.outSec = cutPoint;
-  clip.fadeOut = 0;
+    const right = { ...clip, id: uid('c'), inSec: cutPoint, startSec: t, fadeIn: 0 };
+    right.chroma = { ...clip.chroma };
+    right.filters = { ...clip.filters };
+    clip.outSec = cutPoint;
+    clip.fadeOut = 0;
 
-  track.clips.push(right);
-  state.selectedClipId = right.id;
+    track.clips.push(right);
+    state.selectedClipId = right.id;
+  });
   renderAll();
 }
 
@@ -568,9 +697,11 @@ function setInAtPlayhead() {
   if (!clip) return;
   const t = state.playhead;
   if (t <= clip.startSec || t >= clipEnd(clip)) { toast('Playhead is outside the clip.', 'warn'); return; }
-  const offset = (t - clip.startSec) * (clip.speed || 1);
-  clip.inSec += offset;
-  clip.startSec = t;
+  edit('set in', () => {
+    const offset = (t - clip.startSec) * (clip.speed || 1);
+    clip.inSec += offset;
+    clip.startSec = t;
+  });
   renderAll();
 }
 
@@ -579,24 +710,30 @@ function setOutAtPlayhead() {
   if (!clip) return;
   const t = state.playhead;
   if (t <= clip.startSec || t >= clipEnd(clip)) { toast('Playhead is outside the clip.', 'warn'); return; }
-  clip.outSec = clip.inSec + (t - clip.startSec) * (clip.speed || 1);
+  edit('set out', () => {
+    clip.outSec = clip.inSec + (t - clip.startSec) * (clip.speed || 1);
+  });
   renderAll();
 }
 
 function deleteSelected() {
   const { clip, track } = findClip(state.selectedClipId);
   if (!clip) return;
-  track.clips = track.clips.filter(c => c.id !== clip.id);
-  state.selectedClipId = null;
+  edit('delete', () => {
+    track.clips = track.clips.filter(c => c.id !== clip.id);
+    state.selectedClipId = null;
+  });
   renderAll();
 }
 
 function closeGaps() {
   const { track } = findClip(state.selectedClipId);
   const target = track || state.project.tracks[0];
-  const sorted = [...target.clips].sort((a, b) => a.startSec - b.startSec);
-  let cursor = 0;
-  for (const c of sorted) { c.startSec = cursor; cursor = clipEnd(c); }
+  edit('close gaps', () => {
+    const sorted = [...target.clips].sort((a, b) => a.startSec - b.startSec);
+    let cursor = 0;
+    for (const c of sorted) { c.startSec = cursor; cursor = clipEnd(c); }
+  });
   renderAll();
 }
 
@@ -610,6 +747,9 @@ function field(labelText, control) {
   const l = document.createElement('label');
   l.className = 'field-label';
   l.textContent = labelText;
+  // Every field wraps a control that writes into the project, so undo tracking
+  // belongs here rather than repeated at each of the twenty-odd call sites.
+  trackContinuous(control, labelText.toLowerCase());
   wrap.append(l, control);
   return wrap;
 }
@@ -635,6 +775,8 @@ function slider(labelText, value, min, max, step, format, onInput) {
     val.textContent = format(v);
     onInput(v);
   };
+  // A slider drag is one edit, however many input events it fires.
+  trackContinuous(input, labelText.split('—')[0].trim().toLowerCase());
   row.append(input, val);
   wrap.append(l, row);
   return wrap;
@@ -690,7 +832,7 @@ function renderInspector() {
     const b = document.createElement('button');
     b.className = 'chip' + (clip.speed === s ? ' on' : '');
     b.textContent = s + '×';
-    b.onclick = () => { clip.speed = s; renderAll(); };
+    b.onclick = () => { edit('speed', () => { clip.speed = s; }); renderAll(); };
     chips.appendChild(b);
   }
   speedWrap.append(sl, chips);
@@ -736,7 +878,7 @@ function renderInspector() {
   cb.type = 'checkbox';
   cb.id = 'chromaOn';
   cb.checked = clip.chroma.on;
-  cb.onchange = () => { clip.chroma.on = cb.checked; renderAll(); };
+  cb.onchange = () => { edit('key', () => { clip.chroma.on = cb.checked; }); renderAll(); };
   const cl = document.createElement('label');
   cl.htmlFor = 'chromaOn';
   cl.textContent = 'Key out background';
@@ -786,7 +928,7 @@ function renderInspector() {
       const y = Math.floor((e.clientY - rect.top) * (canvas.height / rect.height));
       const [r, g, b] = canvas.getContext('2d').getImageData(x, y, 1, 1).data;
       const hex = '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
-      clip.chroma.color = hex;
+      edit('key colour', () => { clip.chroma.color = hex; });
       colour.value = hex;
       pick.textContent = `Sampled ${hex} — pick again`;
       scheduleCommandPreview();
@@ -903,7 +1045,7 @@ function renderCaptionStyle() {
   bcb.type = 'checkbox';
   bcb.id = 'capBg';
   bcb.checked = st.background;
-  bcb.onchange = () => { st.background = bcb.checked; renderCaptionStyle(); };
+  bcb.onchange = () => { edit('caption box', () => { st.background = bcb.checked; }); renderCaptionStyle(); };
   const bl = document.createElement('label');
   bl.htmlFor = 'capBg';
   bl.textContent = 'Box behind text';
@@ -958,6 +1100,8 @@ function renderCaptions() {
     end.className = 'cap-time';
     end.value = cap.end.toFixed(2);
     end.onchange = () => { cap.end = Number(end.value) || 0; renderCaptions(); };
+    trackContinuous(start, 'caption timing');
+    trackContinuous(end, 'caption timing');
     times.append(start, end);
 
     const text = document.createElement('textarea');
@@ -965,12 +1109,15 @@ function renderCaptions() {
     text.rows = 1;
     text.value = cap.text;
     text.oninput = () => { cap.text = text.value; };
+    // A whole burst of typing collapses into one entry, closed on blur —
+    // undo per keystroke would take a dozen presses to clear one line.
+    trackContinuous(text, 'caption text');
 
     const del = document.createElement('button');
     del.className = 'chip';
     del.textContent = '×';
     del.title = 'Remove this line';
-    del.onclick = () => { caps.splice(i, 1); renderCaptions(); };
+    del.onclick = () => { edit('remove caption', () => { caps.splice(i, 1); }); renderCaptions(); };
 
     row.append(times, text, del);
     list.appendChild(row);
@@ -986,15 +1133,17 @@ async function transcribeSelected() {
   const res = await api.transcribe(source, 'auto');
   if (!res.ok) { toast('Transcription failed', 'err', res.error); return; }
 
-  // Whisper timestamps are relative to the source file. If the clip starts
-  // later on the timeline, shift them so the captions land in the right place.
-  const shift = clip ? (clip.startSec - clip.inSec / (clip.speed || 1)) : 0;
-  state.project.captions = res.captions.map(c => ({
-    start: Math.max(0, c.start / (clip?.speed || 1) + shift),
-    end: Math.max(0, c.end / (clip?.speed || 1) + shift),
-    text: c.text
-  }));
-  state.project.captionsEnabled = true;
+  edit('transcribe', () => {
+    // Whisper timestamps are relative to the source file. If the clip starts
+    // later on the timeline, shift them so captions land in the right place.
+    const shift = clip ? (clip.startSec - clip.inSec / (clip.speed || 1)) : 0;
+    state.project.captions = res.captions.map(c => ({
+      start: Math.max(0, c.start / (clip?.speed || 1) + shift),
+      end: Math.max(0, c.end / (clip?.speed || 1) + shift),
+      text: c.text
+    }));
+    state.project.captionsEnabled = true;
+  });
   $('capEnabled').checked = true;
   renderCaptions();
   toast(`${res.captions.length} caption lines. Edit the timings below if any drift.`);
@@ -1044,8 +1193,10 @@ function renderTemplates() {
     apply.onclick = () => {
       const track = state.project.tracks[0];
       if (!track.clips.length) { toast('Put some clips on Video 1 first.', 'warn'); return; }
-      const sorted = [...track.clips].sort((a, b) => a.startSec - b.startSec);
-      track.clips = applyTemplate(tpl, sorted, state.project.bpm);
+      edit(tpl.name, () => {
+        const sorted = [...track.clips].sort((a, b) => a.startSec - b.startSec);
+        track.clips = applyTemplate(tpl, sorted, state.project.bpm);
+      });
       renderAll();
       toast(`${tpl.name} applied to ${track.clips.length} clips.`);
     };
@@ -1164,23 +1315,31 @@ $('btnZoomOut').onclick = () => { state.pxPerSec = clamp(state.pxPerSec / 1.4, 4
 $('snapBeats').onchange = (e) => { state.snapBeats = e.target.checked; renderTimeline(); };
 
 // Captions
-$('capEnabled').onchange = (e) => { state.project.captionsEnabled = e.target.checked; scheduleCommandPreview(); };
+$('capEnabled').onchange = (e) => {
+  edit('burn captions', () => { state.project.captionsEnabled = e.target.checked; });
+  scheduleCommandPreview();
+};
 $('btnTranscribe').onclick = transcribeSelected;
 $('btnImportSrt').onclick = async () => {
   const caps = await api.importCaptions();
   if (!caps) return;
-  state.project.captions = caps;
-  state.project.captionsEnabled = true;
+  edit('import captions', () => {
+    state.project.captions = caps;
+    state.project.captionsEnabled = true;
+  });
   $('capEnabled').checked = true;
   renderCaptions();
   toast(`${caps.length} caption lines imported.`);
 };
 $('btnAddCaption').onclick = () => {
-  state.project.captions.push({ start: state.playhead, end: state.playhead + 2, text: 'New line' });
+  edit('add caption', () => {
+    state.project.captions.push({ start: state.playhead, end: state.playhead + 2, text: 'New line' });
+  });
   renderCaptions();
 };
 
-// Project settings
+// Project settings. These are static markup rather than built by field(), so
+// they get their undo tracking wired explicitly.
 $('projectName').onchange = (e) => { state.project.name = e.target.value || 'untitled'; };
 $('projW').onchange = (e) => { state.project.width = Number(e.target.value) || 1080; scheduleCommandPreview(); };
 $('projH').onchange = (e) => { state.project.height = Number(e.target.value) || 1920; scheduleCommandPreview(); };
@@ -1188,8 +1347,15 @@ $('projFps').onchange = (e) => { state.project.fps = Number(e.target.value) || 3
 $('projBpm').onchange = (e) => { state.project.bpm = Number(e.target.value) || 120; renderAll(); renderTemplates(); };
 $('projPreset').onchange = (e) => { state.project.preset = e.target.value; scheduleCommandPreview(); };
 
+trackContinuous($('projectName'), 'rename');
+trackContinuous($('projW'), 'width');
+trackContinuous($('projH'), 'height');
+trackContinuous($('projFps'), 'fps');
+trackContinuous($('projBpm'), 'bpm');
+trackContinuous($('projPreset'), 'encode speed');
+
 function setSize(w, h) {
-  state.project.width = w; state.project.height = h;
+  edit('canvas size', () => { state.project.width = w; state.project.height = h; });
   $('projW').value = w; $('projH').value = h;
   scheduleCommandPreview();
 }
@@ -1224,16 +1390,35 @@ $('btnOpen').onclick = async () => {
   if (!p) return;
   state.project = p;
   state.selectedClipId = null;
-  $('projectName').value = p.name || 'untitled';
-  $('projW').value = p.width; $('projH').value = p.height;
-  $('projFps').value = p.fps; $('projBpm').value = p.bpm;
-  $('capEnabled').checked = Boolean(p.captionsEnabled);
-  renderAll(); renderCaptions(); renderCaptionStyle();
+  state.playhead = 0;
+  // The stack described edits to the project that was just replaced. Undoing
+  // past an Open back into a different project's history would be nonsense.
+  history.clear();
+  updateHistoryButtons();
+  syncProjectInputs();
+  renderAll(); renderCaptions(); renderCaptionStyle(); renderTemplates();
   toast('Project opened.');
 };
 
+// Undo / redo
+$('btnUndo').onclick = doUndo;
+$('btnRedo').onclick = doRedo;
+
 // Keyboard
 document.addEventListener('keydown', (e) => {
+  // Undo is checked before the typing guard: inside a caption box it should
+  // still undo the edit, which is what every other editor does.
+  if ((e.metaKey || e.ctrlKey) && (e.key === 'z' || e.key === 'Z')) {
+    e.preventDefault();
+    if (e.shiftKey) doRedo(); else doUndo();
+    return;
+  }
+  if ((e.metaKey || e.ctrlKey) && (e.key === 'y' || e.key === 'Y')) {
+    e.preventDefault();
+    doRedo();
+    return;
+  }
+
   const typing = /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
   if (typing) return;
 
@@ -1255,3 +1440,4 @@ renderAll();
 renderCaptions();
 renderCaptionStyle();
 renderTemplates();
+updateHistoryButtons();
