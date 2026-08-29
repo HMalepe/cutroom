@@ -44,10 +44,15 @@ npm test
 ```
 
 `node --test`, no framework. Two kinds: unit tests over the pure modules
-(`ffmpeg-builder`, `history`), and integration tests that load the real
-`index.html` and `app.js` into jsdom and drive actual buttons and pointer
-events. The second kind is what stops the undo wiring rotting when someone
-adds an edit and forgets to record it.
+(`ffmpeg-builder`, `history`, `chroma-math`), and integration tests that load
+the real `index.html` and `app.js` into jsdom and drive actual buttons and
+pointer events. The second kind is what stops the undo wiring rotting when
+someone adds an edit and forgets to record it.
+
+`chroma-math` is the one to read if you are changing the key. Its expected
+values are either derived by hand from the ffmpeg filter source or captured
+from a real ffmpeg run — never from what the code happened to return — because
+a preview that quietly disagrees with the export is worse than no preview.
 
 Nothing here launches Electron or shells out to ffmpeg, so the suite runs in a
 couple of seconds. CI runs it on Node 22.12, 22 and 24.
@@ -64,7 +69,8 @@ shifts anything downstream by accident.
 **Green screen.** Per clip, two sliders. Use **Pick colour from clip** first —
 a real green screen is never exactly `#00FF00`, and a mismatched key colour
 fails silently rather than erroring. Then raise similarity until the green is
-gone and blend until the edge stops looking cut out.
+gone and blend until the edge stops looking cut out. The preview keys live as
+you drag, so you can see both happening instead of rendering to find out.
 
 **Speed.** Per clip, 0.25× to 4×. Audio pitch-corrects automatically. For a
 ramp, split the clip where the speed should change and set each piece.
@@ -78,7 +84,12 @@ fades that your clips get poured into. The bars under each name are the slot
 proportions drawn to scale, so you can see the rhythm before applying it.
 Bauhaus Grid is beat-based: set your BPM first.
 
-**Test 3s.** Renders the first three seconds only. Use it to check a key or a
+**Preview.** Shows the selected clip keyed, colour-corrected, scaled and
+positioned — the same maths the export runs, per frame, on the GPU. What it
+does not show is speed, trims and captions; for those, Test 3s. On a machine
+with no WebGL it quietly goes back to playing the source file.
+
+**Test 3s.** Renders the first three seconds only. Use it to check speed or a
 caption instead of waiting for a full export.
 
 **Undo.** Every edit, back a hundred steps. A drag or a slider counts as one
@@ -115,6 +126,10 @@ shared/
 src/
   app.js             State, timeline rendering, pointer handling, inspector.
   history.js         Undo/redo stacks. Pure, no DOM, so it is testable.
+  chroma-math.js     The key/colour maths, ported from ffmpeg's filters.
+                     Pure, no DOM, no WebGL, so it is testable — and it is,
+                     hard, because this is where being wrong costs most.
+  key-preview.js     The WebGL plumbing that runs that maths per frame.
   templates.js       Edit rhythms. Pure data plus one function.
   index.html         Structure.
   styles.css         Tokens at the top.
@@ -173,6 +188,22 @@ bottom of the window shows which path you are on and the exact command about
 to run. Copy it and paste it in a terminal — the app is a front end for that
 command, and hiding it would be a lie about what it is.
 
+### Why the preview can be trusted
+
+The preview is a port of `chromakey`, `despill` and `eq` into a fragment
+shader, not an impression of them. It measures chroma distance in YUV the way
+`vf_chromakey.c` does, including the 4:2:0 neighbourhood and the quirk where
+the key colour is converted with full-range coefficients while the picture it
+is compared against is limited-range. It runs the three filters in the order
+`buildVideoClipChain` runs them — `eq` before the key, so raising saturation
+moves the matte in the preview exactly as it will in the render.
+
+The one thing it cannot reproduce is the source's chroma planes: a browser
+hands over RGB that has already been upsampled from them, and the shader
+reconstructs the 4:2:0 cells with a box filter. Measured against the real
+chain over a frame already in `yuv420p`, the matte agrees within 4/255 of
+alpha at every pixel.
+
 ### Filter order matters
 
 Inside `buildVideoClipChain` every step runs in **clip-local time** — zero is
@@ -190,9 +221,12 @@ Reasonable next moves, roughly by effort:
 
 - **More tracks.** `state.project.tracks` is an array; the builder already
   loops it. Adding a fourth is a one-line change plus a UI button.
-- **Live key preview.** Draw the video to a `<canvas>` and key per-frame in
-  JS, or in a WebGL fragment shader. Export and preview are already separate
-  concerns, so this touches nothing else.
+- **Speed and trims in the preview.** The key preview shows the clip's
+  appearance but plays the whole source at 1x. Looping between in and out at
+  the clip's speed is the obvious next piece.
+- **Colour tags from the source.** The preview assumes limited-range BT.601
+  when it reconstructs chroma; probing the stream's real tags in `main.js` and
+  passing the matrix name through would close the last gap on BT.709 footage.
 - **Real crossfades.** Currently overlapping alpha fades on two tracks.
   `xfade` is cleaner but needs clips concatenated per track first.
 - **Word-level captions.** whisper.cpp emits word timings with `-ml 1`. The
