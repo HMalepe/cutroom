@@ -357,6 +357,9 @@ ipcMain.handle('project:save', async (_e, project) => {
 
 ipcMain.handle('project:open', async () => {
   const res = await dialog.showOpenDialog(win, {
+    // Matches where project:save writes, so a saved project is where this
+    // dialog opens by default rather than wherever the OS defaults to.
+    defaultPath: app.getPath('documents'),
     properties: ['openFile'],
     filters: [{ name: 'Cutroom project', extensions: ['json'] }]
   });

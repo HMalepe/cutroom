@@ -10,6 +10,9 @@ You need Node 22.12+ and ffmpeg. (Electron 44 fetches its binary through
 `@electron/get`, which is ESM-only, so `npm start` needs a Node that can
 `require()` an ES module — 22.12 is where that landed.)
 
+Electron 44 also needs macOS 13+, and no longer ships 32-bit Windows or Linux
+prebuilts.
+
 ```bash
 # ffmpeg
 brew install ffmpeg                 # macOS
