@@ -43,14 +43,18 @@ works.
 npm test
 ```
 
-`node --test`, no framework. Two kinds: unit tests over the pure modules
-(`ffmpeg-builder`, `history`), and integration tests that load the real
+`node --test`, no framework. Three kinds: unit tests over the pure modules
+(`ffmpeg-builder`, `history`), integration tests that load the real
 `index.html` and `app.js` into jsdom and drive actual buttons and pointer
-events. The second kind is what stops the undo wiring rotting when someone
-adds an edit and forgets to record it.
+events, and render tests that put the built ffmpeg command through a real
+ffmpeg and inspect the pixels. The second kind is what stops the undo wiring
+rotting when someone adds an edit and forgets to record it. The third is there
+because a filter string that reads correctly and a filter string ffmpeg
+accepts are different things, and `xfade` is fussy about both.
 
-Nothing here launches Electron or shells out to ffmpeg, so the suite runs in a
-couple of seconds. CI runs it on Node 22.12, 22 and 24.
+Nothing launches Electron. The render tests skip themselves when ffmpeg is not
+installed, so the suite still runs in a couple of seconds without it — which is
+how CI runs it, on Node 22.12, 22 and 24.
 
 ## What it does
 
@@ -60,6 +64,11 @@ edges to trim, drag between lanes to reassign. Video 2 composites over Video 1.
 **Split and trim.** Playhead + `S` splits. `I` and `O` set in and out points.
 Every clip carries source-time and timeline-time separately, so trimming never
 shifts anything downstream by accident.
+
+**Crossfades.** Overlap two clips on the same track and the overlap becomes a
+real transition — drag one further over its neighbour to make the dissolve
+longer. Overlapping on *different* tracks still layers rather than transitions,
+which is what you want for a keyed clip over a background.
 
 **Green screen.** Per clip, two sliders. Use **Pick colour from clip** first —
 a real green screen is never exactly `#00FF00`, and a mismatched key colour
@@ -184,6 +193,43 @@ clip's start position, which is slow and wrong.
 Clips are centred by the overlay expression `(W-w)/2`, not by padding, so a
 keyed clip's transparent area stays transparent.
 
+A clip inside a crossfade bends both of those, and the next section is why.
+
+### Crossfades
+
+Overlap two clips **on the same video track** and the overlap is a crossfade,
+rendered by `xfade`. However long the overlap, that is how long the transition
+takes.
+
+`xfade` does not fit the one-clip-at-a-time shape of the rest of the video
+path. It takes two streams and returns one, and its `offset` is measured in the
+joined stream's own time rather than the timeline's — so the clips either side
+of a transition have to be folded together *before* anything reaches the
+canvas. `groupTrackRuns` finds the stretches of a track that need it: a clip
+joins the run in front of it when it overlaps that run **and carries on past
+it**, and anything else starts a new one.
+
+That leaves most projects where they were. A run of one clip is the old path
+untouched, byte for byte, which is every clip that abuts its neighbour, sits
+after a gap, or stands alone. Two clips on **different** tracks that overlap
+are layering — a keyed face over a background — and stay on the overlay path,
+because reading those as transitions would rewrite what existing projects mean.
+
+Inside a run, two of the rules above are suspended. Each clip is padded to one
+shared box, because `xfade` refuses inputs that disagree on size, pixel format,
+frame rate, SAR or timebase, and `force_original_aspect_ratio=decrease` hands
+every clip a different size. That padding is transparent, so the point of the
+no-padding rule survives — a letterboxed or keyed clip still shows the layer
+underneath — and each clip's `posX`/`posY` rides in its own pad offset, because
+one overlay now serves the whole run. The timeline shift moves off the clips
+onto the run, which does it once after the last fold.
+
+The alpha fades facing a transition are dropped. `xfade` is doing that blend
+now, and running both takes the picture down through the canvas on the way
+across — which is exactly what overlapping alpha fades used to do, and the
+reason this replaced them. The *audio* fades stay: overlapping `afade`s under
+`amix` are what crossfades the sound.
+
 ## Extending it
 
 Reasonable next moves, roughly by effort:
@@ -193,8 +239,9 @@ Reasonable next moves, roughly by effort:
 - **Live key preview.** Draw the video to a `<canvas>` and key per-frame in
   JS, or in a WebGL fragment shader. Export and preview are already separate
   concerns, so this touches nothing else.
-- **Real crossfades.** Currently overlapping alpha fades on two tracks.
-  `xfade` is cleaner but needs clips concatenated per track first.
+- **Other transitions.** `xfade` has about fifty; the builder always asks for
+  `fade`. Choosing per overlap is a couple of lines in `buildVideoRun` plus
+  somewhere in the inspector to put the control.
 - **Word-level captions.** whisper.cpp emits word timings with `-ml 1`. The
   ASS writer already supports karaoke tags.
 
