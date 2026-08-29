@@ -19,11 +19,14 @@ jobs:
 
     strategy:
       # One version failing should still report the others, so a break can be
-      # read as "only on 18" rather than just "red".
+      # read as "only on the floor" rather than just "red".
       fail-fast: false
       matrix:
-        # The floor the README promises, the current LTS, and the newest LTS.
-        node: ['18', '22', '24']
+        # The floor the README promises, the newest 22.x, and the current LTS.
+        # The floor is pinned exactly: Electron 44 needs require(esm), which
+        # first shipped in 22.12.0, so that patch is the promise — not 22 as a
+        # whole.
+        node: ['22.12.0', '22', '24']
 
     name: node ${{ matrix.node }}
 
@@ -35,9 +38,10 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
 
-      # --ignore-scripts skips Electron's postinstall, which downloads a
-      # ~100MB binary the tests never launch. Everything under test is either
-      # pure Node or runs in jsdom.
+      # Electron 42 moved the ~100MB binary download out of postinstall and
+      # into first run, so --ignore-scripts no longer carries any weight here.
+      # It stays because it is still the right default for CI, and nothing
+      # under test launches Electron: everything is pure Node or jsdom.
       - name: Install
         run: npm ci --ignore-scripts
         env:
