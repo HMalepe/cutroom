@@ -52,6 +52,14 @@ adds an edit and forgets to record it.
 Nothing here launches Electron or shells out to ffmpeg, so the suite runs in a
 couple of seconds. CI runs it on Node 22.12, 22 and 24.
 
+```bash
+npm run lint
+```
+
+ESLint, flat config in `eslint.config.js`. Deliberately small — undefined
+globals, unreachable code, unused variables, nothing stylistic. CI runs it
+alongside the tests.
+
 ## What it does
 
 **Timeline.** Three tracks: two video, one audio. Drag clips to move, drag the
