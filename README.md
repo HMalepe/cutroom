@@ -32,6 +32,21 @@ pip install -U openai-whisper       # easier
 Without it, the Transcribe button explains itself and Import (.srt/.vtt) still
 works.
 
+## Tests
+
+```bash
+npm test
+```
+
+`node --test`, no framework. Two kinds: unit tests over the pure modules
+(`ffmpeg-builder`, `history`), and integration tests that load the real
+`index.html` and `app.js` into jsdom and drive actual buttons and pointer
+events. The second kind is what stops the undo wiring rotting when someone
+adds an edit and forgets to record it.
+
+Nothing here launches Electron or shells out to ffmpeg, so the suite runs in a
+couple of seconds. CI runs it on Node 18, 22 and 24.
+
 ## What it does
 
 **Timeline.** Three tracks: two video, one audio. Drag clips to move, drag the
@@ -61,6 +76,13 @@ Bauhaus Grid is beat-based: set your BPM first.
 **Test 3s.** Renders the first three seconds only. Use it to check a key or a
 caption instead of waiting for a full export.
 
+**Undo.** Every edit, back a hundred steps. A drag or a slider counts as one
+step, not one per pixel, and an action that changed nothing — clicking a clip
+to select it, grabbing a slider and letting go — leaves no step at all. What
+gets restored is the project and the selection; your media bin, playhead and
+zoom stay where they are, because those are where you are looking rather than
+what you have made.
+
 ## Keyboard
 
 | | |
@@ -70,6 +92,8 @@ caption instead of waiting for a full export.
 | `I` / `O` | set in / set out |
 | `←` `→` | step one frame (hold Shift for one second) |
 | `Delete` | remove selected clip |
+| `Ctrl/Cmd Z` | undo |
+| `Ctrl/Cmd Shift Z` | redo |
 
 ## How it fits together
 
@@ -85,9 +109,12 @@ shared/
                      so it is the easiest thing here to test.
 src/
   app.js             State, timeline rendering, pointer handling, inspector.
+  history.js         Undo/redo stacks. Pure, no DOM, so it is testable.
   templates.js       Edit rhythms. Pure data plus one function.
   index.html         Structure.
   styles.css         Tokens at the top.
+test/
+  *.test.js          node --test, no framework. `npm test`.
 ```
 
 ### The data model
@@ -109,6 +136,26 @@ the whole app rests on. Collapse them into one and export math drifts the
 moment a speed change enters the picture. The only place they are deliberately
 coupled is dragging a clip's left handle, where trimming the head has to move
 the clip so the frame under your cursor stays put.
+
+### How undo works
+
+Because a clip is plain JSON with no live references, a structural clone of
+`state.project` is a complete record of the edit state. So undo stores whole
+snapshots rather than per-operation inverses — there is no undo logic per
+command to write, and therefore none to get out of step with the command
+itself.
+
+Edits open with `history.begin()` and close with `history.commit()`. A
+discrete edit does both at once (`edit('split', …)`); a drag or a slider calls
+`begin` when the gesture starts and `commit` when it ends, which is what makes
+a hundred pointermove events collapse into one step. `commit` compares the
+before and after and discards the entry if they match, so gestures that
+changed nothing never reach the stack.
+
+The inspector wires this in `field()` and `slider()` rather than at each
+control, so a new inspector row is undoable without anyone remembering to make
+it so. Controls built outside those two helpers — the static project panel,
+the caption rows — are wired by hand with `trackContinuous`.
 
 ### Two export paths
 
@@ -138,8 +185,6 @@ Reasonable next moves, roughly by effort:
 
 - **More tracks.** `state.project.tracks` is an array; the builder already
   loops it. Adding a fourth is a one-line change plus a UI button.
-- **Undo.** Structural clone `state.project` onto a stack before each mutating
-  operation. The state is plain JSON, which makes this easy.
 - **Live key preview.** Draw the video to a `<canvas>` and key per-frame in
   JS, or in a WebGL fragment shader. Export and preview are already separate
   concerns, so this touches nothing else.

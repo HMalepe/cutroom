@@ -1,0 +1,1443 @@
+/*
+ * app.js — the renderer.
+ * ---------------------------------------------------------------------------
+ * Holds the project state, draws the timeline, and hands the project object to
+ * the main process when it is time to export. It never touches disk itself.
+ *
+ * Read order if you are picking this apart:
+ *   1. state + the clip factory      — the data model
+ *   2. renderTimeline                — how state becomes pixels
+ *   3. pointer handlers              — how pixels become state again
+ * Everything else hangs off those three.
+ */
+
+'use strict';
+
+const api = window.cutroom;
+
+// ==========================================================================
+// State
+// ==========================================================================
+
+const state = {
+  project: {
+    name: 'untitled',
+    width: 1080,
+    height: 1920,
+    fps: 30,
+    bpm: 120,
+    preset: 'medium',
+    crf: 20,
+    captionsEnabled: false,
+    captions: [],
+    captionStyle: {
+      font: 'Arial',
+      size: 54,
+      color: '#FFFFFF',
+      bold: true,
+      background: false,
+      bgColor: '#000000',
+      bgOpacity: 0.7,
+      outlineColor: '#000000',
+      outlineWidth: 3,
+      position: 'bottom',
+      marginV: 220,
+      animation: 'pop'
+    },
+    tracks: [
+      { id: 'v1', kind: 'video', name: 'Video 1', clips: [] },
+      { id: 'v2', kind: 'video', name: 'Video 2', clips: [] },
+      { id: 'a1', kind: 'audio', name: 'Audio 1', clips: [] }
+    ]
+  },
+  bin: [],
+  binSelection: [],
+  selectedClipId: null,
+  playhead: 0,
+  pxPerSec: 40,
+  snapBeats: false,
+  env: null,
+  exporting: false
+};
+
+let clipSeq = 0;
+const uid = (p) => `${p}${Date.now().toString(36)}${(clipSeq++).toString(36)}`;
+
+// ==========================================================================
+// Small utilities
+// ==========================================================================
+
+const $ = (id) => document.getElementById(id);
+
+function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+
+function fmtTime(sec) {
+  const s = Math.max(0, sec);
+  const h = String(Math.floor(s / 3600)).padStart(2, '0');
+  const m = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+  const ss = String(Math.floor(s % 60)).padStart(2, '0');
+  const ff = String(Math.floor((s % 1) * 100)).padStart(2, '0');
+  return { main: `${h}:${m}:${ss}`, frac: ff };
+}
+
+function fileUrl(p) {
+  return 'file://' + p.split(/[\\/]/).map(encodeURIComponent).join('/');
+}
+
+function toast(msg, kind = 'ok', detail = '') {
+  const el = document.createElement('div');
+  el.className = `toast ${kind}`;
+  el.textContent = msg;
+  if (detail) {
+    const pre = document.createElement('pre');
+    pre.textContent = detail;
+    el.appendChild(pre);
+  }
+  $('toasts').appendChild(el);
+  setTimeout(() => el.remove(), kind === 'err' ? 14000 : 5000);
+}
+
+const beatSec = () => 60 / (state.project.bpm || 120);
+
+function snap(sec) {
+  if (!state.snapBeats) return sec;
+  const b = beatSec();
+  return Math.round(sec / b) * b;
+}
+
+// ==========================================================================
+// Data model
+// ==========================================================================
+
+/** Build a timeline clip from a bin item. */
+function makeClip(media, startSec) {
+  return {
+    id: uid('c'),
+    src: media.path,
+    name: media.name,
+    sourceDuration: media.duration,
+    hasAudio: media.hasAudio,
+    hasVideo: media.hasVideo,
+    inSec: 0,
+    outSec: media.duration || 5,
+    startSec: startSec,
+    speed: 1,
+    volume: 1,
+    fadeIn: 0,
+    fadeOut: 0,
+    scale: 1,
+    posX: 0,
+    posY: 0,
+    chroma: { on: false, color: '#00FF00', similarity: 0.1, blend: 0.05 },
+    filters: { brightness: 0, contrast: 1, saturation: 1 }
+  };
+}
+
+const clipDur = (c) => Math.max(0, (c.outSec - c.inSec) / (c.speed || 1));
+const clipEnd = (c) => c.startSec + clipDur(c);
+
+function projectDuration() {
+  let max = 0;
+  for (const t of state.project.tracks) {
+    for (const c of t.clips) max = Math.max(max, clipEnd(c));
+  }
+  return max;
+}
+
+function findClip(id) {
+  for (const t of state.project.tracks) {
+    const c = t.clips.find(x => x.id === id);
+    if (c) return { clip: c, track: t };
+  }
+  return { clip: null, track: null };
+}
+
+function selectedClip() { return findClip(state.selectedClipId).clip; }
+
+/** Next free position on a track, so new clips land after existing ones. */
+function trackTail(track) {
+  return track.clips.reduce((m, c) => Math.max(m, clipEnd(c)), 0);
+}
+
+// ==========================================================================
+// Undo / redo
+// ==========================================================================
+
+/*
+ * What a snapshot covers is a judgement about what an undo should feel like.
+ *
+ * The project is in, obviously. Selection is in too: undoing a delete that
+ * does not give you the clip back selected feels like it only half worked.
+ *
+ * Everything else is deliberately out. The media bin is not an edit — undoing
+ * a trim should not un-import a file. Playhead, zoom and beat-snap are where
+ * you are looking, not what you have made; rewinding them under the user is
+ * disorienting rather than helpful.
+ */
+const history = createHistory({
+  read: () => ({
+    project: state.project,
+    selectedClipId: state.selectedClipId
+  }),
+  write: (snap) => {
+    state.project = snap.project;
+    state.selectedClipId = snap.selectedClipId;
+    // A restored project can be shorter than where the playhead was left.
+    state.playhead = Math.min(state.playhead, Math.max(projectDuration(), 0));
+    syncProjectInputs();
+    renderAll();
+    renderCaptions();
+    renderCaptionStyle();
+    renderTemplates();
+  },
+  limit: 100
+});
+
+/** Convenience for the common case: one discrete edit, one undo entry. */
+function edit(label, fn) {
+  history.run(label, fn);
+  updateHistoryButtons();
+}
+
+/**
+ * The project panel and caption checkbox are plain HTML inputs rather than
+ * re-rendered markup, so they need pushing back into sync after an undo.
+ */
+function syncProjectInputs() {
+  const p = state.project;
+  $('projectName').value = p.name || 'untitled';
+  $('projW').value = p.width;
+  $('projH').value = p.height;
+  $('projFps').value = p.fps;
+  $('projBpm').value = p.bpm;
+  $('projPreset').value = p.preset || 'medium';
+  $('capEnabled').checked = Boolean(p.captionsEnabled);
+}
+
+function updateHistoryButtons() {
+  const u = $('btnUndo');
+  const r = $('btnRedo');
+  u.disabled = !history.canUndo();
+  r.disabled = !history.canRedo();
+  u.title = history.canUndo() ? `Undo ${history.undoLabel()}` : 'Nothing to undo';
+  r.title = history.canRedo() ? `Redo ${history.redoLabel()}` : 'Nothing to redo';
+}
+
+/**
+ * Undo feedback replaces itself instead of stacking. Naming the edit is
+ * useful — an undo whose effect is off-screen otherwise looks like nothing
+ * happened — but holding the shortcut down would otherwise bury the window
+ * in a column of near-identical toasts.
+ */
+let lastHistoryToast = null;
+function historyToast(msg, kind = 'ok') {
+  if (lastHistoryToast) lastHistoryToast.remove();
+  const el = document.createElement('div');
+  el.className = `toast ${kind}`;
+  el.textContent = msg;
+  $('toasts').appendChild(el);
+  lastHistoryToast = el;
+  setTimeout(() => {
+    el.remove();
+    if (lastHistoryToast === el) lastHistoryToast = null;
+  }, 2500);
+}
+
+/*
+ * Both of these close any edit still open first. Pressing undo halfway
+ * through typing a caption should undo that typing, not skip over it to the
+ * edit before — and without the commit, the half-finished edit would be lost
+ * silently rather than recorded.
+ */
+function doUndo() {
+  history.commit();
+  const label = history.undo();
+  updateHistoryButtons();
+  historyToast(label ? `Undid ${label}.` : 'Nothing left to undo.', label ? 'ok' : 'warn');
+}
+
+function doRedo() {
+  history.commit();
+  const label = history.redo();
+  updateHistoryButtons();
+  historyToast(label ? `Redid ${label}.` : 'Nothing to redo.', label ? 'ok' : 'warn');
+}
+
+/**
+ * Wire a control whose value changes continuously — a slider, or a text box
+ * typed into character by character — so the whole gesture becomes one entry.
+ *
+ * Grabbing the control opens the edit; releasing it or leaving the field
+ * closes it. If the value ends up where it started, commit discards it.
+ */
+function trackContinuous(el, label) {
+  el.addEventListener('pointerdown', () => history.begin(label));
+  el.addEventListener('focus', () => history.begin(label));
+  el.addEventListener('change', () => { history.commit(); updateHistoryButtons(); });
+  el.addEventListener('blur', () => { history.commit(); updateHistoryButtons(); });
+  return el;
+}
+
+// ==========================================================================
+// Environment
+// ==========================================================================
+
+async function checkEnv() {
+  state.env = await api.checkEnv();
+  const ok = Boolean(state.env.ffmpeg);
+  $('envDot').classList.toggle('ok', ok);
+  $('envText').textContent = ok
+    ? (state.env.whisper ? 'ffmpeg + whisper' : 'ffmpeg')
+    : 'ffmpeg missing';
+  $('envPill').title = ok
+    ? `ffmpeg: ${state.env.ffmpeg}\nwhisper: ${state.env.whisper || 'not installed'}`
+    : 'Install ffmpeg, then restart Cutroom.';
+  if (!ok) {
+    toast('ffmpeg not found. Nothing will export until it is installed.', 'err',
+      'macOS:  brew install ffmpeg\nWindows: winget install ffmpeg\nLinux:  sudo apt install ffmpeg');
+  }
+}
+
+// ==========================================================================
+// Media bin
+// ==========================================================================
+
+async function addPaths(paths) {
+  if (!paths || !paths.length) return;
+  let added = 0;
+  for (const p of paths) {
+    if (state.bin.some(m => m.path === p)) continue;
+    try {
+      const media = await api.probe(p);
+      // A still image probes as zero duration. Give it a sane default so it
+      // can sit on the timeline like anything else.
+      if (!media.duration || media.duration < 0.02) media.duration = 4;
+      state.bin.push(media);
+      added++;
+    } catch (err) {
+      toast(`Could not read ${p.split(/[\\/]/).pop()}`, 'err', String(err.message || err));
+    }
+  }
+  if (added) renderBin();
+}
+
+function renderBin() {
+  const list = $('binList');
+  list.innerHTML = '';
+  for (const m of state.bin) {
+    const el = document.createElement('div');
+    el.className = 'bin-item' + (state.binSelection.includes(m.path) ? ' selected' : '');
+
+    const kind = document.createElement('div');
+    kind.className = 'bin-kind' + (m.hasVideo ? '' : ' audio');
+    el.appendChild(kind);
+
+    const meta = document.createElement('div');
+    meta.className = 'bin-meta';
+    const name = document.createElement('div');
+    name.className = 'bin-name';
+    name.textContent = m.name;
+    name.title = m.path;
+    const sub = document.createElement('div');
+    sub.className = 'bin-sub';
+    sub.textContent = m.hasVideo
+      ? `${m.width}×${m.height} · ${m.duration.toFixed(1)}s${m.hasAudio ? '' : ' · silent'}`
+      : `audio · ${m.duration.toFixed(1)}s`;
+    meta.append(name, sub);
+    el.appendChild(meta);
+
+    el.onclick = (e) => {
+      const i = state.binSelection.indexOf(m.path);
+      if (e.metaKey || e.ctrlKey || e.shiftKey) {
+        if (i >= 0) state.binSelection.splice(i, 1); else state.binSelection.push(m.path);
+      } else {
+        state.binSelection = i >= 0 && state.binSelection.length === 1 ? [] : [m.path];
+      }
+      renderBin();
+      loadPreview(m.path);
+    };
+    list.appendChild(el);
+  }
+
+  $('binHint').textContent = state.binSelection.length
+    ? `${state.binSelection.length} selected — order of selection is the order they land.`
+    : 'Select clips in the bin, then send them to a track. Order of selection is the order they land.';
+}
+
+function sendToTrack(trackId) {
+  const track = state.project.tracks.find(t => t.id === trackId);
+  if (!track) return;
+  if (!state.binSelection.length) { toast('Select something in the bin first.', 'warn'); return; }
+
+  edit('add clips', () => {
+    let cursor = trackTail(track);
+    for (const p of state.binSelection) {
+      const media = state.bin.find(m => m.path === p);
+      if (!media) continue;
+      if (track.kind === 'audio' && !media.hasAudio) {
+        toast(`${media.name} has no audio stream.`, 'warn');
+        continue;
+      }
+      const clip = makeClip(media, cursor);
+      // On a video track, a clip's own audio is on by default. On an audio
+      // track only the audio matters.
+      if (track.kind === 'audio') clip.hasVideo = false;
+      track.clips.push(clip);
+      cursor = clipEnd(clip);
+    }
+  });
+  state.binSelection = [];
+  renderBin();
+  renderAll();
+}
+
+// ==========================================================================
+// Preview
+// ==========================================================================
+
+function loadPreview(path) {
+  const v = $('video');
+  const empty = $('viewerEmpty');
+  if (!path) { v.style.display = 'none'; empty.style.display = 'block'; return; }
+  v.src = fileUrl(path);
+  v.style.display = 'block';
+  empty.style.display = 'none';
+}
+
+// ==========================================================================
+// Timeline rendering
+// ==========================================================================
+
+function renderHeads() {
+  const heads = $('tlHeads');
+  heads.innerHTML = '<div class="tl-heads-pad"></div>';
+  for (const track of state.project.tracks) {
+    const el = document.createElement('div');
+    el.className = 'track-head';
+
+    const name = document.createElement('div');
+    name.className = 'track-head-name';
+    name.textContent = track.name;
+
+    const btns = document.createElement('div');
+    btns.className = 'track-head-btns';
+
+    const mute = document.createElement('button');
+    mute.className = 'chip' + (track.muted ? ' on' : '');
+    mute.textContent = 'M';
+    mute.title = 'Mute this track in the export';
+    mute.onclick = () => { edit('mute', () => { track.muted = !track.muted; }); renderAll(); };
+
+    const hide = document.createElement('button');
+    hide.className = 'chip' + (track.hidden ? ' on' : '');
+    hide.textContent = 'H';
+    hide.title = 'Hide this track in the export';
+    hide.onclick = () => { edit('hide track', () => { track.hidden = !track.hidden; }); renderAll(); };
+
+    btns.append(mute);
+    if (track.kind === 'video') btns.append(hide);
+    el.append(name, btns);
+    heads.appendChild(el);
+  }
+}
+
+function renderRuler(width) {
+  const ruler = $('ruler');
+  ruler.innerHTML = '';
+  ruler.style.width = width + 'px';
+
+  // Pick a tick interval that keeps labels roughly 70px apart at any zoom.
+  const targetPx = 74;
+  const candidates = [0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300];
+  const step = candidates.find(c => c * state.pxPerSec >= targetPx) || 600;
+
+  const total = width / state.pxPerSec;
+  for (let t = 0; t <= total; t += step) {
+    const tick = document.createElement('div');
+    tick.className = 'ruler-tick';
+    tick.style.left = (t * state.pxPerSec) + 'px';
+    const label = document.createElement('span');
+    const f = fmtTime(t);
+    label.textContent = f.main.replace(/^00:/, '');
+    tick.appendChild(label);
+    ruler.appendChild(tick);
+  }
+
+  // Beat grid, drawn only when it will not turn into a solid block.
+  if (state.snapBeats) {
+    const b = beatSec();
+    if (b * state.pxPerSec > 5) {
+      for (let t = 0; t <= total; t += b) {
+        const line = document.createElement('div');
+        line.className = 'beat-line';
+        line.style.left = (t * state.pxPerSec) + 'px';
+        ruler.appendChild(line);
+      }
+    }
+  }
+}
+
+function renderClipEl(clip, track) {
+  const el = document.createElement('div');
+  el.className = 'clip'
+    + (track.kind === 'audio' ? ' audio' : '')
+    + (clip.id === state.selectedClipId ? ' selected' : '');
+  el.style.left = (clip.startSec * state.pxPerSec) + 'px';
+  el.style.width = Math.max(14, clipDur(clip) * state.pxPerSec) + 'px';
+  el.dataset.clipId = clip.id;
+
+  const label = document.createElement('div');
+  label.className = 'clip-label';
+  label.textContent = clip.name;
+
+  const badges = document.createElement('div');
+  badges.className = 'clip-badges';
+
+  const dur = document.createElement('span');
+  dur.className = 'badge';
+  dur.textContent = clipDur(clip).toFixed(2) + 's';
+  badges.appendChild(dur);
+
+  if ((clip.speed || 1) !== 1) {
+    const s = document.createElement('span');
+    s.className = 'badge spd';
+    s.textContent = clip.speed + '×';
+    badges.appendChild(s);
+  }
+  if (clip.chroma && clip.chroma.on) {
+    const k = document.createElement('span');
+    k.className = 'badge key';
+    k.textContent = 'KEY';
+    badges.appendChild(k);
+  }
+  if (clip.fadeIn || clip.fadeOut) {
+    const f = document.createElement('span');
+    f.className = 'badge';
+    f.textContent = 'FADE';
+    badges.appendChild(f);
+  }
+
+  el.append(label, badges);
+
+  const hl = document.createElement('div');
+  hl.className = 'clip-handle left';
+  hl.dataset.handle = 'left';
+  const hr = document.createElement('div');
+  hr.className = 'clip-handle right';
+  hr.dataset.handle = 'right';
+  el.append(hl, hr);
+
+  return el;
+}
+
+function renderLanes(width) {
+  const lanes = $('lanes');
+  lanes.innerHTML = '';
+  for (const track of state.project.tracks) {
+    const lane = document.createElement('div');
+    lane.className = 'track-lane';
+    lane.style.width = width + 'px';
+    lane.dataset.trackId = track.id;
+    for (const clip of track.clips) lane.appendChild(renderClipEl(clip, track));
+    lanes.appendChild(lane);
+  }
+}
+
+function renderTimeline() {
+  const dur = Math.max(projectDuration(), 12);
+  // Always leave a screen of empty room to the right so you can drag past the
+  // end of the last clip.
+  const width = Math.max(($('tlScroll').clientWidth || 800), (dur + 6) * state.pxPerSec);
+  $('tlInner').style.width = width + 'px';
+  renderRuler(width);
+  renderLanes(width);
+  $('playhead').style.left = (state.playhead * state.pxPerSec) + 'px';
+  $('zoomLabel').textContent = Math.round(state.pxPerSec) + ' px/s';
+
+  const f = fmtTime(state.playhead);
+  $('timecode').innerHTML = `${f.main}<span class="frac">.${f.frac}</span>`;
+  $('timecodeTotal').textContent = '/ ' + fmtTime(projectDuration()).main;
+}
+
+// ==========================================================================
+// Timeline interaction
+// ==========================================================================
+
+let drag = null;
+
+$('tlScroll').addEventListener('pointerdown', (e) => {
+  const scroll = $('tlScroll');
+  const rect = $('tlInner').getBoundingClientRect();
+  const x = e.clientX - rect.left;
+
+  const clipEl = e.target.closest('.clip');
+
+  // Clicking the ruler or empty lane space moves the playhead.
+  if (!clipEl) {
+    state.playhead = Math.max(0, snap(x / state.pxPerSec));
+    renderTimeline();
+    return;
+  }
+
+  const id = clipEl.dataset.clipId;
+  state.selectedClipId = id;
+  const { clip, track } = findClip(id);
+  loadPreview(clip.src);
+
+  const handle = e.target.dataset.handle;
+  // Opened whether or not the pointer ends up moving. A click that only
+  // selects a clip leaves the project untouched, and commit drops it.
+  history.begin(handle ? 'trim' : 'move');
+  drag = {
+    mode: handle || 'move',
+    id,
+    startX: e.clientX,
+    origStart: clip.startSec,
+    origIn: clip.inSec,
+    origOut: clip.outSec,
+    trackId: track.id,
+    moved: false
+  };
+  clipEl.classList.add('dragging');
+  scroll.setPointerCapture(e.pointerId);
+  renderInspector();
+});
+
+$('tlScroll').addEventListener('pointermove', (e) => {
+  if (!drag) return;
+  const dx = e.clientX - drag.startX;
+  if (Math.abs(dx) > 2) drag.moved = true;
+  const dSec = dx / state.pxPerSec;
+  const { clip } = findClip(drag.id);
+  if (!clip) return;
+
+  if (drag.mode === 'move') {
+    clip.startSec = Math.max(0, snap(drag.origStart + dSec));
+  } else if (drag.mode === 'left') {
+    // Dragging the left handle trims into the source AND moves the clip, so
+    // the frame under the cursor stays put. Source time and timeline time
+    // move together here — this is the one place they are coupled.
+    const speed = clip.speed || 1;
+    const newIn = clamp(drag.origIn + dSec * speed, 0, clip.outSec - 0.05);
+    const delta = (newIn - drag.origIn) / speed;
+    clip.inSec = newIn;
+    clip.startSec = Math.max(0, drag.origStart + delta);
+  } else if (drag.mode === 'right') {
+    const speed = clip.speed || 1;
+    const maxOut = clip.sourceDuration || drag.origOut;
+    clip.outSec = clamp(drag.origOut + dSec * speed, clip.inSec + 0.05, maxOut);
+  }
+  renderTimeline();
+});
+
+function endDrag(e) {
+  if (!drag) return;
+  const wasMove = drag.mode === 'move';
+  const id = drag.id;
+  drag = null;
+  document.querySelectorAll('.clip.dragging').forEach(el => el.classList.remove('dragging'));
+
+  // Dropping a clip onto a different lane moves it between tracks. This is
+  // part of the same gesture as the drag, so it lands in the same undo entry.
+  if (wasMove && e) {
+    const lane = document.elementFromPoint(e.clientX, e.clientY)?.closest('.track-lane');
+    if (lane) {
+      const targetId = lane.dataset.trackId;
+      const { clip, track } = findClip(id);
+      if (clip && track && track.id !== targetId) {
+        const target = state.project.tracks.find(t => t.id === targetId);
+        if (target) {
+          track.clips = track.clips.filter(c => c.id !== id);
+          target.clips.push(clip);
+        }
+      }
+    }
+  }
+  history.commit();
+  updateHistoryButtons();
+  renderAll();
+}
+
+$('tlScroll').addEventListener('pointerup', endDrag);
+$('tlScroll').addEventListener('pointercancel', () => endDrag(null));
+
+// ==========================================================================
+// Editing operations
+// ==========================================================================
+
+function splitAtPlayhead() {
+  const { clip, track } = findClip(state.selectedClipId);
+  if (!clip) { toast('Select a clip first.', 'warn'); return; }
+
+  const t = state.playhead;
+  if (t <= clip.startSec + 0.02 || t >= clipEnd(clip) - 0.02) {
+    toast('Put the playhead inside the selected clip.', 'warn');
+    return;
+  }
+
+  edit('split', () => {
+    // Convert timeline position back into source position through the speed.
+    const offsetIntoClip = (t - clip.startSec) * (clip.speed || 1);
+    const cutPoint = clip.inSec + offsetIntoClip;
+
+    const right = { ...clip, id: uid('c'), inSec: cutPoint, startSec: t, fadeIn: 0 };
+    right.chroma = { ...clip.chroma };
+    right.filters = { ...clip.filters };
+    clip.outSec = cutPoint;
+    clip.fadeOut = 0;
+
+    track.clips.push(right);
+    state.selectedClipId = right.id;
+  });
+  renderAll();
+}
+
+function setInAtPlayhead() {
+  const { clip } = findClip(state.selectedClipId);
+  if (!clip) return;
+  const t = state.playhead;
+  if (t <= clip.startSec || t >= clipEnd(clip)) { toast('Playhead is outside the clip.', 'warn'); return; }
+  edit('set in', () => {
+    const offset = (t - clip.startSec) * (clip.speed || 1);
+    clip.inSec += offset;
+    clip.startSec = t;
+  });
+  renderAll();
+}
+
+function setOutAtPlayhead() {
+  const { clip } = findClip(state.selectedClipId);
+  if (!clip) return;
+  const t = state.playhead;
+  if (t <= clip.startSec || t >= clipEnd(clip)) { toast('Playhead is outside the clip.', 'warn'); return; }
+  edit('set out', () => {
+    clip.outSec = clip.inSec + (t - clip.startSec) * (clip.speed || 1);
+  });
+  renderAll();
+}
+
+function deleteSelected() {
+  const { clip, track } = findClip(state.selectedClipId);
+  if (!clip) return;
+  edit('delete', () => {
+    track.clips = track.clips.filter(c => c.id !== clip.id);
+    state.selectedClipId = null;
+  });
+  renderAll();
+}
+
+function closeGaps() {
+  const { track } = findClip(state.selectedClipId);
+  const target = track || state.project.tracks[0];
+  edit('close gaps', () => {
+    const sorted = [...target.clips].sort((a, b) => a.startSec - b.startSec);
+    let cursor = 0;
+    for (const c of sorted) { c.startSec = cursor; cursor = clipEnd(c); }
+  });
+  renderAll();
+}
+
+// ==========================================================================
+// Inspector
+// ==========================================================================
+
+function field(labelText, control) {
+  const wrap = document.createElement('div');
+  wrap.className = 'field';
+  const l = document.createElement('label');
+  l.className = 'field-label';
+  l.textContent = labelText;
+  // Every field wraps a control that writes into the project, so undo tracking
+  // belongs here rather than repeated at each of the twenty-odd call sites.
+  trackContinuous(control, labelText.toLowerCase());
+  wrap.append(l, control);
+  return wrap;
+}
+
+function slider(labelText, value, min, max, step, format, onInput) {
+  const wrap = document.createElement('div');
+  wrap.className = 'field';
+  const l = document.createElement('label');
+  l.className = 'field-label';
+  l.textContent = labelText;
+
+  const row = document.createElement('div');
+  row.className = 'slider-row';
+  const input = document.createElement('input');
+  input.type = 'range';
+  input.min = min; input.max = max; input.step = step; input.value = value;
+  const val = document.createElement('span');
+  val.className = 'slider-val';
+  val.textContent = format(value);
+
+  input.oninput = () => {
+    const v = Number(input.value);
+    val.textContent = format(v);
+    onInput(v);
+  };
+  // A slider drag is one edit, however many input events it fires.
+  trackContinuous(input, labelText.split('—')[0].trim().toLowerCase());
+  row.append(input, val);
+  wrap.append(l, row);
+  return wrap;
+}
+
+function renderInspector() {
+  const box = $('inspector');
+  box.innerHTML = '';
+  const clip = selectedClip();
+  $('clipName').textContent = clip ? clip.name : 'nothing selected';
+
+  if (!clip) {
+    const note = document.createElement('div');
+    note.className = 'empty-note';
+    note.textContent = 'Select a clip on the timeline to trim it, change its speed, or key out a background.';
+    box.appendChild(note);
+    return;
+  }
+
+  // --- Timing -------------------------------------------------------------
+  const timingRow = document.createElement('div');
+  timingRow.className = 'row';
+  for (const [label, key, max] of [
+    ['In (source)', 'inSec', clip.sourceDuration],
+    ['Out (source)', 'outSec', clip.sourceDuration],
+    ['Start (timeline)', 'startSec', 9999]
+  ]) {
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.className = 'input';
+    input.step = '0.05';
+    input.min = '0';
+    input.max = String(max);
+    input.value = clip[key].toFixed(2);
+    input.onchange = () => {
+      clip[key] = clamp(Number(input.value) || 0, 0, max);
+      if (clip.outSec <= clip.inSec) clip.outSec = clip.inSec + 0.1;
+      renderAll();
+    };
+    timingRow.appendChild(field(label, input));
+  }
+  box.appendChild(timingRow);
+
+  // --- Speed --------------------------------------------------------------
+  const speedWrap = document.createElement('div');
+  speedWrap.className = 'field';
+  const sl = document.createElement('label');
+  sl.className = 'field-label';
+  sl.textContent = `Speed — clip runs ${clipDur(clip).toFixed(2)}s on the timeline`;
+  const chips = document.createElement('div');
+  chips.className = 'speed-chips';
+  for (const s of [0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4]) {
+    const b = document.createElement('button');
+    b.className = 'chip' + (clip.speed === s ? ' on' : '');
+    b.textContent = s + '×';
+    b.onclick = () => { edit('speed', () => { clip.speed = s; }); renderAll(); };
+    chips.appendChild(b);
+  }
+  speedWrap.append(sl, chips);
+  box.appendChild(speedWrap);
+
+  const rampNote = document.createElement('div');
+  rampNote.className = 'empty-note';
+  rampNote.style.marginBottom = '10px';
+  rampNote.textContent = 'For a ramp: split the clip where you want the speed to change, then set each piece separately.';
+  box.appendChild(rampNote);
+
+  // --- Transitions --------------------------------------------------------
+  const fadeRow = document.createElement('div');
+  fadeRow.className = 'row';
+  for (const [label, key] of [['Fade in (s)', 'fadeIn'], ['Fade out (s)', 'fadeOut']]) {
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.className = 'input';
+    input.step = '0.05';
+    input.min = '0';
+    input.value = (clip[key] || 0).toFixed(2);
+    input.onchange = () => { clip[key] = Math.max(0, Number(input.value) || 0); renderAll(); };
+    fadeRow.appendChild(field(label, input));
+  }
+  box.appendChild(fadeRow);
+
+  const xfNote = document.createElement('div');
+  xfNote.className = 'empty-note';
+  xfNote.style.marginBottom = '10px';
+  xfNote.textContent = 'Overlap two clips on different video tracks and give them matching fades — that is a crossfade.';
+  box.appendChild(xfNote);
+
+  // --- Volume -------------------------------------------------------------
+  if (clip.hasAudio) {
+    box.appendChild(slider('Volume', clip.volume, 0, 2, 0.05,
+      v => Math.round(v * 100) + '%', v => { clip.volume = v; scheduleCommandPreview(); }));
+  }
+
+  // --- Green screen -------------------------------------------------------
+  const keyCheck = document.createElement('div');
+  keyCheck.className = 'check';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.id = 'chromaOn';
+  cb.checked = clip.chroma.on;
+  cb.onchange = () => { edit('key', () => { clip.chroma.on = cb.checked; }); renderAll(); };
+  const cl = document.createElement('label');
+  cl.htmlFor = 'chromaOn';
+  cl.textContent = 'Key out background';
+  keyCheck.append(cb, cl);
+  box.appendChild(keyCheck);
+
+  if (clip.chroma.on) {
+    const colour = document.createElement('input');
+    colour.type = 'color';
+    colour.className = 'input';
+    colour.style.height = '28px';
+    colour.value = clip.chroma.color;
+    colour.onchange = () => { clip.chroma.color = colour.value; scheduleCommandPreview(); };
+    box.appendChild(field('Key colour', colour));
+
+    // Eyedropper. Grabs a real frame and lets you click the background.
+    // Without this you are guessing a hex value against footage that is never
+    // the pure colour you assume, and a wrong guess keys nothing at all.
+    const pick = document.createElement('button');
+    pick.className = 'btn btn-sm';
+    pick.textContent = 'Pick colour from clip';
+    const canvas = document.createElement('canvas');
+    canvas.className = 'eyedrop';
+    canvas.style.display = 'none';
+
+    pick.onclick = async () => {
+      try {
+        const atSec = clip.inSec + Math.min(0.5, (clip.outSec - clip.inSec) / 2);
+        const dataUrl = await api.grabFrame(clip.src, atSec);
+        const img = new Image();
+        img.onload = () => {
+          canvas.width = img.width;
+          canvas.height = img.height;
+          canvas.getContext('2d').drawImage(img, 0, 0);
+          canvas.style.display = 'block';
+          pick.textContent = 'Click the background above';
+        };
+        img.src = dataUrl;
+      } catch (err) {
+        toast('Could not grab a frame', 'err', String(err.message || err));
+      }
+    };
+
+    canvas.onclick = (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = Math.floor((e.clientX - rect.left) * (canvas.width / rect.width));
+      const y = Math.floor((e.clientY - rect.top) * (canvas.height / rect.height));
+      const [r, g, b] = canvas.getContext('2d').getImageData(x, y, 1, 1).data;
+      const hex = '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
+      edit('key colour', () => { clip.chroma.color = hex; });
+      colour.value = hex;
+      pick.textContent = `Sampled ${hex} — pick again`;
+      scheduleCommandPreview();
+    };
+
+    box.append(pick, canvas);
+
+    box.appendChild(slider('Similarity — how much of the colour to remove',
+      clip.chroma.similarity, 0.01, 0.5, 0.005, v => v.toFixed(3),
+      v => { clip.chroma.similarity = v; scheduleCommandPreview(); }));
+
+    box.appendChild(slider('Blend — edge softness',
+      clip.chroma.blend, 0, 0.4, 0.005, v => v.toFixed(3),
+      v => { clip.chroma.blend = v; scheduleCommandPreview(); }));
+
+    const tip = document.createElement('div');
+    tip.className = 'empty-note';
+    tip.style.marginBottom = '10px';
+    tip.textContent = 'Raise similarity until the green is gone, then raise blend just enough to soften the edge. Check it with Test 3s.';
+    box.appendChild(tip);
+
+    const posRow = document.createElement('div');
+    posRow.className = 'row';
+    for (const [label, key] of [['X offset', 'posX'], ['Y offset', 'posY']]) {
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.className = 'input';
+      input.step = '10';
+      input.value = clip[key] || 0;
+      input.onchange = () => { clip[key] = Number(input.value) || 0; scheduleCommandPreview(); };
+      posRow.appendChild(field(label, input));
+    }
+    box.appendChild(posRow);
+
+    box.appendChild(slider('Scale', clip.scale ?? 1, 0.2, 2, 0.05,
+      v => Math.round(v * 100) + '%', v => { clip.scale = v; scheduleCommandPreview(); }));
+  }
+
+  // --- Colour -------------------------------------------------------------
+  box.appendChild(slider('Brightness', clip.filters.brightness, -0.5, 0.5, 0.01,
+    v => v.toFixed(2), v => { clip.filters.brightness = v; scheduleCommandPreview(); }));
+  box.appendChild(slider('Contrast', clip.filters.contrast, 0.5, 2, 0.01,
+    v => v.toFixed(2), v => { clip.filters.contrast = v; scheduleCommandPreview(); }));
+  box.appendChild(slider('Saturation', clip.filters.saturation, 0, 2.5, 0.01,
+    v => v.toFixed(2), v => { clip.filters.saturation = v; scheduleCommandPreview(); }));
+}
+
+// ==========================================================================
+// Captions
+// ==========================================================================
+
+function renderCaptionStyle() {
+  const box = $('capStyle');
+  box.innerHTML = '';
+  const st = state.project.captionStyle;
+
+  const row1 = document.createElement('div');
+  row1.className = 'row';
+
+  const fontInput = document.createElement('input');
+  fontInput.className = 'input';
+  fontInput.value = st.font;
+  fontInput.onchange = () => { st.font = fontInput.value; scheduleCommandPreview(); };
+  row1.appendChild(field('Font (must be installed)', fontInput));
+
+  const sizeInput = document.createElement('input');
+  sizeInput.type = 'number';
+  sizeInput.className = 'input';
+  sizeInput.value = st.size;
+  sizeInput.onchange = () => { st.size = Number(sizeInput.value) || 54; };
+  row1.appendChild(field('Size', sizeInput));
+  box.appendChild(row1);
+
+  const row2 = document.createElement('div');
+  row2.className = 'row';
+
+  const colour = document.createElement('input');
+  colour.type = 'color';
+  colour.className = 'input';
+  colour.style.height = '28px';
+  colour.value = st.color;
+  colour.onchange = () => { st.color = colour.value; };
+  row2.appendChild(field('Text colour', colour));
+
+  const pos = document.createElement('select');
+  pos.className = 'input';
+  for (const p of ['bottom', 'middle', 'top']) {
+    const o = document.createElement('option');
+    o.value = p; o.textContent = p;
+    if (st.position === p) o.selected = true;
+    pos.appendChild(o);
+  }
+  pos.onchange = () => { st.position = pos.value; };
+  row2.appendChild(field('Position', pos));
+  box.appendChild(row2);
+
+  const anim = document.createElement('select');
+  anim.className = 'input';
+  for (const [v, label] of [
+    ['none', 'none'], ['fade', 'fade'], ['pop', 'pop in'],
+    ['slide', 'slide up'], ['typewriter', 'typewriter']
+  ]) {
+    const o = document.createElement('option');
+    o.value = v; o.textContent = label;
+    if (st.animation === v) o.selected = true;
+    anim.appendChild(o);
+  }
+  anim.onchange = () => { st.animation = anim.value; };
+  box.appendChild(field('Animation', anim));
+
+  const bgCheck = document.createElement('div');
+  bgCheck.className = 'check';
+  const bcb = document.createElement('input');
+  bcb.type = 'checkbox';
+  bcb.id = 'capBg';
+  bcb.checked = st.background;
+  bcb.onchange = () => { edit('caption box', () => { st.background = bcb.checked; }); renderCaptionStyle(); };
+  const bl = document.createElement('label');
+  bl.htmlFor = 'capBg';
+  bl.textContent = 'Box behind text';
+  bgCheck.append(bcb, bl);
+  box.appendChild(bgCheck);
+
+  if (st.background) {
+    const bgRow = document.createElement('div');
+    bgRow.className = 'row';
+    const bg = document.createElement('input');
+    bg.type = 'color';
+    bg.className = 'input';
+    bg.style.height = '28px';
+    bg.value = st.bgColor;
+    bg.onchange = () => { st.bgColor = bg.value; };
+    bgRow.appendChild(field('Box colour', bg));
+    box.appendChild(bgRow);
+  }
+
+  const marginInput = document.createElement('input');
+  marginInput.type = 'number';
+  marginInput.className = 'input';
+  marginInput.value = st.marginV;
+  marginInput.onchange = () => { st.marginV = Number(marginInput.value) || 0; };
+  box.appendChild(field('Distance from edge (px)', marginInput));
+}
+
+function renderCaptions() {
+  const list = $('capList');
+  list.innerHTML = '';
+  const caps = state.project.captions;
+
+  if (!caps.length) {
+    const note = document.createElement('div');
+    note.className = 'empty-note';
+    note.textContent = 'No captions yet. Transcribe the selected clip, import an .srt, or add lines by hand.';
+    list.appendChild(note);
+    return;
+  }
+
+  caps.sort((a, b) => a.start - b.start);
+  caps.forEach((cap, i) => {
+    const row = document.createElement('div');
+    row.className = 'cap-row';
+
+    const times = document.createElement('div');
+    const start = document.createElement('input');
+    start.className = 'cap-time';
+    start.value = cap.start.toFixed(2);
+    start.onchange = () => { cap.start = Number(start.value) || 0; renderCaptions(); };
+    const end = document.createElement('input');
+    end.className = 'cap-time';
+    end.value = cap.end.toFixed(2);
+    end.onchange = () => { cap.end = Number(end.value) || 0; renderCaptions(); };
+    trackContinuous(start, 'caption timing');
+    trackContinuous(end, 'caption timing');
+    times.append(start, end);
+
+    const text = document.createElement('textarea');
+    text.className = 'cap-text';
+    text.rows = 1;
+    text.value = cap.text;
+    text.oninput = () => { cap.text = text.value; };
+    // A whole burst of typing collapses into one entry, closed on blur —
+    // undo per keystroke would take a dozen presses to clear one line.
+    trackContinuous(text, 'caption text');
+
+    const del = document.createElement('button');
+    del.className = 'chip';
+    del.textContent = '×';
+    del.title = 'Remove this line';
+    del.onclick = () => { edit('remove caption', () => { caps.splice(i, 1); }); renderCaptions(); };
+
+    row.append(times, text, del);
+    list.appendChild(row);
+  });
+}
+
+async function transcribeSelected() {
+  const clip = selectedClip();
+  const source = clip ? clip.src : (state.binSelection[0] || state.bin[0]?.path);
+  if (!source) { toast('Select a clip or a bin item to transcribe.', 'warn'); return; }
+
+  toast('Transcribing. This runs locally and can take a while on long clips.');
+  const res = await api.transcribe(source, 'auto');
+  if (!res.ok) { toast('Transcription failed', 'err', res.error); return; }
+
+  edit('transcribe', () => {
+    // Whisper timestamps are relative to the source file. If the clip starts
+    // later on the timeline, shift them so captions land in the right place.
+    const shift = clip ? (clip.startSec - clip.inSec / (clip.speed || 1)) : 0;
+    state.project.captions = res.captions.map(c => ({
+      start: Math.max(0, c.start / (clip?.speed || 1) + shift),
+      end: Math.max(0, c.end / (clip?.speed || 1) + shift),
+      text: c.text
+    }));
+    state.project.captionsEnabled = true;
+  });
+  $('capEnabled').checked = true;
+  renderCaptions();
+  toast(`${res.captions.length} caption lines. Edit the timings below if any drift.`);
+}
+
+// ==========================================================================
+// Templates
+// ==========================================================================
+
+function renderTemplates() {
+  const box = $('tplList');
+  box.innerHTML = '';
+
+  for (const tpl of TEMPLATES) {
+    const el = document.createElement('div');
+    el.className = 'tpl';
+
+    const top = document.createElement('div');
+    top.className = 'tpl-top';
+    const name = document.createElement('span');
+    name.className = 'tpl-name';
+    name.textContent = tpl.name;
+    const tag = document.createElement('span');
+    tag.className = 'tpl-tag';
+    tag.textContent = tpl.tag;
+    top.append(name, tag);
+
+    const note = document.createElement('div');
+    note.className = 'tpl-note';
+    note.textContent = tpl.note;
+
+    // Draw the slot lengths to scale so the rhythm is visible before applying.
+    const bars = document.createElement('div');
+    bars.className = 'tpl-bars';
+    const lengths = tpl.slots.map(s => s.beats ? s.beats * beatSec() : s.dur);
+    const total = lengths.reduce((a, b) => a + b, 0);
+    tpl.slots.forEach((s, i) => {
+      const bar = document.createElement('div');
+      bar.className = 'tpl-bar' + ((s.speed || 1) > 1 ? ' fast' : (s.speed || 1) < 1 ? ' slow' : '');
+      bar.style.flex = String(lengths[i] / total);
+      bars.appendChild(bar);
+    });
+
+    const apply = document.createElement('button');
+    apply.className = 'btn btn-sm';
+    apply.textContent = 'Apply';
+    apply.onclick = () => {
+      const track = state.project.tracks[0];
+      if (!track.clips.length) { toast('Put some clips on Video 1 first.', 'warn'); return; }
+      edit(tpl.name, () => {
+        const sorted = [...track.clips].sort((a, b) => a.startSec - b.startSec);
+        track.clips = applyTemplate(tpl, sorted, state.project.bpm);
+      });
+      renderAll();
+      toast(`${tpl.name} applied to ${track.clips.length} clips.`);
+    };
+
+    el.append(top, note, bars, apply);
+    box.appendChild(el);
+  }
+}
+
+// ==========================================================================
+// Command preview
+// ==========================================================================
+
+let cmdTimer = null;
+function scheduleCommandPreview() {
+  clearTimeout(cmdTimer);
+  cmdTimer = setTimeout(async () => {
+    try {
+      const { mode, command } = await api.previewCommand(state.project);
+      $('cmdBody').textContent = command;
+      const badge = $('cmdMode');
+      badge.textContent = mode === 'copy' ? 'stream copy — no re-encode' : 'filter graph — re-encodes';
+      badge.className = 'cmd-mode ' + mode;
+    } catch (err) {
+      $('cmdBody').textContent = 'Could not build command: ' + err.message;
+    }
+  }, 200);
+}
+
+// ==========================================================================
+// Export
+// ==========================================================================
+
+async function runExport(previewSeconds) {
+  if (state.exporting) return;
+  if (!projectDuration()) { toast('Timeline is empty.', 'warn'); return; }
+
+  state.exporting = true;
+  $('progress').style.display = 'block';
+  $('btnCancelExport').style.display = 'inline-block';
+  $('btnExport').disabled = true;
+
+  const stop = api.onExportProgress(({ percent }) => {
+    $('progressFill').style.width = percent + '%';
+  });
+
+  try {
+    const res = await api.runExport(state.project, previewSeconds || null);
+    if (res.canceled) { toast('Export cancelled.'); }
+    else if (res.ok) {
+      toast(previewSeconds ? 'Test render done.' : 'Export done.');
+      api.reveal(res.path);
+    } else {
+      toast('Export failed', 'err', res.error);
+    }
+  } catch (err) {
+    toast('Export failed', 'err', String(err.message || err));
+  } finally {
+    stop();
+    state.exporting = false;
+    $('progress').style.display = 'none';
+    $('progressFill').style.width = '0';
+    $('btnCancelExport').style.display = 'none';
+    $('btnExport').disabled = false;
+  }
+}
+
+// ==========================================================================
+// Wiring
+// ==========================================================================
+
+function renderAll() {
+  renderHeads();
+  renderTimeline();
+  renderInspector();
+  scheduleCommandPreview();
+}
+
+// Media
+$('btnAddVideo').onclick = async () => addPaths(await api.pickMedia('video'));
+$('btnAddAudio').onclick = async () => addPaths(await api.pickMedia('audio'));
+
+const dz = $('dropzone');
+['dragenter', 'dragover'].forEach(ev =>
+  dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.add('hot'); }));
+['dragleave', 'drop'].forEach(ev =>
+  dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.remove('hot'); }));
+
+// The whole window accepts drops, not just the small zone.
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', async (e) => {
+  e.preventDefault();
+  dz.classList.remove('hot');
+  const paths = [...e.dataTransfer.files].map(f => api.pathForFile(f)).filter(Boolean);
+  if (paths.length) addPaths(paths);
+});
+
+$('btnSendV1').onclick = () => sendToTrack('v1');
+$('btnSendV2').onclick = () => sendToTrack('v2');
+$('btnSendA1').onclick = () => sendToTrack('a1');
+
+// Transport
+$('btnPlay').onclick = () => {
+  const v = $('video');
+  if (v.paused) v.play(); else v.pause();
+};
+$('btnSplit').onclick = splitAtPlayhead;
+$('btnSetIn').onclick = setInAtPlayhead;
+$('btnSetOut').onclick = setOutAtPlayhead;
+$('btnDeleteClip').onclick = deleteSelected;
+$('btnCloseGaps').onclick = closeGaps;
+
+// Zoom
+$('btnZoomIn').onclick = () => { state.pxPerSec = clamp(state.pxPerSec * 1.4, 4, 600); renderTimeline(); };
+$('btnZoomOut').onclick = () => { state.pxPerSec = clamp(state.pxPerSec / 1.4, 4, 600); renderTimeline(); };
+$('snapBeats').onchange = (e) => { state.snapBeats = e.target.checked; renderTimeline(); };
+
+// Captions
+$('capEnabled').onchange = (e) => {
+  edit('burn captions', () => { state.project.captionsEnabled = e.target.checked; });
+  scheduleCommandPreview();
+};
+$('btnTranscribe').onclick = transcribeSelected;
+$('btnImportSrt').onclick = async () => {
+  const caps = await api.importCaptions();
+  if (!caps) return;
+  edit('import captions', () => {
+    state.project.captions = caps;
+    state.project.captionsEnabled = true;
+  });
+  $('capEnabled').checked = true;
+  renderCaptions();
+  toast(`${caps.length} caption lines imported.`);
+};
+$('btnAddCaption').onclick = () => {
+  edit('add caption', () => {
+    state.project.captions.push({ start: state.playhead, end: state.playhead + 2, text: 'New line' });
+  });
+  renderCaptions();
+};
+
+// Project settings. These are static markup rather than built by field(), so
+// they get their undo tracking wired explicitly.
+$('projectName').onchange = (e) => { state.project.name = e.target.value || 'untitled'; };
+$('projW').onchange = (e) => { state.project.width = Number(e.target.value) || 1080; scheduleCommandPreview(); };
+$('projH').onchange = (e) => { state.project.height = Number(e.target.value) || 1920; scheduleCommandPreview(); };
+$('projFps').onchange = (e) => { state.project.fps = Number(e.target.value) || 30; scheduleCommandPreview(); };
+$('projBpm').onchange = (e) => { state.project.bpm = Number(e.target.value) || 120; renderAll(); renderTemplates(); };
+$('projPreset').onchange = (e) => { state.project.preset = e.target.value; scheduleCommandPreview(); };
+
+trackContinuous($('projectName'), 'rename');
+trackContinuous($('projW'), 'width');
+trackContinuous($('projH'), 'height');
+trackContinuous($('projFps'), 'fps');
+trackContinuous($('projBpm'), 'bpm');
+trackContinuous($('projPreset'), 'encode speed');
+
+function setSize(w, h) {
+  edit('canvas size', () => { state.project.width = w; state.project.height = h; });
+  $('projW').value = w; $('projH').value = h;
+  scheduleCommandPreview();
+}
+$('btnPortrait').onclick = () => setSize(1080, 1920);
+$('btnSquare').onclick = () => setSize(1080, 1080);
+$('btnLandscape').onclick = () => setSize(1920, 1080);
+
+// Export
+$('btnExport').onclick = () => runExport(null);
+$('btnPreviewExport').onclick = () => runExport(3);
+$('btnCancelExport').onclick = () => api.cancelExport();
+
+// Command panel
+$('cmdHead').onclick = (e) => {
+  if (e.target.id === 'btnCopyCmd') return;
+  const panel = $('cmdPanel');
+  panel.classList.toggle('collapsed');
+  $('cmdToggle').textContent = panel.classList.contains('collapsed') ? 'show' : 'hide';
+};
+$('btnCopyCmd').onclick = () => {
+  navigator.clipboard.writeText($('cmdBody').textContent);
+  toast('Command copied. Paste it in a terminal to run it yourself.');
+};
+
+// Save / open
+$('btnSave').onclick = async () => {
+  const p = await api.saveProject(state.project);
+  if (p) toast('Project saved.');
+};
+$('btnOpen').onclick = async () => {
+  const p = await api.openProject();
+  if (!p) return;
+  state.project = p;
+  state.selectedClipId = null;
+  state.playhead = 0;
+  // The stack described edits to the project that was just replaced. Undoing
+  // past an Open back into a different project's history would be nonsense.
+  history.clear();
+  updateHistoryButtons();
+  syncProjectInputs();
+  renderAll(); renderCaptions(); renderCaptionStyle(); renderTemplates();
+  toast('Project opened.');
+};
+
+// Undo / redo
+$('btnUndo').onclick = doUndo;
+$('btnRedo').onclick = doRedo;
+
+// Keyboard
+document.addEventListener('keydown', (e) => {
+  // Undo is checked before the typing guard: inside a caption box it should
+  // still undo the edit, which is what every other editor does.
+  if ((e.metaKey || e.ctrlKey) && (e.key === 'z' || e.key === 'Z')) {
+    e.preventDefault();
+    if (e.shiftKey) doRedo(); else doUndo();
+    return;
+  }
+  if ((e.metaKey || e.ctrlKey) && (e.key === 'y' || e.key === 'Y')) {
+    e.preventDefault();
+    doRedo();
+    return;
+  }
+
+  const typing = /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
+  if (typing) return;
+
+  if (e.code === 'Space') { e.preventDefault(); $('btnPlay').click(); }
+  if (e.key === 's' || e.key === 'S') splitAtPlayhead();
+  if (e.key === 'i') setInAtPlayhead();
+  if (e.key === 'o') setOutAtPlayhead();
+  if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); deleteSelected(); }
+  if (e.key === 'ArrowLeft') { state.playhead = Math.max(0, state.playhead - (e.shiftKey ? 1 : 1 / state.project.fps)); renderTimeline(); }
+  if (e.key === 'ArrowRight') { state.playhead += (e.shiftKey ? 1 : 1 / state.project.fps); renderTimeline(); }
+});
+
+window.addEventListener('resize', () => renderTimeline());
+
+// Boot
+checkEnv();
+renderBin();
+renderAll();
+renderCaptions();
+renderCaptionStyle();
+renderTemplates();
+updateHistoryButtons();

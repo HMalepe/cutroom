@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; media-src 'self' file: blob:; img-src 'self' file: blob: data:; style-src 'self' 'unsafe-inline';">
+  <title>Cutroom</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app">
+
+  <!-- ------------------------------------------------------------------ -->
+  <header class="topbar">
+    <span class="wordmark">Cutroom</span>
+    <input id="projectName" class="project-name" value="untitled" aria-label="Project name">
+
+    <button class="btn btn-sm btn-ghost" id="btnOpen">Open</button>
+    <button class="btn btn-sm btn-ghost" id="btnSave">Save</button>
+
+    <span class="topbar-rule"></span>
+
+    <button class="btn btn-sm btn-ghost" id="btnUndo" disabled>Undo</button>
+    <button class="btn btn-sm btn-ghost" id="btnRedo" disabled>Redo</button>
+
+    <span class="topbar-spacer"></span>
+
+    <span class="env-pill" id="envPill" title="ffmpeg does the actual encoding">
+      <span class="env-dot" id="envDot"></span>
+      <span id="envText">checking</span>
+    </span>
+
+    <button class="btn btn-sm" id="btnPreviewExport" title="Renders the first 3 seconds so you can check a key or a caption without waiting for a full export">Test 3s</button>
+    <button class="btn btn-primary" id="btnExport">Export</button>
+  </header>
+
+  <!-- ------------------------------------------------------------------ -->
+  <div class="stage">
+
+    <!-- Media bin --------------------------------------------------------->
+    <div class="col col-bin">
+      <div class="sec">
+        <div class="sec-head">
+          <span>Media</span>
+          <span>
+            <button class="btn btn-sm btn-ghost" id="btnAddVideo">+ Video</button>
+            <button class="btn btn-sm btn-ghost" id="btnAddAudio">+ Audio</button>
+          </span>
+        </div>
+        <div class="dropzone" id="dropzone">
+          Drop video, images or audio here
+        </div>
+        <div class="bin-list" id="binList"></div>
+      </div>
+
+      <div class="sec">
+        <div class="sec-head"><span>Add to timeline</span></div>
+        <div class="empty-note" id="binHint">
+          Select clips in the bin, then send them to a track. Order of selection
+          is the order they land.
+        </div>
+        <div style="margin-top:8px; display:flex; gap:5px; flex-wrap:wrap;">
+          <button class="btn btn-sm" id="btnSendV1">→ Video 1</button>
+          <button class="btn btn-sm" id="btnSendV2">→ Video 2</button>
+          <button class="btn btn-sm" id="btnSendA1">→ Audio 1</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Preview ----------------------------------------------------------->
+    <div class="col-preview">
+      <div class="viewer" id="viewer">
+        <div class="viewer-empty" id="viewerEmpty">
+          The preview plays the selected clip's source file directly.
+          It does not show green screen, speed or captions — use
+          <strong>Test 3s</strong> for that.
+        </div>
+        <video id="video" controls style="display:none"></video>
+      </div>
+      <div class="transport">
+        <button class="btn btn-sm" id="btnPlay">Play</button>
+        <button class="btn btn-sm" id="btnSplit" title="Split the selected clip at the playhead">Split</button>
+        <button class="btn btn-sm" id="btnSetIn" title="Trim the clip's start to the playhead">Set In</button>
+        <button class="btn btn-sm" id="btnSetOut" title="Trim the clip's end to the playhead">Set Out</button>
+        <span class="topbar-spacer"></span>
+        <span class="timecode" id="timecode">00:00:00<span class="frac">.00</span></span>
+        <span class="timecode-total" id="timecodeTotal">/ 00:00:00</span>
+      </div>
+    </div>
+
+    <!-- Inspector --------------------------------------------------------->
+    <div class="col col-inspect">
+
+      <div class="sec">
+        <div class="sec-head"><span>Clip</span><span id="clipName" class="tpl-tag">nothing selected</span></div>
+        <div id="inspector">
+          <div class="empty-note">Select a clip on the timeline to trim it, change its speed, or key out a background.</div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <div class="sec-head">
+          <span>Captions</span>
+          <span>
+            <button class="btn btn-sm btn-ghost" id="btnTranscribe">Transcribe</button>
+            <button class="btn btn-sm btn-ghost" id="btnImportSrt">Import</button>
+          </span>
+        </div>
+        <div class="check">
+          <input type="checkbox" id="capEnabled">
+          <label for="capEnabled">Burn captions into export</label>
+        </div>
+        <div id="capStyle"></div>
+        <div class="cap-list" id="capList"></div>
+        <button class="btn btn-sm btn-ghost" id="btnAddCaption" style="margin-top:6px;">+ Add line</button>
+      </div>
+
+      <div class="sec">
+        <div class="sec-head"><span>Templates</span></div>
+        <div class="empty-note" style="margin-bottom:8px;">
+          Applies to every clip on Video 1, in order.
+        </div>
+        <div id="tplList"></div>
+      </div>
+
+      <div class="sec">
+        <div class="sec-head"><span>Project</span></div>
+        <div class="row">
+          <div class="field">
+            <label class="field-label" for="projW">Width</label>
+            <input type="number" class="input" id="projW" value="1080">
+          </div>
+          <div class="field">
+            <label class="field-label" for="projH">Height</label>
+            <input type="number" class="input" id="projH" value="1920">
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label class="field-label" for="projFps">FPS</label>
+            <input type="number" class="input" id="projFps" value="30">
+          </div>
+          <div class="field">
+            <label class="field-label" for="projBpm">BPM</label>
+            <input type="number" class="input" id="projBpm" value="120">
+          </div>
+        </div>
+        <div class="field">
+          <label class="field-label" for="projPreset">Encode speed</label>
+          <select class="input" id="projPreset">
+            <option value="ultrafast">ultrafast — big file, quick</option>
+            <option value="veryfast">veryfast</option>
+            <option value="medium" selected>medium — balanced</option>
+            <option value="slow">slow — smaller file</option>
+          </select>
+        </div>
+        <div style="display:flex; gap:5px; margin-top:4px;">
+          <button class="btn btn-sm btn-ghost" id="btnPortrait">9:16</button>
+          <button class="btn btn-sm btn-ghost" id="btnSquare">1:1</button>
+          <button class="btn btn-sm btn-ghost" id="btnLandscape">16:9</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ------------------------------------------------------------------ -->
+  <div class="timeline">
+    <div class="tl-bar">
+      <button class="btn btn-sm btn-ghost" id="btnZoomOut">−</button>
+      <button class="btn btn-sm btn-ghost" id="btnZoomIn">+</button>
+      <span class="tpl-tag" id="zoomLabel">40 px/s</span>
+
+      <span style="width:1px; height:16px; background:var(--line);"></span>
+
+      <div class="check" style="margin:0;">
+        <input type="checkbox" id="snapBeats">
+        <label for="snapBeats">Snap to beat</label>
+      </div>
+
+      <button class="btn btn-sm btn-ghost" id="btnCloseGaps" title="Push every clip on the selected track flush against the one before it">Close gaps</button>
+      <button class="btn btn-sm btn-ghost btn-danger" id="btnDeleteClip">Delete clip</button>
+
+      <span class="topbar-spacer"></span>
+      <div class="progress" id="progress" style="max-width:180px; display:none;">
+        <div class="progress-fill" id="progressFill"></div>
+      </div>
+      <button class="btn btn-sm btn-danger" id="btnCancelExport" style="display:none;">Cancel</button>
+    </div>
+
+    <div class="tl-body">
+      <div class="tl-heads" id="tlHeads">
+        <div class="tl-heads-pad"></div>
+      </div>
+      <div class="timeline-scroll" id="tlScroll">
+        <div class="tl-inner" id="tlInner">
+          <div class="ruler" id="ruler"></div>
+          <div id="lanes"></div>
+          <div class="playhead" id="playhead" style="left:0"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ------------------------------------------------------------------ -->
+  <div class="cmd collapsed" id="cmdPanel">
+    <div class="cmd-head" id="cmdHead">
+      <span class="cmd-title">ffmpeg command</span>
+      <span class="cmd-mode" id="cmdMode">—</span>
+      <span class="topbar-spacer"></span>
+      <button class="btn btn-sm btn-ghost" id="btnCopyCmd">Copy</button>
+      <span class="tpl-tag" id="cmdToggle">show</span>
+    </div>
+    <div class="cmd-body" id="cmdBody">Build a timeline to see the command.</div>
+  </div>
+
+</div>
+
+<div class="toast-stack" id="toasts"></div>
+
+<script src="history.js"></script>
+<script src="templates.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

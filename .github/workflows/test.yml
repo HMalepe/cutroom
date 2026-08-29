@@ -1,0 +1,47 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to a branch makes the run already in flight irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      # One version failing should still report the others, so a break can be
+      # read as "only on 18" rather than just "red".
+      fail-fast: false
+      matrix:
+        # The floor the README promises, the current LTS, and the newest LTS.
+        node: ['18', '22', '24']
+
+    name: node ${{ matrix.node }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # --ignore-scripts skips Electron's postinstall, which downloads a
+      # ~100MB binary the tests never launch. Everything under test is either
+      # pure Node or runs in jsdom.
+      - name: Install
+        run: npm ci --ignore-scripts
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+
+      - name: Test
+        run: npm test
