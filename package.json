@@ -10,9 +10,12 @@
   },
   "author": "Holiday Malepe",
   "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
   "devDependencies": {
     "electron": "^32.0.0",
-    "jsdom": "^30.0.1"
+    "jsdom": "^26.1.0"
   },
   "build": {
     "appId": "com.holiday.cutroom",
