@@ -1019,7 +1019,7 @@ function renderInspector() {
   const xfNote = document.createElement('div');
   xfNote.className = 'empty-note';
   xfNote.style.marginBottom = '10px';
-  xfNote.textContent = 'Overlap two clips on different video tracks and give them matching fades — that is a crossfade.';
+  xfNote.textContent = 'Overlap two clips on the SAME video track — that is a crossfade. Overlap them on different tracks instead to layer one over the other.';
   box.appendChild(xfNote);
 
   // --- Volume -------------------------------------------------------------
