@@ -35,17 +35,6 @@ module.exports = [
     }
   },
   {
-    // shared/ffmpeg-builder.js is being actively rewritten by a concurrent
-    // PR (claude/xfade-crossfades). Deferring this one pre-existing finding
-    // rather than editing the file out from under that work: an unused
-    // `const path = require('path')` at the top of the file. Revisit once
-    // that PR lands and re-run the linter on the merged result.
-    files: ['shared/ffmpeg-builder.js'],
-    rules: {
-      'no-unused-vars': 'off'
-    }
-  },
-  {
     files: ['src/*.js'],
     languageOptions: {
       ecmaVersion: 2022,
@@ -57,11 +46,12 @@ module.exports = [
         ...globals.node,
         // Loaded as separate <script> tags before app.js in index.html, so
         // they share one global scope. ESLint lints one file at a time and
-        // can't see the declarations in history.js / templates.js, so they
-        // have to be listed here instead.
+        // can't see the declarations in history.js / templates.js /
+        // key-preview.js, so they have to be listed here instead.
         createHistory: 'readonly',
         TEMPLATES: 'readonly',
-        applyTemplate: 'readonly'
+        applyTemplate: 'readonly',
+        createKeyPreview: 'readonly'
       }
     },
     rules: {
@@ -71,7 +61,13 @@ module.exports = [
       // lexical binding that shadows access to the same-named window
       // property without touching window.history itself — legal, and
       // exactly what is intended here. Not a bug.
-      'no-redeclare': ['error', { builtinGlobals: false }]
+      'no-redeclare': ['error', { builtinGlobals: false }],
+      // key-preview.js's WebGL setup is deliberately catch-and-fall-back —
+      // a driver too old to compile the shader, or a frame not decodable
+      // yet, both mean "degrade to the plain <video>", not "log why". Same
+      // pattern as main.js's allowEmptyCatch, for catches that keep a named
+      // (but unused) binding instead of an empty one.
+      'no-unused-vars': ['error', { caughtErrors: 'none' }]
     }
   }
 ];
