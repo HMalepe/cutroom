@@ -122,23 +122,41 @@
   // ------------------------------------------------------------------------
 
   /*
-   * APPROXIMATION, and the biggest one in the file.
+   * APPROXIMATION, and the biggest one in the file — though tagged sources
+   * no longer pay for it.
    *
-   * ffmpeg keys the decoder's actual chroma planes. A browser hands us a
-   * <video> already converted to RGB, so to measure the same distance we have
-   * to convert back — which means guessing the matrix and range the file was
-   * encoded with. A <video> element does not expose either.
+   * ffmpeg keys the decoder's actual chroma planes. A browser hands key-preview
+   * a <video> already converted to RGB, so to measure the same distance we
+   * have to convert back, which means knowing the matrix and range the file
+   * was encoded with. A <video> element does not expose either directly, but
+   * `main.js` now reads them from ffprobe (`matrixNameFromTags`, right below)
+   * and threads the result through `state.bin` to the clip, so this function
+   * gets the real matrix for a tagged file and only falls back to guessing
+   * (limited-range BT.601, the same thing swscale assumes for untagged input)
+   * when the source genuinely carries no tag.
    *
-   * We assume limited-range BT.601, which is what swscale itself assumes for
-   * untagged input and what the great majority of phone and webcam footage
-   * carries. On a BT.709-tagged 1080p file the reconstructed U and V drift by
-   * a few units, which shifts the *effective* similarity slightly; the fix, if
-   * it ever matters, is to probe the stream's colour tags in main.js and pass
-   * the matrix name through, which is why this is a parameter and not baked in.
+   * That fallback used to be checked by reading the code. It no longer is:
+   * running a controlled BT.709-tagged frame through a headless Chromium and
+   * reading back the pixels `texImage2D` actually receives showed Chromium
+   * already colour-manages the <video> element correctly before WebGL ever
+   * sees it — the same frame tagged BT.709 vs BT.601 round-trips through
+   * Canvas2D and WebGL to two different, individually-correct RGB values, not
+   * one fixed interpretation. So the browser was never the missing piece;
+   * this reconstruction step was always the only place still guessing, and
+   * matching real ffmpeg output requires undoing the browser's (correct)
+   * conversion with the (correct) source matrix, not a fixed one.
    *
-   * Sampling the colour with "Pick colour from clip" makes the drift mostly
-   * self-cancelling anyway: the eyedropper samples an RGB frame and the key
-   * colour then travels through the same conversion the preview does.
+   * The export side needed no equivalent fix. `eq` and `chromakey` never
+   * leave YUV, so they cannot be tag-sensitive; `despill` does briefly
+   * convert to RGB internally, and swscale already reads the decoded frame's
+   * real colour tag for that conversion with no help from `buildVideoClipChain`
+   * — confirmed by running the same BT.709/BT.601-tagged pair through the real
+   * filter chain and diffing the output, not by reading vf_despill.c.
+   *
+   * Sampling the colour with "Pick colour from clip" still makes any residual
+   * drift on an untagged file mostly self-cancelling: the eyedropper samples
+   * an RGB frame and the key colour then travels through the same conversion
+   * the preview does.
    */
 
   /**
@@ -196,6 +214,45 @@
 
   function matrixFor(name) {
     return MATRICES[name] || MATRICES[DEFAULT_MATRIX];
+  }
+
+  /*
+   * ffprobe's `color_space` field is what everyone else calls "matrix
+   * coefficients" — the thing that actually decides which row of MATRICES is
+   * right. `color_primaries` and `color_transfer` describe gamut and gamma,
+   * neither of which this file models (see the eq section for why gamma in
+   * particular is out of scope), so they are not probed for.
+   *
+   * One real-world exception earns primaries a look-in anyway: some
+   * encoders tag primaries/transfer as bt709 and leave matrix coefficients
+   * unspecified, because the three are independent flags and matrix is the
+   * one people forget. Falling through to primaries in that one case is
+   * cheap and catches footage that would otherwise silently default to 601.
+   *
+   * Untagged input (color_space "unknown"/"unspecified", or missing
+   * entirely) resolves to DEFAULT_MATRIX, which is bt601 — verified against
+   * both ffmpeg's own swscale and a real browser decode (see key-preview's
+   * header) to be what an untagged file is assumed to be everywhere else in
+   * this pipeline too, so nothing here should override that on its own.
+   */
+  const BT709_SPACES = new Set(['bt709']);
+  const BT601_SPACES = new Set(['smpte170m', 'bt470bg', 'fcc', 'smpte240m']);
+
+  /**
+   * ffprobe's stream tags -> a name from MATRICES, or DEFAULT_MATRIX when the
+   * source is untagged or tagged with something this file has no row for.
+   * @param {{colorSpace?: string, colorPrimaries?: string, colorRange?: string}} tags
+   */
+  function matrixNameFromTags(tags) {
+    const t = tags || {};
+    const space = String(t.colorSpace || '').toLowerCase();
+    const primaries = String(t.colorPrimaries || '').toLowerCase();
+    const full = String(t.colorRange || '').toLowerCase() === 'pc';
+
+    if (BT709_SPACES.has(space)) return 'bt709';
+    if (BT601_SPACES.has(space)) return full ? 'bt601-full' : 'bt601';
+    if (BT709_SPACES.has(primaries)) return 'bt709';
+    return DEFAULT_MATRIX;
   }
 
   /**
@@ -491,6 +548,7 @@
     MATRICES,
     DEFAULT_MATRIX,
     matrixFor,
+    matrixNameFromTags,
     invert3x3,
     rgbToYuv,
     yuvToRgb,

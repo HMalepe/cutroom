@@ -217,11 +217,27 @@ is compared against is limited-range. It runs the three filters in the order
 `buildVideoClipChain` runs them — `eq` before the key, so raising saturation
 moves the matte in the preview exactly as it will in the render.
 
-The one thing it cannot reproduce is the source's chroma planes: a browser
-hands over RGB that has already been upsampled from them, and the shader
-reconstructs the 4:2:0 cells with a box filter. Measured against the real
-chain over a frame already in `yuv420p`, the matte agrees within 4/255 of
-alpha at every pixel.
+The one thing it cannot reproduce exactly is the source's chroma planes: a
+browser hands over RGB that has already been upsampled from them, and the
+shader reconstructs the 4:2:0 cells with a box filter. Measured against the
+real chain over a frame already in `yuv420p`, the matte agrees within 4/255
+of alpha at every pixel.
+
+Reconstructing that RGB back into YUV needs the source's real colour matrix,
+not a guess: `main.js` reads it from ffprobe on import and carries it through
+`state.bin` to the clip, and `chroma-math.js` uses it for every clip
+individually, falling back to limited-range BT.601 only when the file is
+genuinely untagged (matching what ffmpeg itself assumes for untagged input).
+A real headless Chromium confirmed this is the only place that still needed
+fixing: fed a controlled BT.709-tagged frame, both `<canvas>` 2D and the
+`texImage2D` call this preview actually uses already returned the correct,
+colour-managed RGB — a BT.709-tagged frame and the same bytes tagged BT.601
+came back as two different, individually-correct colours, not one fixed
+interpretation. The export side needed no matching change: `eq` and
+`chromakey` never leave YUV, and `despill` — the one filter here that does
+briefly touch RGB — already gets it right from swscale's own automatic,
+tag-aware conversion, confirmed by running a BT.709/BT.601-tagged pair
+through the real filter chain and diffing the output.
 
 ### Filter order matters
 
@@ -277,9 +293,6 @@ Reasonable next moves, roughly by effort:
 
 - **More tracks.** `state.project.tracks` is an array; the builder already
   loops it. Adding a fourth is a one-line change plus a UI button.
-- **Colour tags from the source.** The preview assumes limited-range BT.601
-  when it reconstructs chroma; probing the stream's real tags in `main.js` and
-  passing the matrix name through would close the last gap on BT.709 footage.
 - **Other transitions.** `xfade` has about fifty; the builder always asks for
   `fade`. Choosing per overlap is a couple of lines in `buildVideoRun` plus
   somewhere in the inspector to put the control.

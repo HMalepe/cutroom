@@ -160,6 +160,30 @@ test('rgbToYuv does not clamp, because chromakey measures a distance', () => {
   assert.ok(rgb.r <= 255 && rgb.r >= 0, `expected a displayable red, got ${rgb.r}`);
 });
 
+test('matrixNameFromTags reads ffprobe tags the way main.js will hand them over', () => {
+  assert.equal(M.matrixNameFromTags({ colorSpace: 'bt709' }), 'bt709');
+  assert.equal(M.matrixNameFromTags({ colorSpace: 'BT709' }), 'bt709', 'case-insensitive');
+  assert.equal(M.matrixNameFromTags({ colorSpace: 'smpte170m' }), 'bt601');
+  assert.equal(M.matrixNameFromTags({ colorSpace: 'bt470bg' }), 'bt601');
+  assert.equal(M.matrixNameFromTags({ colorSpace: 'smpte170m', colorRange: 'pc' }), 'bt601-full');
+});
+
+test('matrixNameFromTags falls through to primaries when matrix coefficients are unset', () => {
+  // A real pattern: some encoders tag primaries/transfer as bt709 and leave
+  // matrix coefficients unspecified, because the three are independent flags.
+  assert.equal(
+    M.matrixNameFromTags({ colorSpace: 'unknown', colorPrimaries: 'bt709' }),
+    'bt709'
+  );
+});
+
+test('matrixNameFromTags defaults untagged or unrecognised input to DEFAULT_MATRIX', () => {
+  assert.equal(M.matrixNameFromTags(undefined), M.DEFAULT_MATRIX);
+  assert.equal(M.matrixNameFromTags({}), M.DEFAULT_MATRIX);
+  assert.equal(M.matrixNameFromTags({ colorSpace: 'unknown' }), M.DEFAULT_MATRIX);
+  assert.equal(M.matrixNameFromTags({ colorSpace: 'bt2020nc' }), M.DEFAULT_MATRIX);
+});
+
 test('the matrix assumption is what it claims to be, and it matters', () => {
   // Both of these are "pure green" as far as the picture is concerned, but
   // BT.709 puts its chroma much closer to the key colour, so the same

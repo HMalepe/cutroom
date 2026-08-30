@@ -118,6 +118,7 @@ function makeClip(media, startSec) {
     sourceDuration: media.duration,
     hasAudio: media.hasAudio,
     hasVideo: media.hasVideo,
+    colorMatrix: media.colorMatrix,
     inSec: 0,
     outSec: media.duration || 5,
     startSec: startSec,

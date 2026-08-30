@@ -19,9 +19,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-require('../src/chroma-math.js'); // key-preview reads it off the global
+const M = require('../src/chroma-math.js'); // key-preview reads it off the global too
 const KP = require('../src/key-preview.js');
-const { opts, boot, seedBin, flush, SRC } = require('./dom-harness.js');
+const { opts, boot, seedBin, flush, SRC, fakeMedia } = require('./dom-harness.js');
 
 // ==========================================================================
 // Degrading
@@ -97,6 +97,121 @@ test('the shader uses ffmpeg\'s constants, not rounded-off versions of them', ()
   // gone back to the version that disagreed with the export by five codes.
   assert.ok(KP.FRAG.includes('4096.0'), 'process_c\'s fixed point');
   assert.ok(!KP.FRAG.includes('256.0 *'), 'and not create_lut\'s scale');
+});
+
+// ==========================================================================
+// Colour matrix selection
+// ==========================================================================
+
+/*
+ * draw() needs a real, linkable program before it will reach the uniform
+ * uploads, so the shader-compile mock above is not enough; this builds one
+ * that succeeds at every step and just records what draw() sent to
+ * uniformMatrix3fv, keyed by the uniform's own name.
+ */
+function makeFakeGl() {
+  const uniforms = {};
+  const uniformMatrix3fv = [];
+  const gl = {
+    VERTEX_SHADER: 1, FRAGMENT_SHADER: 2, COMPILE_STATUS: 3, LINK_STATUS: 4,
+    ARRAY_BUFFER: 5, STATIC_DRAW: 6, TEXTURE_2D: 7, TEXTURE_WRAP_S: 8, TEXTURE_WRAP_T: 9,
+    CLAMP_TO_EDGE: 10, TEXTURE_MIN_FILTER: 11, TEXTURE_MAG_FILTER: 12, LINEAR: 13,
+    RGBA: 14, UNSIGNED_BYTE: 15, COLOR_BUFFER_BIT: 16, TRIANGLE_STRIP: 17, FLOAT: 18, TEXTURE0: 19,
+    createShader: () => ({}),
+    shaderSource: () => {},
+    compileShader: () => {},
+    getShaderParameter: () => true,
+    getShaderInfoLog: () => '',
+    deleteShader: () => {},
+    createProgram: () => ({}),
+    attachShader: () => {},
+    linkProgram: () => {},
+    getProgramParameter: () => true,
+    getProgramInfoLog: () => '',
+    deleteProgram: () => {},
+    createBuffer: () => ({}),
+    bindBuffer: () => {},
+    bufferData: () => {},
+    getAttribLocation: () => 0,
+    getUniformLocation: (_prog, name) => (uniforms[name] || (uniforms[name] = { name })),
+    createTexture: () => ({}),
+    bindTexture: () => {},
+    texParameteri: () => {},
+    texImage2D: () => {},
+    viewport: () => {},
+    clearColor: () => {},
+    clear: () => {},
+    useProgram: () => {},
+    enableVertexAttribArray: () => {},
+    vertexAttribPointer: () => {},
+    activeTexture: () => {},
+    uniform1i: () => {},
+    uniform2f: () => {},
+    uniform4f: () => {},
+    uniform3f: () => {},
+    uniform1f: () => {},
+    uniformMatrix3fv: (loc, transpose, data) => uniformMatrix3fv.push({ name: loc.name, data: Array.from(data) }),
+    drawArrays: () => {},
+    deleteTexture: () => {},
+    deleteBuffer: () => {}
+  };
+  return { gl, uniformMatrix3fv };
+}
+
+/** Row-major MATRICES entry -> the column-major array WebGL wants, computed
+ *  independently of columnMajor() in key-preview.js so the test cannot pass
+ *  by sharing a bug with the code it checks. Rounded through Float32Array,
+ *  the same lossy step draw() itself applies before the upload. */
+function columnMajorIndependently(m) {
+  return Array.from(new Float32Array(
+    [m[0][0], m[1][0], m[2][0], m[0][1], m[1][1], m[2][1], m[0][2], m[1][2], m[2][2]]
+  ));
+}
+
+test('draw() selects the matrix from the clip\'s colour tag, not the project', () => {
+  const canvas = { width: 0, height: 0, getContext: () => fake.gl, addEventListener: () => {} };
+  const fake = makeFakeGl();
+  const kp = KP.createKeyPreview(canvas);
+  assert.ok(kp, 'the fully-stubbed context should link');
+
+  const video = { videoWidth: 100, videoHeight: 100 };
+  const project = { width: 100, height: 100, colorMatrix: 'bt709' }; // must be ignored
+  const clip = { chroma: { color: '#00FF00' }, colorMatrix: 'bt601' };
+
+  assert.ok(kp.draw(video, clip, project), 'draw should report a frame drawn');
+  const uFwd = fake.uniformMatrix3fv.filter(c => c.name === 'uFwd');
+  assert.equal(uFwd.length, 1);
+  assert.deepEqual(uFwd[0].data, columnMajorIndependently(M.MATRICES.bt601.m),
+    'a project.colorMatrix of bt709 must not leak into a bt601 clip');
+});
+
+test('draw() falls back to DEFAULT_MATRIX for an untagged clip', () => {
+  const canvas = { width: 0, height: 0, getContext: () => fake.gl, addEventListener: () => {} };
+  const fake = makeFakeGl();
+  const kp = KP.createKeyPreview(canvas);
+
+  const video = { videoWidth: 100, videoHeight: 100 };
+  const project = { width: 100, height: 100 };
+  const clip = { chroma: { color: '#00FF00' } }; // no colorMatrix: an untagged source
+
+  kp.draw(video, clip, project);
+  const uFwd = fake.uniformMatrix3fv.find(c => c.name === 'uFwd');
+  assert.deepEqual(uFwd.data, columnMajorIndependently(M.MATRICES[M.DEFAULT_MATRIX].m));
+});
+
+test('two clips in the same project can carry different colour matrices', () => {
+  const canvas = { width: 0, height: 0, getContext: () => fake.gl, addEventListener: () => {} };
+  const fake = makeFakeGl();
+  const kp = KP.createKeyPreview(canvas);
+  const video = { videoWidth: 100, videoHeight: 100 };
+  const project = { width: 100, height: 100 };
+
+  kp.draw(video, { chroma: {}, colorMatrix: 'bt709' }, project);
+  kp.draw(video, { chroma: {}, colorMatrix: 'bt601' }, project);
+
+  const sent = fake.uniformMatrix3fv.filter(c => c.name === 'uFwd').map(c => c.data);
+  assert.deepEqual(sent[0], columnMajorIndependently(M.MATRICES.bt709.m));
+  assert.deepEqual(sent[1], columnMajorIndependently(M.MATRICES.bt601.m));
 });
 
 // ==========================================================================
@@ -394,6 +509,38 @@ test('changing speed alone updates playbackRate without moving the loop window',
     const video = doc.getElementById('video');
     assert.equal(video.playbackRate, 4);
     assert.equal(video.currentTime, 0, 'the default trim starts at 0, untouched by a speed-only change');
+  } finally {
+    stopLoop(doc);
+  }
+});
+
+test('a probed colour tag survives the whole probe -> bin -> clip -> draw() pipeline', opts, async () => {
+  // End to end, through the real app.js and the real makeClip, rather than
+  // constructing a clip object by hand: the thing worth pinning here is that
+  // nothing along that path drops main.js's tag or defaults it away.
+  const { win, doc } = boot();
+  const drawnClips = [];
+  win.createKeyPreview = () => ({
+    draw: (video, clip) => { drawnClips.push(clip); return true; },
+    resize: () => ({ width: 1920, height: 1080 }),
+    destroy: () => {},
+    isLost: () => false
+  });
+  win.cutroom.probe = async (p) => ({ ...fakeMedia(path.basename(p)), colorMatrix: 'bt709' });
+
+  try {
+    seedBin(win, doc, ['camera.mp4']);
+    await flush();
+    doc.querySelector('#binList .bin-item').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+    doc.getElementById('btnSendV1').click();
+    doc.querySelector('#lanes .clip').dispatchEvent(
+      new win.MouseEvent('pointerdown', { bubbles: true, clientX: 10, clientY: 10 })
+    );
+    await rafTick();
+
+    assert.ok(drawnClips.length > 0, 'draw() should have been called at least once');
+    assert.ok(drawnClips.every(c => c.colorMatrix === 'bt709'),
+      'every draw() call should carry the probed tag through to the clip');
   } finally {
     stopLoop(doc);
   }

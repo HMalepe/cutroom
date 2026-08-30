@@ -354,7 +354,8 @@ void main() {
      * @param {HTMLVideoElement} video  must have metadata; earlier than that
      *   there are no dimensions to fit against and nothing is drawn
      * @param {object} clip             a timeline clip, for its chroma/filters
-     * @param {object} project          for width/height and the matrix name
+     *   and the source's colour matrix
+     * @param {object} project          for width/height
      * @returns {boolean} whether anything was drawn
      */
     function draw(video, clip, project) {
@@ -376,7 +377,11 @@ void main() {
 
       const chroma = (clip && clip.chroma) || {};
       const filters = (clip && clip.filters) || {};
-      const matrix = M().matrixFor((project && project.colorMatrix) || M().DEFAULT_MATRIX);
+      // The colour tag belongs to the clip's source file, not the project
+      // canvas — two clips in one project can come from differently-tagged
+      // cameras. matrixFor() falls back to DEFAULT_MATRIX on its own for an
+      // untagged or missing value, so nothing here needs to guess first.
+      const matrix = M().matrixFor(clip && clip.colorMatrix);
       const keyUV = M().keyUVFromHex(chroma.color);
 
       const contrast = num(filters.contrast, 1);

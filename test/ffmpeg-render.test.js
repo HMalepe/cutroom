@@ -74,6 +74,43 @@ const withSound = () => source('sound', [
   '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest'
 ]);
 
+/**
+ * A solid 320x240 frame built from exact YUV bytes rather than an ffmpeg
+ * colour source, so its Y/U/V is known precisely instead of trusted to
+ * survive an RGB colour spec through a first encode untouched. Tagged with
+ * real -colorspace/-color_primaries/-color_trc/-color_range flags — used to
+ * prove ffmpeg reads its OWN decoded frame's tag with no help from
+ * buildVideoClipChain, which never passes any of those flags itself.
+ */
+function taggedSolid(name, { y, u, v, tag }) {
+  const key = `tagged-${name}`;
+  if (!sources.has(key)) {
+    const w = 320, h = 240, frames = 90;
+    // rawvideo has no frame count of its own — the demuxer just reads
+    // w*h*1.5-byte chunks until the file runs out — so the frame has to be
+    // repeated on disk rather than asked for with -frames:v against a
+    // single copy, or the "clip" is one real frame and 2.97s of nothing.
+    const frame = Buffer.concat([
+      Buffer.alloc(w * h, y),
+      Buffer.alloc((w * h) / 4, u),
+      Buffer.alloc((w * h) / 4, v)
+    ]);
+    const rawFile = path.join(DIR, `${name}.yuv`);
+    fs.writeFileSync(rawFile, Buffer.concat(Array(frames).fill(frame)));
+    const file = path.join(DIR, `${name}.mp4`);
+    const r = spawnSync('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'rawvideo', '-pix_fmt', 'yuv420p', '-s', `${w}x${h}`, '-r', '30', '-i', rawFile,
+      '-pix_fmt', 'yuv420p',
+      '-colorspace', tag, '-color_primaries', tag, '-color_trc', tag, '-color_range', 'tv',
+      file
+    ], { encoding: 'utf8' });
+    assert.equal(r.status, 0, `fixture ${name} failed:\n${r.stderr}`);
+    sources.set(key, file);
+  }
+  return sources.get(key);
+}
+
 // --------------------------------------------------------------------------
 // Helpers
 // --------------------------------------------------------------------------
@@ -322,4 +359,51 @@ test('abutting clips, which take no xfade at all, still render', opts, () => {
     clip(white(), { startSec: 3 })
   ]]));
   near(durationOf(out), 6, 0.15, 'abutting clips are appended, not overlapped');
+});
+
+// --------------------------------------------------------------------------
+// Colour tags: does the export need to know about them itself?
+// --------------------------------------------------------------------------
+
+/*
+ * chroma-math.js has to guess the source's YUV matrix, because a browser
+ * hands the preview RGB with no tag attached. The export never has that
+ * problem — it stays in ffmpeg's own decode the whole way — but does
+ * `buildVideoClipChain` need to pass a matrix along anyway for despill (the
+ * one filter in the chain that briefly leaves YUV) to get it right?
+ *
+ * These two fixtures are the exact same YUV bytes, tagged two different real
+ * ways. Nothing in the builder passes -colorspace, -color_primaries or
+ * -color_trc — so if despill's output still comes out correct for each tag,
+ * that is swscale reading the decoded frame's own colour metadata on its
+ * own, and the builder needs no change. Expected values below were computed
+ * independently, from chroma-math.js's own yuvToRgb + despillGreen, not
+ * copied from a prior run of this test.
+ */
+test('despill reads the source\'s real colour tag on its own; the builder passes it nothing', opts, () => {
+  const chroma = { on: true, color: '#00FF00', similarity: 0.1, blend: 0.05 };
+  const src709 = taggedSolid('src709', { y: 150, u: 97, v: 96, tag: 'bt709' });
+  const src601 = taggedSolid('src601', { y: 150, u: 97, v: 96, tag: 'smpte170m' });
+
+  const out709 = render('tag709', project([[clip(src709, { chroma })]]));
+  const out601 = render('tag601', project([[clip(src601, { chroma })]]));
+
+  const [r709, g709, b709] = pixel(out709, 0.5);
+  const [r601, g601, b601] = pixel(out601, 0.5);
+
+  // Y150/U97/V96 read as bt709 is true rgb(99,180,91); despill (mix=0.5) pulls
+  // green's excess over the red/blue average back out, landing near (99,95,91).
+  near(r709, 99, 8, 'bt709: red is untouched by despill');
+  near(g709, 95, 8, 'bt709: green is despilled down from ~180');
+  near(b709, 91, 8, 'bt709: blue is untouched by despill');
+
+  // The identical bytes read as bt601 are a different true colour, rgb(105,
+  // 194, 93); despilled that lands near (105, 99, 93) — visibly different
+  // from the bt709 render above, from the tag alone.
+  near(r601, 105, 8, 'bt601: red is untouched by despill');
+  near(g601, 99, 8, 'bt601: green is despilled down from ~194');
+  near(b601, 93, 8, 'bt601: blue is untouched by despill');
+
+  assert.ok(Math.abs(g709 - g601) > 3,
+    `identical bytes under different tags should despill to visibly different green, saw ${g709} vs ${g601}`);
 });
