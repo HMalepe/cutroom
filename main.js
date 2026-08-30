@@ -6,7 +6,7 @@
 
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { app, BrowserWindow, Menu, ipcMain, dialog, shell } = require('electron');
 const { spawn, execFile } = require('child_process');
 const path = require('path');
 const fs = require('fs');
@@ -14,10 +14,44 @@ const os = require('os');
 
 const builder = require('./shared/ffmpeg-builder');
 const { validateProject, PROJECT_VERSION } = require('./shared/project-schema');
+const saveState = require('./shared/save-state');
 const { matrixNameFromTags } = require('./src/chroma-math');
 
 let win = null;
 let currentExport = null;
+
+// --------------------------------------------------------------------------
+// Save state
+// --------------------------------------------------------------------------
+
+/*
+ * Three pieces of state, and it is worth being precise about who owns what.
+ *
+ * The renderer owns the project. Main never holds a copy, because a copy is a
+ * copy that can be stale, and the one moment it would be read — saving on the
+ * way out of a close dialog — is exactly the moment being a few hundred
+ * milliseconds behind would silently write the wrong file. So when main needs
+ * the project it asks the renderer for it.
+ *
+ * Main owns the current file path and mirrors the dirty flag, because both are
+ * needed by things only main can do: the window title, and a close handler
+ * that has to decide before any renderer round-trip whether to interrupt.
+ */
+let currentPath = null;
+let isDirty = false;
+// Only used for the title before a project has a file, and in the close
+// dialog's "Save changes to X?" — so it is a label, not state anything reads.
+let projectName = 'untitled';
+
+// Set once the close guard has run and allowed the close, so the second pass
+// through the 'close' handler falls straight through instead of asking again.
+let allowClose = false;
+// Cmd+Q sets this. Without it, the re-close after the dialog would close the
+// window and leave the app running on macOS — a quit that quietly became a
+// close, which looks exactly like the app ignoring the shortcut.
+let quitting = false;
+// Resolver for a save that main asked the renderer to perform.
+let pendingSave = null;
 
 // --------------------------------------------------------------------------
 // Locating ffmpeg
@@ -63,7 +97,7 @@ function createWindow() {
     minWidth: 1080,
     minHeight: 680,
     backgroundColor: '#12161C',
-    title: 'Cutroom',
+    title: saveState.titleFor({}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -71,17 +105,339 @@ function createWindow() {
     }
   });
   win.loadFile(path.join(__dirname, 'src', 'index.html'));
+  win.on('close', onWindowClose);
+  win.on('closed', () => { win = null; });
+  applyWindowTitle();
+  return win;
 }
 
+/**
+ * The window title is the only place the app says which file you are editing
+ * and whether it is saved, so it is recomputed from one function rather than
+ * poked at from the four places that can change either.
+ */
+function applyWindowTitle() {
+  if (!win || win.isDestroyed()) return;
+  win.setTitle(saveState.titleFor({ filePath: currentPath, projectName, dirty: isDirty }));
+  if (process.platform === 'darwin') {
+    // The proxy icon and the dot in the close button. Mac users read the
+    // close button for this before they read the title.
+    win.setDocumentEdited(isDirty);
+    win.setRepresentedFilename(currentPath || '');
+  }
+}
+
+// --------------------------------------------------------------------------
+// The close guard
+// --------------------------------------------------------------------------
+
+/*
+ * Electron's 'close' event is synchronous and the dialog is not, which is the
+ * whole difficulty. preventDefault() has to happen now, before any await, or
+ * the window is already gone by the time the user is asked; and the close then
+ * has to be started again by hand once the answer arrives, through a flag that
+ * makes the second pass fall through instead of asking twice.
+ *
+ * Getting either half wrong has a distinctive failure: no preventDefault and
+ * the prompt appears over a window that is already closing, no second close
+ * and the window can never be shut at all.
+ */
+function onWindowClose(e) {
+  if (allowClose) return;
+
+  if (!isDirty) {
+    // A clean exit must not leave an autosave behind. That file existing is
+    // what makes the next launch ask about recovery, and a recovery prompt
+    // after an ordinary quit is the thing that gets the whole feature turned
+    // off — so "there is nothing to recover" is stated by deleting it here
+    // rather than worked out later.
+    clearAutosave();
+    return;
+  }
+
+  e.preventDefault();
+  resolveDirtyClose().then(allowed => {
+    if (!allowed) {
+      // Cancel means cancel, including for a Cmd+Q that got us here: leaving
+      // `quitting` set would make the next ordinary window close quit the app.
+      quitting = false;
+      return;
+    }
+    // Save, Don't Save and "it was already clean" all mean the work is
+    // resolved, so the autosave has nothing left to offer. Don't Save
+    // especially: restoring what the user just chose to throw away is the
+    // single most annoying thing a recovery feature can do.
+    clearAutosave();
+    allowClose = true;
+    if (quitting) app.quit(); else win.close();
+  });
+}
+
+/**
+ * Ask, and act on the answer. Resolves true if the close may go ahead.
+ */
+async function resolveDirtyClose() {
+  const { response } = await dialog.showMessageBox(
+    win, saveState.closeDialogOptions({ projectName })
+  );
+  const choice = saveState.closeChoice(response);
+
+  if (choice === 'cancel') return false;
+  if (choice === 'discard') return true;
+
+  // Save. The project lives in the renderer, so the renderer does the saving
+  // and reports back — including reporting that the user cancelled the Save
+  // dialog, which has to abort the close rather than fall through it.
+  const result = await requestRendererSave();
+  return Boolean(result && result.ok);
+}
+
+/**
+ * Ask the renderer to save and wait for it to say how that went.
+ *
+ * The timeout is not defensive decoration. Without it a renderer that has
+ * hung leaves a window that cannot be closed by any means, and the failure
+ * resolves to "not saved", which cancels the close — so the worst case is a
+ * window that stays open, never one that takes unsaved work with it.
+ */
+function requestRendererSave(timeoutMs = 30000) {
+  if (!win || win.isDestroyed()) return Promise.resolve({ ok: false });
+  return new Promise(resolve => {
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      pendingSave = null;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => finish({ ok: false, timedOut: true }), timeoutMs);
+    pendingSave = finish;
+    win.webContents.send('menu:command', { command: 'save', reply: true });
+  });
+}
+
+ipcMain.on('project:save-finished', (_e, result) => {
+  if (pendingSave) pendingSave(result || { ok: false });
+});
+
+/**
+ * The renderer's own guard, for New and Open — the two other ways to walk away
+ * from unsaved work. Same dialog, same three answers; the renderer acts on the
+ * string rather than main driving it, because unlike a close there is nothing
+ * for main to abort.
+ */
+ipcMain.handle('project:confirm-discard', async () => {
+  if (!isDirty) return 'discard';
+  const { response } = await dialog.showMessageBox(
+    win, saveState.closeDialogOptions({ projectName })
+  );
+  return saveState.closeChoice(response);
+});
+
 app.whenReady().then(() => {
+  Menu.setApplicationMenu(buildAppMenu());
+  // Read before the window: see readAutosaveForRestore for why the order here
+  // is load-bearing rather than arbitrary.
+  const pending = readAutosaveForRestore();
   createWindow();
+  if (pending) offerRestore(pending);
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
 
+// Cmd+Q and any other app-level quit. Recorded rather than acted on: the
+// window's own close handler is the one place that knows whether there is
+// anything to ask about, and it needs to know which of the two it is
+// finishing once the answer comes back.
+app.on('before-quit', () => { quitting = true; });
+
 app.on('window-all-closed', () => {
+  // Belt and braces. The close handler above already clears this on every
+  // route out; this catches a window destroyed some way that never ran it.
+  clearAutosave();
   if (process.platform !== 'darwin') app.quit();
+});
+
+// --------------------------------------------------------------------------
+// Application menu
+// --------------------------------------------------------------------------
+
+/*
+ * Setting an application menu replaces Electron's default one wholesale, and
+ * the default is where cut/copy/paste come from. Without the roles below,
+ * every text field in the app — the caption editor above all — silently loses
+ * clipboard support on macOS, where those shortcuts are the menu's to deliver
+ * and nothing in the page provides them. So the Edit menu carries the standard
+ * roles alongside the app's own Undo and Redo, and `appMenu` restores the
+ * About/Hide/Quit block that would otherwise vanish with it.
+ *
+ * Undo and Redo are wired to the app's history, not to the `undo`/`redo`
+ * roles. Those roles undo typing inside the focused text field; this app's
+ * undo is project-level, and the two are not interchangeable — a user who
+ * splits a clip and presses Cmd+Z expects the split back, not their last
+ * keystroke in a caption box.
+ */
+function buildAppMenu() {
+  const mac = process.platform === 'darwin';
+  const send = (command) => () => {
+    if (win && !win.isDestroyed()) win.webContents.send('menu:command', { command });
+  };
+
+  /*
+   * `registerAccelerator: false` displays the shortcut without claiming it, so
+   * on Windows and Linux app.js's keydown listener stays the single handler
+   * for undo — the same one the tests drive. macOS ignores the option (the
+   * system menu owns key equivalents there), so on that platform the menu is
+   * the handler instead. Either way exactly one of the two paths runs; the
+   * guard in dirty-state.js is what makes that true rather than assumed.
+   */
+  const historyItem = (label, command, accelerator) => ({
+    label, accelerator, registerAccelerator: mac, click: send(command)
+  });
+
+  return Menu.buildFromTemplate([
+    ...(mac ? [{ role: 'appMenu' }] : []),
+    {
+      label: 'File',
+      submenu: [
+        { label: 'New', accelerator: 'CmdOrCtrl+N', click: send('new') },
+        { label: 'Open…', accelerator: 'CmdOrCtrl+O', click: send('open') },
+        { type: 'separator' },
+        { label: 'Save', accelerator: 'CmdOrCtrl+S', click: send('save') },
+        { label: 'Save As…', accelerator: 'CmdOrCtrl+Shift+S', click: send('save-as') },
+        ...(mac ? [] : [{ type: 'separator' }, { role: 'quit' }])
+      ]
+    },
+    {
+      label: 'Edit',
+      submenu: [
+        historyItem('Undo', 'undo', 'CmdOrCtrl+Z'),
+        historyItem('Redo', 'redo', mac ? 'Shift+Cmd+Z' : 'Ctrl+Y'),
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' },
+        ...(mac
+          ? [{ role: 'pasteAndMatchStyle' }, { role: 'delete' }, { role: 'selectAll' }]
+          : [{ role: 'delete' }, { type: 'separator' }, { role: 'selectAll' }])
+      ]
+    },
+    {
+      label: 'View',
+      submenu: [{ role: 'reload' }, { role: 'toggleDevTools' }, { type: 'separator' },
+                { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' },
+                { type: 'separator' }, { role: 'togglefullscreen' }]
+    },
+    { role: 'windowMenu' }
+  ]);
+}
+
+// --------------------------------------------------------------------------
+// Autosave and crash recovery
+// --------------------------------------------------------------------------
+
+/*
+ * userData rather than a dotfile beside the project: there may be no project
+ * file yet — which is the case with the most to lose — and a directory the OS
+ * already gives us is not one the user has to be told about or clean up.
+ */
+const autosavePath = () => path.join(app.getPath('userData'), saveState.AUTOSAVE_FILENAME);
+
+/**
+ * Written through a temp file and renamed. The event this exists for is the
+ * app dying, and dying midway through an fs.writeFileSync leaves a truncated
+ * autosave — a recovery file that cannot be recovered from. rename is atomic
+ * within a directory, so the real path only ever holds a whole record.
+ */
+function writeAutosave(project) {
+  const target = autosavePath();
+  const tmp = `${target}.tmp`;
+  const record = saveState.autosaveRecord({ project, filePath: currentPath, savedAt: Date.now() });
+  try {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(record), 'utf8');
+    fs.renameSync(tmp, target);
+  } catch {
+    // An autosave that cannot be written is not worth interrupting anyone
+    // over — the project is still safe in memory, and the user has not asked
+    // for anything. The next tick tries again.
+    try { fs.unlinkSync(tmp); } catch {}
+  }
+}
+
+function clearAutosave() {
+  try { fs.unlinkSync(autosavePath()); } catch {}
+}
+
+/**
+ * Read the autosave and decide whether it is worth offering.
+ *
+ * Called before the window exists, and that is not incidental. The moment the
+ * renderer boots it reports a clean project, and main deletes the autosave on
+ * hearing that — so a read scheduled any later is a race against the app's own
+ * tidying up. Doing it first makes the ordering a property of the code rather
+ * than of how quickly a page happens to load.
+ *
+ * @returns {{record: object, reason: string}|null}
+ */
+function readAutosaveForRestore() {
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(autosavePath(), 'utf8'));
+  } catch {
+    return null; // No autosave, or one we cannot read. Either way, nothing to offer.
+  }
+
+  const read = saveState.readAutosaveRecord(parsed);
+  if (!read.ok) { clearAutosave(); return null; }
+  const record = read.record;
+
+  let fileMtimeMs = null;
+  if (record.filePath) {
+    try { fileMtimeMs = fs.statSync(record.filePath).mtimeMs; } catch { fileMtimeMs = null; }
+  }
+
+  const verdict = saveState.shouldOfferRestore({ record, fileMtimeMs });
+  if (!verdict.offer) { clearAutosave(); return null; }
+  return { record, reason: verdict.reason };
+}
+
+/** Ask, once the page it would be restored into actually exists. */
+function offerRestore({ record, reason }) {
+  win.webContents.once('did-finish-load', async () => {
+    if (!win || win.isDestroyed()) return;
+    const { response } = await dialog.showMessageBox(
+      win, saveState.restoreDialogOptions({ reason, filePath: record.filePath })
+    );
+    if (saveState.restoreChoice(response) !== 'restore') { clearAutosave(); return; }
+    if (!win || win.isDestroyed()) return;
+
+    currentPath = record.filePath;
+    // Recovered work is unsaved work, whatever it was recovered from.
+    isDirty = true;
+    applyWindowTitle();
+    win.webContents.send('project:restore', { project: record.project, filePath: record.filePath });
+  });
+}
+
+ipcMain.on('project:autosave', (_e, project) => {
+  if (project) writeAutosave(project);
+});
+
+/**
+ * The renderer's running report on the project: whether it differs from the
+ * file, and what it is called. Both feed the title; the dirty half also feeds
+ * the close guard, which is why it is pushed on every change rather than
+ * asked for at close time, when the renderer might be busy.
+ */
+ipcMain.on('project:state', (_e, { dirty, name } = {}) => {
+  isDirty = Boolean(dirty);
+  if (typeof name === 'string') projectName = name;
+  // Clean means the file on disk already has everything. Nothing to recover.
+  if (!isDirty) clearAutosave();
+  applyWindowTitle();
 });
 
 // --------------------------------------------------------------------------
@@ -381,17 +737,49 @@ ipcMain.handle('captions:import', async () => {
 // Project save / open
 // --------------------------------------------------------------------------
 
-ipcMain.handle('project:save', async (_e, project) => {
-  const res = await dialog.showSaveDialog(win, {
-    defaultPath: path.join(app.getPath('documents'), `${project.name || 'project'}.cutroom.json`),
-    filters: [{ name: 'Cutroom project', extensions: ['json'] }]
-  });
-  if (res.canceled) return null;
+/**
+ * Save and Save As are one handler, because the difference between them is a
+ * single decision — whether to open a dialog — and splitting them would give
+ * that decision two places to be made differently.
+ *
+ * Returns `{ok, path}`, `{canceled}` or `{ok: false, error}`. A plain path
+ * would not do: the close guard has to be able to tell "saved" from "the user
+ * backed out of the Save dialog", and those have opposite consequences.
+ */
+ipcMain.handle('project:save', async (_e, { project, saveAs } = {}) => {
+  if (!project) return { ok: false, error: 'Nothing to save.' };
+
+  const plan = saveState.savePlan({ filePath: currentPath, saveAs });
+  let target = plan.path;
+
+  if (plan.needsDialog) {
+    const res = await dialog.showSaveDialog(win, {
+      defaultPath: plan.path ||
+        path.join(app.getPath('documents'), `${project.name || 'project'}.cutroom.json`),
+      filters: [{ name: 'Cutroom project', extensions: ['json'] }]
+    });
+    if (res.canceled) return { canceled: true };
+    target = res.filePath;
+  }
+
   // The version rides on the file, not on the project in memory: it describes
   // the format on disk, and nothing in the editor should start reading it.
   const onDisk = { ...project, version: PROJECT_VERSION };
-  fs.writeFileSync(res.filePath, JSON.stringify(onDisk, null, 2), 'utf8');
-  return res.filePath;
+  try {
+    fs.writeFileSync(target, JSON.stringify(onDisk, null, 2), 'utf8');
+  } catch (err) {
+    // A full disk or a read-only folder has to reach the user as a failure.
+    // Reported as not-saved, so a save-on-close that hits this cancels the
+    // close instead of quietly closing over the top of the failure.
+    return { ok: false, error: `Could not save ${path.basename(target)}.`, detail: String(err.message || err) };
+  }
+
+  currentPath = target;
+  isDirty = false;
+  projectName = project.name || projectName;
+  clearAutosave();
+  applyWindowTitle();
+  return { ok: true, path: target };
 });
 
 ipcMain.handle('project:open', async () => {
@@ -420,5 +808,28 @@ ipcMain.handle('project:open', async () => {
 
   const check = validateProject(parsed);
   if (!check.ok) return { ok: false, error: check.error, detail: name };
-  return { ok: true, project: check.project };
+
+  // Only now, once the file is known good: this is the path Save writes back
+  // to, and pointing it at a file that was refused would be worse than having
+  // no path at all.
+  currentPath = file;
+  isDirty = false;
+  projectName = check.project.name || 'untitled';
+  clearAutosave();
+  applyWindowTitle();
+  return { ok: true, project: check.project, filePath: file };
+});
+
+/**
+ * New. The project the renderer is about to build has never been anywhere, so
+ * the file it would be saved back to has to be forgotten here — otherwise the
+ * first Save would write a brand new project over the last one.
+ */
+ipcMain.handle('project:new', async () => {
+  currentPath = null;
+  isDirty = false;
+  projectName = 'untitled';
+  clearAutosave();
+  applyWindowTitle();
+  return { ok: true };
 });

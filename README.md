@@ -44,7 +44,8 @@ npm test
 ```
 
 `node --test`, no framework. Three kinds: unit tests over the pure modules
-(`ffmpeg-builder`, `history`, `templates`, `chroma-math`), integration tests
+(`ffmpeg-builder`, `history`, `templates`, `chroma-math`, `save-state`,
+`dirty-state`), integration tests
 that load the real `index.html` and `app.js` into jsdom and drive actual
 buttons and pointer events, and render tests that put the built ffmpeg command
 through a real ffmpeg and inspect the pixels. The second kind is what stops
@@ -136,6 +137,24 @@ gets restored is the project and the selection; your media bin, playhead and
 zoom stay where they are, because those are where you are looking rather than
 what you have made.
 
+**Saving.** The title bar shows the file you are editing and a `●` when it
+has changes that are not in it (on macOS, the same dot appears in the close
+button). **Save** writes back to that file without asking; **Save As** always
+asks; the first save of a new project asks, because there is nowhere yet to
+write. Closing the window with unsaved changes asks Save / Don't Save /
+Cancel, and Cancel genuinely cancels — including a Cmd-Q that got there.
+New and Open ask the same question, for the same reason.
+
+Undoing back to exactly the state you last saved leaves you *not* dirty: the
+dot goes away, and closing asks nothing. See "Dirty is a comparison" below.
+
+**Autosave.** Every couple of seconds after you stop editing, and at least
+every thirty seconds if you never do, the project is written to a recovery
+file in the app's own data folder. If Cutroom or the machine dies, the next
+launch offers it back. A normal quit deletes it, so a launch after an
+ordinary session never asks — that is the whole difference between a recovery
+feature people keep and one they turn off.
+
 ## Keyboard
 
 | | |
@@ -147,6 +166,16 @@ what you have made.
 | `Delete` | remove selected clip |
 | `Ctrl/Cmd Z` | undo |
 | `Ctrl/Cmd Shift Z` | redo |
+| `Ctrl/Cmd N` | new project |
+| `Ctrl/Cmd O` | open |
+| `Ctrl/Cmd S` | save |
+| `Ctrl/Cmd Shift S` | save as |
+
+The last four come from the application menu, which also carries the standard
+Edit roles — cut, copy, paste, select all. That is not decoration: setting an
+application menu at all replaces Electron's default one, and the default is
+where clipboard support in text fields comes from. Drop those roles and typing
+in the caption editor quietly loses cut and paste on macOS.
 
 ## How it fits together
 
@@ -162,9 +191,16 @@ shared/
                      so it is the easiest thing here to test.
   project-schema.js  What a saved project has to look like before it will be
                      opened. Pure, no Electron, for the same reason.
+  save-state.js      The window title, the Save/Don't Save/Cancel dialog's
+                     button indices, Save vs Save As, and whether an autosave
+                     is worth offering. Pure, no Electron — main.js is left
+                     holding only the calls, not the decisions.
 src/
   app.js             State, timeline rendering, pointer handling, inspector.
   history.js         Undo/redo stacks. Pure, no DOM, so it is testable.
+  dirty-state.js     Whether the project differs from the file, when an
+                     autosave is due, and the guard that stops one keypress
+                     being handled twice. Pure, no DOM, same reason.
   chroma-math.js     The key/colour maths, ported from ffmpeg's filters.
                      Pure, no DOM, no WebGL, so it is testable — and it is,
                      hard, because this is where being wrong costs most.
@@ -244,6 +280,112 @@ The inspector wires this in `field()` and `slider()` rather than at each
 control, so a new inspector row is undoable without anyone remembering to make
 it so. Controls built outside those two helpers — the static project panel,
 the caption rows — are wired by hand with `trackContinuous`.
+
+### Dirty is a comparison, not a flag
+
+"Are there unsaved changes" is asked of the project's *content*: `dirty-state.js`
+serialises `state.project` with its object keys sorted, and compares that
+against the serialisation taken at the last save or open.
+
+The obvious alternative is a boolean that every edit sets and a save clears. It
+gets one case wrong, and it is a case the user can see: edit a clip, undo it,
+and the project in memory is byte-for-byte the file on disk while the flag
+still says dirty. Closing then asks whether to save something already saved.
+The cost of that is not the extra keystroke — it is that the prompt starts
+appearing when nothing is at stake, which is exactly how people learn to
+dismiss it without reading, and the one time it matters they dismiss that too.
+
+It is also the answer `history.js` already gives to its own version of the
+question. `commit()` compares before against after and drops the entry if they
+match, so a gesture that changed nothing leaves no undo step. Dirty is the same
+question asked about the file rather than the stack, and answering it the same
+way keeps the two from contradicting each other: an edit history refuses to
+record cannot make the title grow a dot.
+
+The cost is a serialisation per check instead of a boolean read. A project is
+small plain JSON and the check runs about once a second, so that is not a real
+cost — and the version that is cheap is the version that is wrong.
+
+Keys are sorted rather than left in insertion order because a project arriving
+from `JSON.parse` of a hand-edited file does not have to preserve it. Arrays are
+not sorted: clip, track and caption order are all content.
+
+### Where save protection lives
+
+The renderer owns the project; main owns the window. That split decides
+everything else here.
+
+Main never keeps a copy of the project, because a copy is a copy that can be
+stale, and the one moment it would be read — saving on the way out of a close
+dialog — is exactly the moment being a few hundred milliseconds behind would
+write the wrong file silently. So main asks the renderer to save and waits for
+it to report back, including reporting that the Save dialog was cancelled,
+which has to abort the close rather than fall through it.
+
+What main *does* keep is the current file path and a mirror of the dirty flag,
+pushed by the renderer whenever either moves. Both are needed by things only
+main can do: the window title, and a `close` handler that has to decide whether
+to interrupt before any renderer round-trip could answer.
+
+The Electron mechanics of that handler are the fiddly part, and both halves
+have to be right. `close` is synchronous and the dialog is not, so
+`preventDefault()` has to happen before any `await` — otherwise the prompt
+appears over a window that is already closing — and the close then has to be
+started again by hand once the answer arrives, behind a flag that makes the
+second pass fall straight through. Miss the first and the guard does nothing;
+miss the second and the window can never be shut at all. `before-quit` records
+that a Cmd-Q is in flight, because otherwise the re-close would close the
+window and leave the app running on macOS: a quit that quietly became a close.
+
+Everything in that paragraph is Electron behaviour, and nothing in this repo
+launches Electron. So the *decisions* were pushed into `shared/save-state.js` —
+which button index means discard, whether Save needs a dialog, whether an
+autosave is worth offering — where they are pure and tested, the same split
+`project-schema.js` was extracted for. What is left in `main.js` is the calls.
+
+### Autosave, and not being annoying
+
+Autosaves go to `app.getPath('userData')`, not next to the project: there may
+be no project file yet, which is the case with the most to lose. They are
+written to a temp path and renamed, because the event this exists for is the
+app dying, and dying midway through a write leaves a recovery file that cannot
+be recovered from.
+
+Two triggers, because each alone has a hole. A debounce fires two seconds after
+the edits stop — which is most editing, and costs nothing while idle — but it
+resets on every change, so someone who keeps working never reaches it. A
+thirty-second ceiling from the oldest pending change is therefore the number
+that actually bounds how much a crash can take.
+
+The part that decides whether any of this is tolerable is when the app does
+*not* ask. A clean close deletes the autosave — and so does Don't Save, since
+restoring what someone just chose to throw away is the single most annoying
+thing a recovery feature can do. On launch, an autosave whose file has since
+caught up with it is deleted rather than offered. Between them, an ordinary
+session never produces a recovery prompt, which is the only reason the prompt
+means anything when it does appear.
+
+### The menu, and one keypress arriving twice
+
+`Menu.setApplicationMenu` replaces Electron's default menu wholesale, and the
+default is where cut/copy/paste in text fields come from. The Edit menu
+therefore carries the standard roles explicitly; without them, typing in the
+caption editor silently loses clipboard support on macOS. `appMenu` restores
+the About/Hide/Quit block for the same reason.
+
+Undo and Redo are wired to this app's history, not to the `undo`/`redo` roles —
+those undo typing inside the focused field, and a user who splits a clip and
+presses Cmd-Z wants the split back.
+
+That leaves undo reachable two ways: the menu accelerator, and `app.js`'s own
+keydown listener. Which one fires is a platform question. macOS's menu bar
+claims a key equivalent before the page sees it; on Windows and Linux the menu
+item is given `registerAccelerator: false` so the keydown stays the only path.
+Neither arrangement can be run here, so the code does not depend on being right
+about it: `createCommandGuard` drops a second arrival of the same command from
+a *different* source within 50ms. Same-source repeats always run — that is a
+held-down key, and swallowing those would be a worse bug than the one being
+prevented.
 
 ### Two export paths
 
