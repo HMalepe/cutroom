@@ -731,6 +731,31 @@ test('canStreamCopy rejects the inspector settings the copy path cannot honour',
   const muted = copyCandidate();
   muted.tracks[0].muted = true;
   assert.equal(canStreamCopy(muted), false, 'muted track');
+
+  // Hiding is the same trap one field over, and the two paths disagree in
+  // opposite directions: the filter path drops a hidden track before the
+  // canvas and renders black, while -c copy cannot express "show nothing" and
+  // would hand back the hidden footage.
+  const hidden = copyCandidate();
+  hidden.tracks[0].hidden = true;
+  assert.equal(canStreamCopy(hidden), false, 'hidden track');
+});
+
+test('a hidden video track renders black rather than being copied out', () => {
+  // The bug this pins is not that one path is wrong on its own — it is that
+  // the two paths disagree. Assert the filter path's answer (no clip reaches
+  // the canvas) so the copy path has something concrete to match.
+  const hidden = copyCandidate();
+  hidden.tracks[0].hidden = true;
+
+  const { args, mode } = buildExportCommand(hidden, 'out.mp4');
+  assert.equal(mode, 'filter', 'a hidden track must not take the copy path');
+
+  const graph = args[args.indexOf('-filter_complex') + 1];
+  assert.ok(
+    !graph.includes('[0:v]'),
+    `the hidden clip must not enter the video graph, got: ${graph}`
+  );
 });
 
 test('canStreamCopy still takes the fast path for the defaults, however they are spelled', () => {

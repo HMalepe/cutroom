@@ -250,8 +250,8 @@ the caption rows — are wired by hand with `trackContinuous`.
 `canStreamCopy()` checks whether the project is boring enough to copy the
 bitstream directly — one clip, no speed change, no key, no captions, starting
 at zero, and none of the settings the filter graph is what applies: no scale,
-no position nudge, no volume change, no muted track. That path takes about a
-second because nothing gets decoded.
+no position nudge, no volume change, no muted or hidden track. That path takes
+about a second because nothing gets decoded.
 
 Every one of those has to be in the list, because the copy path cannot half-
 honour a setting: it either re-encodes or it writes the source's bitstream out
@@ -261,6 +261,14 @@ say so. The defaults are compared through `num()` so a clip that never touched
 any of them — including one saved before the field existed, where it reads
 `undefined` — still takes the fast path, which is the entire point of having
 one.
+
+`hidden` is in that list for a sharper reason than the rest. The other settings
+make the copy path merely incomplete; this one makes the two paths disagree in
+opposite directions. The filter graph drops a hidden track before it reaches
+the canvas, so a project whose only video track is hidden renders black —
+whereas `-c copy` has no way to express "show nothing" and would hand back the
+exact footage that was hidden. Same project, two commands, opposite pictures,
+no error on either.
 
 One thing the check still cannot see is resolution. A 720p clip in a 1080p
 project stream-copies out at 720p, ignoring the project size. The clip object

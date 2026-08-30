@@ -118,6 +118,13 @@ function canStreamCopy(project) {
   // filter path is the only one that can drop the sound.
   if (videoTracks[0].muted) return false;
 
+  // Hiding is the same trap one field over. The filter path drops a hidden
+  // track before it reaches the canvas, so a project whose only video track is
+  // hidden renders black — while -c copy, which cannot express "show nothing",
+  // would hand back the very footage that was hidden. Two paths, opposite
+  // pictures, no error either way.
+  if (videoTracks[0].hidden) return false;
+
   const c = clips[0];
   if ((c.speed || 1) !== 1) return false;
   if (c.chroma && c.chroma.on) return false;
