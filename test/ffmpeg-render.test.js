@@ -155,11 +155,11 @@ function durationOf(file) {
   return Number(r.stdout.trim());
 }
 
-/** The average colour of an 8x8 patch at (x,y) on the frame at time t. */
-function pixel(file, t, x = 156, y = 116) {
+/** The average colour of a w*h patch at (x,y) on the frame at time t. */
+function pixel(file, t, x = 156, y = 116, w = 8, h = 8) {
   const r = spawnSync('ffmpeg', [
     '-hide_banner', '-loglevel', 'error', '-i', file, '-ss', String(t), '-frames:v', '1',
-    '-vf', `crop=8:8:${x}:${y},scale=1:1`, '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'
+    '-vf', `crop=${w}:${h}:${x}:${y},scale=1:1`, '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'
   ], { encoding: 'buffer' });
   assert.equal(r.status, 0, 'pixel probe failed');
   return [r.stdout[0], r.stdout[1], r.stdout[2]];
@@ -317,6 +317,58 @@ test('a run composites with layering, audio and burnt-in captions all at once', 
     ['-v', 'error', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', out],
     { encoding: 'utf8' }).stdout.trim().split('\n').sort();
   assert.deepEqual(streams, ['audio', 'video'], 'both streams should survive');
+});
+
+test('real per-word karaoke timing sweeps through libass, not just through the builder', opts, () => {
+  // ffmpeg-builder.test.js proves the \k values are computed correctly. It
+  // cannot prove libass actually reveals PrimaryColour word-by-word on that
+  // schedule rather than, say, all at once or not at all — subtitles
+  // rendering is exactly the kind of thing that reads right and renders
+  // wrong. So this burns a real two-word karaoke line onto a black canvas
+  // with maximally distinct, fully-opaque colours and samples a pixel inside
+  // each word's glyphs before and after its \k window closes.
+  const assPath = path.join(DIR, 'karaoke.ass');
+  fs.writeFileSync(assPath, require('../shared/ffmpeg-builder').buildAssFile({
+    width: 320, height: 240,
+    captionStyle: {
+      font: 'Arial', size: 120, position: 'middle', animation: 'typewriter',
+      color: '#FF0000', secondaryColor: '#0000FF'
+    },
+    captions: [{
+      start: 0, end: 2, text: 'A B',
+      words: [{ start: 0, end: 1, text: 'A' }, { start: 1, end: 2, text: 'B' }]
+    }]
+  }));
+
+  // No visible clip is needed — the point is the caption over plain black —
+  // but projectDuration only looks at clips, so an inaudible, invisible dummy
+  // clip on the audio track is what actually gives the project the 2.5s of
+  // length the karaoke line needs; it never reaches the video graph at all.
+  const proj = project([[], [], [clip(bars(), { startSec: 0, outSec: 2.5, hasAudio: false })]],
+    { captionsEnabled: true, captions: [{ start: 0, end: 2, text: 'A B' }] });
+  const out = render('karaoke', proj, { assPath });
+
+  // x=120 sits inside "A", x=185 inside "B" — found by rendering this exact
+  // line and reading back where its glyphs actually landed, not guessed. The
+  // crop is taller than it is wide because both letters have gaps between
+  // strokes at some heights (the crossbar of the "A", the bowl of the "B"),
+  // and a wider-than-tall sample risked crossing into the space between the
+  // two words instead of staying inside one of them.
+  const wordA = (t) => pixel(out, t, 120, 110, 6, 20);
+  const wordB = (t) => pixel(out, t, 185, 110, 6, 20);
+
+  // t=0.3: "A"'s \k (0 -> 1s) is running, "B"'s has not started.
+  const [ar0, , ab0] = wordA(0.3);
+  const [br0, , bb0] = wordB(0.3);
+  assert.ok(ar0 > 200 && ab0 < 60, `"A" should already be sung (red) at t=0.3, saw rgb(${wordA(0.3)})`);
+  assert.ok(bb0 > 200 && br0 < 60, `"B" should still be unsung (blue) at t=0.3, saw rgb(${wordB(0.3)})`);
+
+  // t=1.3: "B"'s \k (1s -> 2s) has now run too, and karaoke never un-sings a
+  // word, so "A" is still red.
+  const [ar1] = wordA(1.3);
+  const [br1, , bb1] = wordB(1.3);
+  assert.ok(ar1 > 200, `"A" should stay sung (red) at t=1.3, saw rgb(${wordA(1.3)})`);
+  assert.ok(br1 > 200 && bb1 < 60, `"B" should now be sung (red) at t=1.3, saw rgb(${wordB(1.3)})`);
 });
 
 test('a run that does not start at zero folds at the right offset', opts, () => {

@@ -98,7 +98,13 @@ ramp, split the clip where the speed should change and set each piece.
 
 **Captions.** Transcribe or import, edit the text and timings inline, then
 style font, size, colour, box, position and animation. Burned in at export via
-a generated ASS file.
+a generated ASS file. Transcribing asks whisper for real per-word timestamps
+and regroups them into sentence-sized rows for editing — see "Word-level
+captions and karaoke" below — so the **typewriter** animation is a real
+per-word karaoke sweep rather than one line advancing all at once. Editing a
+row's text or timing by hand, or importing an `.srt`/`.vtt`, falls back to the
+old even-split-by-character estimate for that row, exactly as it rendered
+before word-level timing existed.
 
 **Templates.** Each one is a rhythm — a list of slot durations, speeds and
 fades that your clips get poured into. The bars under each name are the slot
@@ -305,14 +311,72 @@ curated ten — the dissolve family (`fade`, `dissolve`, `fadeblack`,
 way — every one proven against a real ffmpeg in `test/ffmpeg-render.test.js`
 rather than trusted from `xfade`'s documentation.
 
+### Word-level captions and karaoke
+
+Transcribing asks whisper for one SRT cue per **word**, not whisper's own
+sentence segmentation:
+
+- whisper.cpp: `-ml 1 -sow`. `-ml 1` (max segment length 1 character) alone is
+  not enough — whisper.cpp's default is to split wherever the length limit is
+  hit, which is frequently mid-word, because its tokens are BPE sub-word
+  pieces rather than whole words. `-sow` (`--split-on-word`) restricts split
+  points to tokens that actually begin a new word, which is what turns that
+  into one whole word per line. This is read out of whisper.cpp's own source
+  (`should_split_on_word` / `whisper_wrap_segment` in `src/whisper.cpp`), not
+  a real binary — there was none available while building this — so it has
+  not been independently re-driven against real audio. If you have
+  whisper.cpp installed and see it disagree with this, that is the thing to
+  check first.
+- openai-whisper: `--word_timestamps True --max_words_per_line 1`. Also read
+  out of source (`whisper/utils.py`'s `SubtitlesWriter.iterate_result`): with
+  no `--max_line_width` set, every word starts a new subtitle cue. Same
+  caveat — verified from source, not from a real run.
+
+`groupWordsIntoCaptions` in `ffmpeg-builder.js` then re-assembles those
+one-word cues into sentence/phrase-sized rows for the caption list — a couple
+hundred one-word rows for a minute of speech is not a usable editor — using
+two triggers to end a row: sentence-ending punctuation (`.`, `!`, `?`,
+optionally followed by a closing quote or bracket) or a gap of 0.6s or more
+before the next word. A row is also capped at 12 words regardless, so a
+transcript with neither punctuation nor pauses for a long stretch still
+breaks into readable lines. Each word's own real start/end rides along on the
+row (`cap.words`) for the ASS writer to use.
+
+`buildAssFile`'s `typewriter` animation uses that per-word timing when a row
+has it: one `{\k}` tag per word rather than one for the whole line, each
+tag's duration running from that word's own start to the *next* word's
+start — not to its own end — so a pause between words is charged to the word
+before it and the highlight lands exactly when the next word starts. The
+`[V4+ Styles]` line's `SecondaryColour` (the "not yet spoken" state karaoke
+reveals against) now actually differs from `PrimaryColour` — it used to be
+set to the same value, which made a karaoke sweep invisible even once the
+`\k` tags were real. It defaults to the caption's text colour at reduced
+opacity, so "not yet spoken" stays visibly distinct from "spoken" whatever
+text colour is chosen (a fixed hue, picked once, could land on or near the
+user's own colour and vanish); the caption style panel's **Karaoke colour**
+field overrides it directly when animation is set to typewriter.
+
+A row falls back to the old behaviour — one `\k` tag over the whole line,
+its duration split evenly by character count — whenever it has no per-word
+timing: a hand-typed line, an imported `.srt`/`.vtt`, or a transcribed row
+whose text or timing was subsequently hand-edited (`renderCaptions` in
+`app.js` drops `words` the moment a row is touched, since an edited row's
+text no longer matches what the stored per-word timestamps describe).
+
+Verification: `test/ffmpeg-builder.test.js` hand-computes the grouping
+triggers and the `\k` values, including the case a naive implementation gets
+wrong — a pause between two words has to be charged to the word *before* it.
+`test/ffmpeg-render.test.js` burns a real two-word karaoke line onto a black
+canvas through actual ffmpeg/libass and samples a pixel inside each word's
+glyphs before and after its `\k` window closes, so the sweep is proven on
+screen and not just in the string the builder produced.
+
 ## Extending it
 
 Reasonable next moves, roughly by effort:
 
 - **More tracks.** `state.project.tracks` is an array; the builder already
   loops it. Adding a fourth is a one-line change plus a UI button.
-- **Word-level captions.** whisper.cpp emits word timings with `-ml 1`. The
-  ASS writer already supports karaoke tags.
 
 ## Licence
 

@@ -7,6 +7,7 @@ const {
   buildExportCommand,
   buildAssFile,
   parseSubtitles,
+  groupWordsIntoCaptions,
   clipTimelineDuration,
   clipTimelineEnd,
   projectDuration,
@@ -190,6 +191,148 @@ test('buildAssFile embeds project dimensions and caption text', () => {
   assert.match(ass, /PlayResX: 1080/);
   assert.match(ass, /PlayResY: 1920/);
   assert.match(ass, /line one/);
+});
+
+// --------------------------------------------------------------------------
+// Word-level captions: grouping whisper's one-word-per-cue output back into
+// editable rows (main.js requests one SRT cue per word — see its comment on
+// captions:transcribe — so this is what turns that into what the caption
+// list actually shows).
+// --------------------------------------------------------------------------
+
+/** A word with tidy, hand-computable timing: start, then start+dur as end. */
+function w(start, dur, text) {
+  return { start, end: start + dur, text };
+}
+
+test('groupWordsIntoCaptions ends a row at sentence-ending punctuation', () => {
+  // Only 0.3s between "friend." and "New" — comfortably under the 0.6s gap
+  // threshold, so the break has to come from the period, not the pause.
+  const words = [
+    w(0.00, 0.30, 'Hello'),
+    w(0.35, 0.25, 'there,'),
+    w(0.65, 0.35, 'friend.'),
+    w(1.30, 0.20, 'New'),
+    w(1.55, 0.25, 'sentence')
+  ];
+  const groups = groupWordsIntoCaptions(words);
+  assert.equal(groups.length, 2);
+
+  assert.equal(groups[0].start, 0);
+  assert.equal(groups[0].end, 1.0);
+  assert.equal(groups[0].text, 'Hello there, friend.');
+  assert.equal(groups[0].words.length, 3);
+  assert.deepEqual(groups[0].words[1], { start: 0.35, end: 0.6, text: 'there,' });
+
+  assert.equal(groups[1].start, 1.3);
+  assert.equal(groups[1].end, 1.8);
+  assert.equal(groups[1].text, 'New sentence');
+});
+
+test('groupWordsIntoCaptions also breaks on a pause, with no punctuation in sight', () => {
+  // 0.8s of silence between "Wait" and "what" — no sentence-ending mark
+  // anywhere, so only the default 0.6s gap threshold can end the row.
+  const words = [w(0, 0.2, 'Wait'), w(1.0, 0.2, 'what')];
+  const groups = groupWordsIntoCaptions(words);
+  assert.equal(groups.length, 2);
+  assert.equal(groups[0].text, 'Wait');
+  assert.equal(groups[1].text, 'what');
+});
+
+test('groupWordsIntoCaptions respects a custom gap threshold', () => {
+  // Same 0.8s gap as above, but a 1s threshold should let it join into one row.
+  const words = [w(0, 0.2, 'Wait'), w(1.0, 0.2, 'what')];
+  const groups = groupWordsIntoCaptions(words, { maxGap: 1 });
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].text, 'Wait what');
+});
+
+test('groupWordsIntoCaptions caps row length when nothing else would break it', () => {
+  // 15 words, tight timing (0.1s gaps, well under the 0.6s default) and no
+  // punctuation — the only thing that can stop this becoming one giant row.
+  const words = Array.from({ length: 15 }, (_, i) => w(i * 0.3, 0.2, `w${i}`));
+  const groups = groupWordsIntoCaptions(words);
+  assert.deepEqual(groups.map(g => g.words.length), [12, 3]);
+  assert.equal(groups[0].words[0].text, 'w0');
+  assert.equal(groups[1].words[0].text, 'w12');
+});
+
+test('groupWordsIntoCaptions respects a custom word cap', () => {
+  const words = Array.from({ length: 5 }, (_, i) => w(i * 0.3, 0.2, `w${i}`));
+  const groups = groupWordsIntoCaptions(words, { maxWords: 2 });
+  assert.deepEqual(groups.map(g => g.words.length), [2, 2, 1]);
+});
+
+// --------------------------------------------------------------------------
+// Karaoke: buildAssFile's typewriter animation, with and without real
+// per-word timing.
+// --------------------------------------------------------------------------
+
+/** Pulls the [V4+ Styles] Style line's comma-separated fields out. */
+function styleFields(ass) {
+  const line = ass.match(/^Style: Main,(.*)$/m)[1];
+  return line.split(',');
+}
+
+test('typewriter falls back to one even-split \\k tag when a row has no word timing', () => {
+  // Unchanged from before word-level timing existed: dur=1s over 2 characters
+  // -> 100/2 = 50 centiseconds per character, one tag for the whole line.
+  const project = baseProject({
+    captions: [{ start: 0, end: 1, text: 'Hi' }],
+    captionStyle: { animation: 'typewriter' }
+  });
+  const ass = buildAssFile(project);
+  assert.match(ass, /,,\{\\k50\}Hi$/m);
+});
+
+test('typewriter uses real per-word \\k timing when the row has it', () => {
+  // "Hello" only lasts 0.30s of the 0.35s it has before "there" starts — a
+  // real 0.05s breath. That gap has to be charged to "Hello"'s own \k, not
+  // dropped: a \k measured word-start-to-word-OWN-end would read 30 here,
+  // not 35, and the highlight would jump onto "there" before it is actually
+  // spoken.
+  const project = baseProject({
+    captions: [{
+      start: 0, end: 1.0, text: 'Hello there friend',
+      words: [w(0, 0.30, 'Hello'), w(0.35, 0.30, 'there'), w(0.65, 0.35, 'friend')]
+    }],
+    captionStyle: { animation: 'typewriter' }
+  });
+  const ass = buildAssFile(project);
+  // \k is this word's start to the NEXT word's start (0.35s, then 0.30s),
+  // except the last word, which has no next and runs to its own end
+  // (1.0 - 0.65 = 0.35s) — all in centiseconds.
+  assert.match(ass, /,,\{\\k35\}Hello \{\\k30\}there \{\\k35\}friend$/m);
+});
+
+test('typewriter drops a hand-edited row back to the even-split fallback', () => {
+  // groupWordsIntoCaptions never produces a mismatch between `text` and
+  // `words`, but the caption editor can — this is what renderCaptions in
+  // app.js relies on `delete cap.words` to prevent: a caption whose `words`
+  // no longer describes its `text` must not use the (now wrong) real timing.
+  const project = baseProject({
+    captions: [{ start: 0, end: 1, text: 'Hi', words: [] }],
+    captionStyle: { animation: 'typewriter' }
+  });
+  const ass = buildAssFile(project);
+  assert.match(ass, /,,\{\\k50\}Hi$/m);
+});
+
+test('karaoke SecondaryColour defaults to a dimmed PrimaryColour, not an identical one', () => {
+  // Before this, both colours were `${primary},${primary}` — a real karaoke
+  // sweep between two identical colours is invisible.
+  const project = baseProject({ captionStyle: { color: '#FFFFFF' } });
+  const [, , primary, secondary] = styleFields(buildAssFile(project));
+  assert.equal(primary, '&H00FFFFFF');
+  // 0.55 alpha -> round(0.55*255) = 140 = 0x8C.
+  assert.equal(secondary, '&H8CFFFFFF');
+  assert.notEqual(primary, secondary);
+});
+
+test('an explicit secondaryColor overrides the dimmed default, at full opacity', () => {
+  const project = baseProject({ captionStyle: { color: '#FFFFFF', secondaryColor: '#FF0000' } });
+  const [, , , secondary] = styleFields(buildAssFile(project));
+  assert.equal(secondary, '&H000000FF');
 });
 
 // --------------------------------------------------------------------------

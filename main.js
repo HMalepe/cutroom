@@ -293,6 +293,23 @@ ipcMain.handle('shell:reveal', async (_e, filePath) => {
  *
  * If whisper is not installed we say so plainly rather than failing silently.
  * Importing an .srt from anywhere else is always available as a fallback.
+ *
+ * Both whisper backends are asked for one SRT cue per WORD rather than
+ * whisper's own natural sentence segmentation:
+ *   - whisper.cpp: `-ml 1 -sow` (max segment length 1 character, forced to
+ *     split only on word boundaries). `-ml 1` alone is not enough — without
+ *     `-sow` whisper.cpp splits on raw BPE tokens, which are frequently
+ *     sub-word pieces, so a segment can end mid-word. `-sow` restricts the
+ *     split points to tokens that begin a new word, which is what actually
+ *     gets one whole word per line. (Verified against whisper.cpp's own
+ *     source — `should_split_on_word`/`whisper_wrap_segment` in
+ *     src/whisper.cpp — not against a real binary; see the README.)
+ *   - openai-whisper: `--word_timestamps True --max_words_per_line 1`. Also
+ *     verified from source (whisper/utils.py's `SubtitlesWriter`): with no
+ *     `--max_line_width` set, every word starts a new subtitle cue.
+ * `groupWordsIntoCaptions` then re-assembles those one-word cues into
+ * sentence/phrase-sized caption rows for the editor, keeping each word's own
+ * timing on the row for real per-word karaoke.
  */
 ipcMain.handle('captions:transcribe', async (_e, { sourcePath, language }) => {
   const whisper = findBinary(['whisper-cli', 'whisper']);
@@ -319,8 +336,9 @@ ipcMain.handle('captions:transcribe', async (_e, { sourcePath, language }) => {
 
     const isCpp = /whisper-cli|whisper\.cpp/.test(whisper);
     const args = isCpp
-      ? ['-f', tmpWav, '-osrt', '-of', path.join(tmpDir, 'out'), '-l', language || 'auto']
+      ? ['-f', tmpWav, '-osrt', '-of', path.join(tmpDir, 'out'), '-l', language || 'auto', '-ml', '1', '-sow']
       : [tmpWav, '--model', 'base', '--output_format', 'srt', '--output_dir', tmpDir,
+         '--word_timestamps', 'True', '--max_words_per_line', '1',
          ...(language && language !== 'auto' ? ['--language', language] : [])];
 
     await new Promise((resolve, reject) => {
@@ -334,7 +352,11 @@ ipcMain.handle('captions:transcribe', async (_e, { sourcePath, language }) => {
     const srt = fs.readdirSync(tmpDir).find(f => f.endsWith('.srt'));
     if (!srt) return { ok: false, error: 'whisper ran but produced no .srt' };
 
-    const captions = builder.parseSubtitles(fs.readFileSync(path.join(tmpDir, srt), 'utf8'));
+    // One entry per word (see the comment above). Group them back into
+    // caption-sized rows for the editor, carrying real per-word timing along
+    // for the ASS writer's karaoke.
+    const words = builder.parseSubtitles(fs.readFileSync(path.join(tmpDir, srt), 'utf8'));
+    const captions = builder.groupWordsIntoCaptions(words);
     return { ok: true, captions };
   } catch (err) {
     return { ok: false, error: err.message };
