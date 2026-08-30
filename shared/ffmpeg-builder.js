@@ -113,12 +113,26 @@ function canStreamCopy(project) {
   if (clips.length !== 1) return false;
   if (project.captionsEnabled && (project.captions || []).length) return false;
 
+  // Muting is a property of the track, not the clip, and -c copy has no way to
+  // honour it: it would copy the source's audio stream out untouched. The
+  // filter path is the only one that can drop the sound.
+  if (videoTracks[0].muted) return false;
+
   const c = clips[0];
   if ((c.speed || 1) !== 1) return false;
   if (c.chroma && c.chroma.on) return false;
   if (c.fadeIn || c.fadeOut) return false;
   if (c.filters && (c.filters.brightness || c.filters.contrast !== 1 || c.filters.saturation !== 1)) return false;
   if ((c.startSec || 0) !== 0) return false;
+  // Geometry and level live on the clip but are applied by the filter graph —
+  // scale by `scale=`, the nudge by the overlay's x/y, the level by `volume=`.
+  // Copying the bitstream skips every one of them, so a clip carrying any of
+  // them has to re-encode or the setting is silently thrown away. The defaults
+  // are spelled out through num() so an untouched clip — where these are 1/0/1
+  // or absent entirely — still takes the fast path, which is the whole point.
+  if (num(c.scale, 1) !== 1) return false;
+  if (num(c.posX, 0) !== 0 || num(c.posY, 0) !== 0) return false;
+  if (num(c.volume, 1) !== 1) return false;
   return true;
 }
 
@@ -421,9 +435,14 @@ function buildAudioClipChain(clip, inputIdx, label) {
   // Resample to a common rate so amix does not silently drop a track.
   steps.push('aresample=48000');
 
-  // adelay takes milliseconds, per channel.
+  // adelay takes milliseconds, per channel, and leaves any channel the list
+  // does not name completely undelayed — so a hardcoded two-entry list silently
+  // desyncs everything past stereo. On a 5.1 source `adelay=1000|1000` moves
+  // FL and FR and leaves FC, LFE, BL and BR sitting at zero (measured, not
+  // assumed). `all=1` reuses the last delay for the remaining channels, which
+  // is the whole point of the option.
   const ms = Math.round(start * 1000);
-  if (ms > 0) steps.push(`adelay=${ms}|${ms}`);
+  if (ms > 0) steps.push(`adelay=${ms}:all=1`);
 
   return `[${inputIdx}:a]${steps.join(',')}[${label}]`;
 }
@@ -445,16 +464,32 @@ function buildExportCommand(project, outPath, opts = {}) {
   // ---- Fast path -----------------------------------------------------------
   if (canStreamCopy(project) && !opts.forceEncode) {
     const clip = project.tracks.find(t => t.kind === 'video').clips[0];
+    // Test 3s has to clamp here too, not just on the filter path. Only the
+    // copy path's own -to can do it: -c copy writes whatever it reads, so
+    // without this the "3 second" test render is the entire clip.
+    const copyDur = opts.previewSeconds
+      ? Math.min(duration, opts.previewSeconds)
+      : duration;
+    // -ss and -to are BOTH input options here, and an input-side -to is a
+    // position in the source's own timeline rather than a length measured from
+    // -ss: `-ss 2 -to 5` yields three seconds, not five (checked against a
+    // real ffmpeg, not assumed). So the stop point is inSec + the length we
+    // want. A clip on this path has speed 1 and startSec 0, so its timeline
+    // length and its source length are the same number, and with no
+    // previewSeconds this is inSec + (outSec - inSec) — the same -to the copy
+    // path has always written.
     const args = [
       '-hide_banner', '-y',
       '-ss', num(clip.inSec).toFixed(4),
-      '-to', num(clip.outSec).toFixed(4),
+      '-to', (num(clip.inSec) + copyDur).toFixed(4),
       '-i', clip.src,
       '-c', 'copy',
       '-avoid_negative_ts', 'make_zero',
       outPath
     ];
-    return { args, mode: 'copy', duration };
+    // The progress bar divides by this, so returning the full length made a
+    // 3-second test render crawl to 30% and stop.
+    return { args, mode: 'copy', duration: copyDur };
   }
 
   // ---- Filter path ---------------------------------------------------------
@@ -594,6 +629,36 @@ function assColour(hex, alpha = 0) {
   return `&H${a}${b}${g}${r}`.toUpperCase();
 }
 
+/** Breaks a backslash away from the character after it. Draws nothing. */
+const ZWSP = '\u200B';
+
+/**
+ * libass reads a Dialogue line as markup, so a caption that merely mentions a
+ * brace loses text with no error raised anywhere: `costs {50} today` renders
+ * as `costs  today`, because `{` opens an override block and everything up to
+ * the matching `}` is read as tags. `\` is live too — `\N` and `\n` are line
+ * breaks and `\h` a hard space — so a caption reading `C:\Notes` silently
+ * wraps onto two lines.
+ *
+ * `\{` and `\}` are the escapes libass honours for the braces. The backslash
+ * has no escape of its own: libass renders `\\` as TWO backslashes and still
+ * reads the `\N` in `\\Nx` as a line break, so doubling makes things worse
+ * rather than better. The only thing that separates a user's backslash from
+ * the character after it is a zero-width space, which libass passes through
+ * and no font puts ink on. It goes in after every backslash rather than only
+ * the three that are live today, so this never has to be kept in step with
+ * libass's escape table.
+ *
+ * This is for the user's text ONLY. The `\N` line breaks and the `{\k}` /
+ * `{\fad}` / `{\move}` tags the builder writes are markup we mean, and are
+ * added around the result of this rather than passed through it.
+ */
+function assEscape(text) {
+  return String(text)
+    .replace(/\\/g, `\\${ZWSP}`)
+    .replace(/[{}]/g, '\\$&');
+}
+
 /**
  * Real per-word karaoke for one caption line, built from `c.words` (each
  * `{start, end, text}`, real timestamps from whisper — see
@@ -609,7 +674,8 @@ function karaokeText(words) {
     const next = words[i + 1];
     const boundary = next ? next.start : w.end;
     const cs = Math.max(1, Math.round((boundary - w.start) * 100));
-    return `{\\k${cs}}${String(w.text || '').trim()}`;
+    // The tag is ours and stays live; only the word inside it is escaped.
+    return `{\\k${cs}}${assEscape(String(w.text || '').trim())}`;
   }).join(' ');
 }
 
@@ -654,7 +720,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
     .slice()
     .sort((a, b) => a.start - b.start)
     .map(c => {
-      let text = String(c.text || '').replace(/\n/g, '\\N');
+      // Order matters and is the subtle part. The user's text is escaped
+      // FIRST, while it is still only the user's text; the `\N` line breaks
+      // and the animation tags below are the builder's own markup and are
+      // wrapped around the escaped result. Escaping after either of those
+      // would defuse the very tags this function exists to write.
+      const source = String(c.text || '');
+      let text = assEscape(source).replace(/\n/g, '\\N');
       if (anim === 'fade') text = `{\\fad(120,120)}${text}`;
       if (anim === 'pop') text = `{\\fscx60\\fscy60\\t(0,140,\\fscx100\\fscy100)}${text}`;
       if (anim === 'slide') text = `{\\move(${W / 2},${H + 40},${W / 2},${H - (st.marginV ?? 70)},0,160)}${text}`;
@@ -669,7 +741,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
           text = karaokeText(c.words);
         } else {
           const dur = Math.max(0.1, c.end - c.start);
-          text = `{\\k${Math.round((dur * 100) / Math.max(1, text.length))}}${text}`;
+          // Counted over the text the viewer sees, not over the escapes just
+          // added around it — otherwise a caption with braces in it gets a
+          // shorter highlight than the same caption without them.
+          const visible = source.replace(/\n/g, '\\N').length;
+          text = `{\\k${Math.round((dur * 100) / Math.max(1, visible))}}${text}`;
         }
       }
       return `Dialogue: 0,${assTime(c.start)},${assTime(c.end)},Main,,0,0,0,,${text}`;

@@ -98,7 +98,10 @@ ramp, split the clip where the speed should change and set each piece.
 
 **Captions.** Transcribe or import, edit the text and timings inline, then
 style font, size, colour, box, position and animation. Burned in at export via
-a generated ASS file. Transcribing asks whisper for real per-word timestamps
+a generated ASS file. Your text is escaped on the way into that file: libass
+reads `{` as the start of an override block, so a caption that mentions
+`{50}` used to lose it silently, and `\N`, `\n` and `\h` are all live, so a
+caption reading `C:\Notes` used to wrap onto two lines. Transcribing asks whisper for real per-word timestamps
 and regroups them into sentence-sized rows for editing — see "Word-level
 captions and karaoke" below — so the **typewriter** animation is a real
 per-word karaoke sweep rather than one line advancing all at once. Editing a
@@ -119,7 +122,12 @@ captions — for those, Test 3s. On a machine with no WebGL it quietly goes
 back to playing the source file, at 1x, start to end.
 
 **Test 3s.** Renders the first three seconds only. Use it to check speed or a
-caption instead of waiting for a full export.
+caption instead of waiting for a full export. It clamps on both export paths.
+On the copy path the clamp is an input-side `-to`, which is a position in the
+source rather than a length from `-ss`, so it is written as `inSec + 3`; and
+because stream copy can only start at a keyframe, a source with a sparse GOP
+still comes out somewhat longer than three seconds. That is stream copy's
+nature rather than something the builder can correct.
 
 **Undo.** Every edit, back a hundred steps. A drag or a slider counts as one
 step, not one per pixel, and an action that changed nothing — clicking a clip
@@ -152,6 +160,8 @@ shared/
   ffmpeg-builder.js  Project object -> ffmpeg argument array. The only file
                      that knows ffmpeg syntax exists. Pure functions, no I/O,
                      so it is the easiest thing here to test.
+  project-schema.js  What a saved project has to look like before it will be
+                     opened. Pure, no Electron, for the same reason.
 src/
   app.js             State, timeline rendering, pointer handling, inspector.
   history.js         Undo/redo stacks. Pure, no DOM, so it is testable.
@@ -188,6 +198,33 @@ moment a speed change enters the picture. The only place they are deliberately
 coupled is dragging a clip's left handle, where trimming the head has to move
 the clip so the frame under your cursor stays put.
 
+### Opening a project
+
+`project:open` checks the shape of a file before the app accepts it. It used to
+be `JSON.parse` and nothing else, with the result assigned straight to
+`state.project` — so a truncated, hand-edited or simply foreign JSON file threw
+somewhere inside `renderAll()`, *after* the project that was open had already
+been replaced, leaving a half-drawn window and no message.
+
+`shared/project-schema.js` holds the check, pure and separate so it is testable
+without Electron. It is a gate, not a full schema: the file has to be an object
+with a `tracks` array, and every track needs a `kind` of `video` or `audio` and
+a `clips` array. A file that fails comes back as `{ ok: false, error }`, the
+error is toasted, and the project on screen is left exactly as it was.
+
+Saving now writes a `version` field. Nothing reads it yet — it exists so a
+later change to the project shape has somewhere to branch, which is only worth
+anything if it is already being written by the time that change arrives. A file
+*without* it loads normally and always will, because every project saved before
+this existed lacks it. A file with a version this build does not know is
+refused by name rather than half-loaded.
+
+Being a gate rather than a schema has a limit worth knowing: a hand-edited file
+can satisfy every rule above and still be missing something the UI reads
+without checking — `captionStyle`, for one, which `renderCaptionStyle`
+dereferences directly. Widening the check to a full schema is a bigger change
+than this one.
+
 ### How undo works
 
 Because a clip is plain JSON with no live references, a structural clone of
@@ -212,7 +249,26 @@ the caption rows — are wired by hand with `trackContinuous`.
 
 `canStreamCopy()` checks whether the project is boring enough to copy the
 bitstream directly — one clip, no speed change, no key, no captions, starting
-at zero. That path takes about a second because nothing gets decoded.
+at zero, and none of the settings the filter graph is what applies: no scale,
+no position nudge, no volume change, no muted track. That path takes about a
+second because nothing gets decoded.
+
+Every one of those has to be in the list, because the copy path cannot half-
+honour a setting: it either re-encodes or it writes the source's bitstream out
+untouched. A clip scaled to 50% that stream-copies is not a fast export of the
+right thing, it is a fast export of the wrong thing, with nothing on screen to
+say so. The defaults are compared through `num()` so a clip that never touched
+any of them — including one saved before the field existed, where it reads
+`undefined` — still takes the fast path, which is the entire point of having
+one.
+
+One thing the check still cannot see is resolution. A 720p clip in a 1080p
+project stream-copies out at 720p, ignoring the project size. The clip object
+carries no width or height — `makeClip` copies duration, audio, video and
+colour matrix off the bin item and stops there — so a pure function over the
+project genuinely cannot tell. Fixing it means either putting the source
+dimensions on the clip or probing from the builder, and the builder does no
+I/O by design.
 
 Anything else builds a filter graph and re-encodes. The command strip at the
 bottom of the window shows which path you are on and the exact command about
@@ -261,6 +317,13 @@ clip's start position, which is slow and wrong.
 
 Clips are centred by the overlay expression `(W-w)/2`, not by padding, so a
 keyed clip's transparent area stays transparent.
+
+The audio chain does the same shift with `adelay`, and that one has a trap in
+it: `adelay` leaves any channel its delay list does not name completely
+undelayed, so a two-entry list silently desyncs everything past stereo — on a
+5.1 source it moves the front pair and leaves the centre, LFE and both
+surrounds sitting at zero. It is written `adelay=<ms>:all=1`, which reuses the
+last delay for the remaining channels.
 
 A clip inside a crossfade bends both of those, and the next section is why.
 
