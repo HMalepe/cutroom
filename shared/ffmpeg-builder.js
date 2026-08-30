@@ -128,13 +128,20 @@ function canStreamCopy(project) {
 // Video chain for one clip
 // --------------------------------------------------------------------------
 
-function buildVideoClipChain(clip, inputIdx, label, project) {
+/**
+ * @param {object} opts  Set only when this clip is a member of a crossfade run:
+ *   box          {w,h}  Shared geometry every clip in the run is padded to.
+ *   noFadeIn            Suppress the alpha fade on the side facing an xfade.
+ *   noFadeOut
+ */
+function buildVideoClipChain(clip, inputIdx, label, project, opts = {}) {
   const W = project.width;
   const H = project.height;
   const FPS = project.fps;
   const speed = clip.speed || 1;
   const start = num(clip.startSec);
   const dur = clipTimelineDuration(clip);
+  const box = opts.box || null;
   const steps = [];
 
   // 1. Take only the slice of source we want.
@@ -151,7 +158,7 @@ function buildVideoClipChain(clip, inputIdx, label, project) {
 
   // 4. Fit inside the project canvas without distortion. No padding — the
   //    overlay in the caller centres it, which also keeps a keyed clip's
-  //    transparent area transparent.
+  //    transparent area transparent. (A run member is the exception; step 6b.)
   const scaleW = Math.round(W * (clip.scale ?? 1));
   const scaleH = Math.round(H * (clip.scale ?? 1));
   steps.push(`scale=${scaleW}:${scaleH}:force_original_aspect_ratio=decrease`);
@@ -168,7 +175,7 @@ function buildVideoClipChain(clip, inputIdx, label, project) {
   // 6. Green screen. This is what forces a re-encode, so it is opt-in per clip.
   //    similarity: how far from the key colour still counts as background
   //    blend: softness of the edge (0 = hard cut, higher = feathered)
-  const needsAlpha = (clip.chroma && clip.chroma.on) || clip.fadeIn || clip.fadeOut;
+  const needsAlpha = (clip.chroma && clip.chroma.on) || clip.fadeIn || clip.fadeOut || box;
   if (needsAlpha) steps.push('format=yuva420p');
 
   if (clip.chroma && clip.chroma.on) {
@@ -180,22 +187,192 @@ function buildVideoClipChain(clip, inputIdx, label, project) {
     steps.push('despill=type=green:mix=0.5:expand=0');
   }
 
-  // 7. Transitions. Fading the alpha channel means overlapping two clips on the
-  //    timeline produces a real crossfade, with no separate transition system.
-  if (clip.fadeIn > 0) {
+  // 6b. Run members only. xfade refuses two inputs that disagree on size, and
+  //     force_original_aspect_ratio=decrease hands every clip a different one,
+  //     so pad each to the run's shared box. The padding is transparent, which
+  //     is why it can do here what step 4 refuses to do in general: the canvas
+  //     still shows through a letterboxed or keyed clip. Each clip's posX/posY
+  //     is baked into the pad offset, so one overlay can serve the whole run
+  //     without flattening per-clip nudges. It runs after eq so the colour
+  //     filters never tint the padding.
+  if (box) {
+    const px = Math.round(num(clip.posX, 0));
+    const py = Math.round(num(clip.posY, 0));
+    const xoff = px === 0 ? '(ow-iw)/2' : `(ow-iw)/2${px > 0 ? '+' : ''}${px}`;
+    const yoff = py === 0 ? '(oh-ih)/2' : `(oh-ih)/2${py > 0 ? '+' : ''}${py}`;
+    steps.push(`pad=${box.w}:${box.h}:${xoff}:${yoff}:color=black@0`);
+  }
+
+  // 7. Transitions. An alpha fade against the background is a fade to black.
+  //    Where a clip meets another clip it is xfade that does the blend, so the
+  //    fade on that side is suppressed — running both dips through the canvas
+  //    on the way across, which is the bug this replaced.
+  if (clip.fadeIn > 0 && !opts.noFadeIn) {
     steps.push(`fade=t=in:st=0:d=${num(clip.fadeIn).toFixed(3)}:alpha=1`);
   }
-  if (clip.fadeOut > 0) {
+  if (clip.fadeOut > 0 && !opts.noFadeOut) {
     const fadeStart = Math.max(0, dur - clip.fadeOut);
     steps.push(`fade=t=out:st=${fadeStart.toFixed(4)}:d=${num(clip.fadeOut).toFixed(3)}:alpha=1`);
   }
 
   // 8. Now shift the whole clip to its position on the output timeline, and
   //    fix the pixel aspect so overlay does not complain.
-  if (start > 0) steps.push(`setpts=PTS+${start.toFixed(4)}/TB`);
-  steps.push('setsar=1');
+  //
+  //    A run member skips the shift. xfade measures its offset in the joined
+  //    stream's own time and re-bases what it is handed, so a shift here would
+  //    not survive it — the run does the shift once, after the last fold,
+  //    which is the only place it means anything. settb pins the timebase, the
+  //    last of the four properties xfade insists its two inputs share.
+  if (box) {
+    steps.push('setsar=1');
+    steps.push('settb=AVTB');
+  } else {
+    if (start > 0) steps.push(`setpts=PTS+${start.toFixed(4)}/TB`);
+    steps.push('setsar=1');
+  }
 
   return `[${inputIdx}:v]${steps.join(',')}[${label}]`;
+}
+
+// --------------------------------------------------------------------------
+// Crossfade runs
+// --------------------------------------------------------------------------
+
+/**
+ * Split one track's clips into runs that have to be rendered as a single
+ * stream, because a crossfade joins them.
+ *
+ * What counts as a crossfade is a deliberate choice, and it is narrow: clips
+ * that overlap in time ON THE SAME TRACK. Two clips overlapping on DIFFERENT
+ * tracks are layering — a keyed face over a background — and stay on the
+ * overlay path, because turning those into transitions would silently rewrite
+ * what every existing project means.
+ *
+ * A boundary where clips merely abut ends a run rather than joining it, so
+ * every fold inside a run is an xfade and none is a plain concat. That is
+ * worth the sentence it costs: abutting clips are the common case, they are
+ * what `split` produces, and leaving them in one-clip runs keeps them on
+ * byte-for-byte the command they had before any of this existed.
+ *
+ * @param {number} minOverlap  Overlaps shorter than this are not transitions.
+ *                             One frame, from the caller.
+ */
+function groupTrackRuns(clips, minOverlap = 0) {
+  const sorted = [...clips]
+    .filter(c => c && c.src)
+    .sort((a, b) => num(a.startSec) - num(b.startSec));
+
+  const runs = [];
+  let current = null;
+  let currentEnd = 0;
+
+  for (const clip of sorted) {
+    const start = num(clip.startSec);
+    const end = clipTimelineEnd(clip);
+
+    // Two conditions, and the second is the interesting one. A clip has to
+    // overlap what is already on screen, and it has to carry on past it. A
+    // clip that begins and ends inside its neighbour is not a transition —
+    // there is nothing to transition to — so it stays on the overlay path
+    // exactly as it is today rather than being folded in and dragged to the
+    // end of the run.
+    const joins = current
+      && currentEnd - start >= minOverlap
+      && end - currentEnd >= minOverlap;
+
+    if (joins) {
+      current.push(clip);
+    } else {
+      current = [clip];
+      runs.push(current);
+    }
+    currentEnd = end;
+  }
+
+  return runs;
+}
+
+/**
+ * Fold one run into a single labelled stream and return where it sits on the
+ * timeline, so the caller can overlay it like any other layer.
+ *
+ * A one-clip run is the old path untouched: same chain, same shift, same
+ * label. Only a genuine overlap takes the sequential route.
+ */
+function buildVideoRun(run, project, inputIndex, filters, labelNo) {
+  const runStart = num(run[0].startSec);
+
+  if (run.length === 1) {
+    const label = `v${labelNo}`;
+    filters.push(buildVideoClipChain(run[0], inputIndex.get(run[0].src), label, project));
+    return { label, start: runStart, end: clipTimelineEnd(run[0]) };
+  }
+
+  // One geometry for the whole run. Big enough for the largest scale in it
+  // plus the largest nudge, so the pad in step 6b never crops: a clip is at
+  // most width*maxScale wide and is offset by at most maxX, and the box has
+  // exactly that much slack on each side.
+  const maxScale = Math.max(...run.map(c => num(c.scale, 1)));
+  const maxX = Math.max(...run.map(c => Math.abs(Math.round(num(c.posX, 0)))));
+  const maxY = Math.max(...run.map(c => Math.abs(Math.round(num(c.posY, 0)))));
+  const box = {
+    w: Math.round(project.width * maxScale) + 2 * maxX,
+    h: Math.round(project.height * maxScale) + 2 * maxY
+  };
+
+  let acc = null;
+  // Length of the folded stream so far, in its own time. This is the number
+  // xfade offsets are measured against, and it is NOT a timeline position —
+  // keeping the two apart is the same discipline the rest of the file keeps.
+  let accLen = 0;
+
+  run.forEach((clip, i) => {
+    const label = `v${labelNo + i}`;
+    filters.push(buildVideoClipChain(clip, inputIndex.get(clip.src), label, project, {
+      box,
+      // The fades facing this join were the old hand-rolled crossfade. xfade
+      // does that blend now. Only the VIDEO fade goes: buildAudioClipChain
+      // still writes the afade, and those overlapping afades under amix are
+      // what crossfades the sound beneath the picture.
+      noFadeIn: i > 0,
+      noFadeOut: i < run.length - 1
+    }));
+
+    const dur = clipTimelineDuration(clip);
+    if (acc === null) {
+      acc = label;
+      accLen = dur;
+      return;
+    }
+
+    // How far into the joined stream this clip's start lands, and therefore
+    // how long the two shots are on screen together.
+    const overlap = accLen - (num(clip.startSec) - runStart);
+    // xfade rejects a transition longer than either of its inputs. Grouping
+    // already guarantees it fits — a clip that does not outlast its neighbour
+    // never joins a run — so this is a belt to that braces, cheap enough to
+    // keep against a future change to the grouping rule.
+    const d = Math.min(overlap, accLen, dur);
+    const offset = Math.max(0, accLen - d);
+
+    const out = `x${labelNo + i}`;
+    filters.push(
+      `[${acc}][${label}]xfade=transition=fade:duration=${d.toFixed(4)}:offset=${offset.toFixed(4)}[${out}]`
+    );
+    acc = out;
+    // xfade runs the first stream to `offset`, blends for `d`, then plays out
+    // the rest of the second — which comes to offset + dur seconds.
+    accLen = offset + dur;
+  });
+
+  // One stream again, so shift it onto the timeline exactly once.
+  const label = `r${labelNo}`;
+  const tail = [];
+  if (runStart > 0) tail.push(`setpts=PTS+${runStart.toFixed(4)}/TB`);
+  tail.push('setsar=1');
+  filters.push(`[${acc}]${tail.join(',')}[${label}]`);
+
+  return { label, start: runStart, end: runStart + accLen };
 }
 
 // --------------------------------------------------------------------------
@@ -283,22 +460,26 @@ function buildExportCommand(project, outPath, opts = {}) {
   let vLabel = `${canvasIdx}:v`;
   let vCount = 0;
 
+  // Runs, not clips. Clips that overlap on the same track are a crossfade and
+  // get folded into one stream by xfade before they reach the canvas; anything
+  // else is still one overlay per clip. Runs cannot overlap each other on a
+  // track — a run ends exactly where a clip stops overlapping — so composing
+  // them here is the same job as composing clips was.
+  let runCount = 0;
   for (const track of videoTracks) {
-    const sorted = [...track.clips].sort((a, b) => a.startSec - b.startSec);
-    for (const clip of sorted) {
-      if (!clip.src) continue;
-      const inputIdx = index.get(clip.src);
-      const label = `v${vCount}`;
-      filters.push(buildVideoClipChain(clip, inputIdx, label, project));
+    for (const run of groupTrackRuns(track.clips, 1 / (FPS || 30))) {
+      const { label, start, end } = buildVideoRun(run, project, index, filters, vCount);
+      vCount += run.length;
 
-      const start = num(clip.startSec);
-      const end = clipTimelineEnd(clip);
       // (W-w)/2 centres the clip on the canvas whatever its aspect ratio, so a
       // landscape phone clip in a 9:16 project sits in the middle rather than
-      // stuck to the top edge. posX/posY nudge it from there.
-      const x = `(W-w)/2${num(clip.posX, 0) >= 0 ? '+' : ''}${Math.round(num(clip.posX, 0))}`;
-      const y = `(H-h)/2${num(clip.posY, 0) >= 0 ? '+' : ''}${Math.round(num(clip.posY, 0))}`;
-      const outLabel = `bg${vCount}`;
+      // stuck to the top edge. posX/posY nudge it from there — for a run they
+      // are already baked into each clip's pad, so the overlay just centres.
+      const px = run.length > 1 ? 0 : Math.round(num(run[0].posX, 0));
+      const py = run.length > 1 ? 0 : Math.round(num(run[0].posY, 0));
+      const x = `(W-w)/2${px >= 0 ? '+' : ''}${px}`;
+      const y = `(H-h)/2${py >= 0 ? '+' : ''}${py}`;
+      const outLabel = `bg${runCount}`;
 
       // enable= stops the last frame of a clip from freezing on screen after
       // the clip is over, which is the classic overlay bug.
@@ -308,7 +489,7 @@ function buildExportCommand(project, outPath, opts = {}) {
       );
 
       vLabel = outLabel;
-      vCount++;
+      runCount++;
     }
   }
 
@@ -471,6 +652,7 @@ function parseSubtitles(text) {
 
 module.exports = {
   buildExportCommand,
+  groupTrackRuns,
   buildAssFile,
   parseSubtitles,
   clipTimelineDuration,
