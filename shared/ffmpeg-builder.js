@@ -594,6 +594,25 @@ function assColour(hex, alpha = 0) {
   return `&H${a}${b}${g}${r}`.toUpperCase();
 }
 
+/**
+ * Real per-word karaoke for one caption line, built from `c.words` (each
+ * `{start, end, text}`, real timestamps from whisper — see
+ * `groupWordsIntoCaptions`). ASS `\k` takes the highlight's own duration in
+ * centiseconds, measured from this word's start to the NEXT word's start —
+ * not this word's own start-to-end — so a pause between words is charged to
+ * the word before it and the highlight lands exactly when the next word
+ * starts rather than early. The last word in the line has no "next", so it
+ * runs to its own end.
+ */
+function karaokeText(words) {
+  return words.map((w, i) => {
+    const next = words[i + 1];
+    const boundary = next ? next.start : w.end;
+    const cs = Math.max(1, Math.round((boundary - w.start) * 100));
+    return `{\\k${cs}}${String(w.text || '').trim()}`;
+  }).join(' ');
+}
+
 function buildAssFile(project) {
   const st = project.captionStyle || {};
   const W = project.width;
@@ -606,6 +625,15 @@ function buildAssFile(project) {
   const outline = st.background
     ? assColour(st.bgColor || '#000000', 1 - (st.bgOpacity ?? 0.7))
     : assColour(st.outlineColor || '#000000');
+  // Karaoke reveals PrimaryColour (sung) against SecondaryColour (not yet
+  // sung) — the two have to actually differ or the sweep is invisible. An
+  // explicit secondaryColor wins; otherwise fall back to the text colour at
+  // reduced opacity rather than a fixed hue, so the "not yet sung" state
+  // stays visibly distinct from "sung" no matter what text colour was picked
+  // (a fixed grey, for instance, would vanish into a grey caption).
+  const secondary = st.secondaryColor
+    ? assColour(st.secondaryColor)
+    : assColour(st.color || '#FFFFFF', 0.55);
 
   const header = `[Script Info]
 ScriptType: v4.00+
@@ -616,7 +644,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Main,${st.font || 'Arial'},${st.size || 54},${primary},${primary},${outline},${outline},${st.bold ? -1 : 0},0,0,0,100,100,${st.spacing || 0},0,${borderStyle},${st.outlineWidth ?? 3},0,${align},60,60,${st.marginV ?? 70},1
+Style: Main,${st.font || 'Arial'},${st.size || 54},${primary},${secondary},${outline},${outline},${st.bold ? -1 : 0},0,0,0,100,100,${st.spacing || 0},0,${borderStyle},${st.outlineWidth ?? 3},0,${align},60,60,${st.marginV ?? 70},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`;
@@ -631,8 +659,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`
       if (anim === 'pop') text = `{\\fscx60\\fscy60\\t(0,140,\\fscx100\\fscy100)}${text}`;
       if (anim === 'slide') text = `{\\move(${W / 2},${H + 40},${W / 2},${H - (st.marginV ?? 70)},0,160)}${text}`;
       if (anim === 'typewriter') {
-        const dur = Math.max(0.1, c.end - c.start);
-        text = `{\\k${Math.round((dur * 100) / Math.max(1, text.length))}}${text}`;
+        // Real per-word timing when this line came from a transcription that
+        // has it. Anything else — hand-typed lines, an imported .srt/.vtt, or
+        // a line whose timing/text was hand-edited after transcription (see
+        // renderCaptions in app.js, which drops `words` the moment a line is
+        // touched) — falls back to the old even-split-by-character estimate,
+        // exactly as it rendered before word-level timing existed.
+        if (Array.isArray(c.words) && c.words.length) {
+          text = karaokeText(c.words);
+        } else {
+          const dur = Math.max(0.1, c.end - c.start);
+          text = `{\\k${Math.round((dur * 100) / Math.max(1, text.length))}}${text}`;
+        }
       }
       return `Dialogue: 0,${assTime(c.start)},${assTime(c.end)},Main,,0,0,0,,${text}`;
     });
@@ -669,11 +707,68 @@ function parseSubtitles(text) {
   return out;
 }
 
+// --------------------------------------------------------------------------
+// Word-level captions
+//
+// whisper.cpp (`-ml 1 -sow`) and openai-whisper (`--word_timestamps True
+// --max_words_per_line 1`) can both be made to emit one SRT cue per word —
+// see main.js's `captions:transcribe` for exactly how. That is real timing
+// data, not something worth showing the editor one row per word: a minute of
+// speech is a couple hundred one-word rows, which is unusable in the caption
+// list. So the words are re-grouped here into sentence/phrase-sized rows for
+// editing, while each word's own start/end rides along on the row for
+// buildAssFile's karaoke `\k` tags to use.
+// --------------------------------------------------------------------------
+
+/** A word ending a sentence — closing quote/paren after the mark is common. */
+const SENTENCE_END = /[.!?]["'”)\]]*$/;
+
+/**
+ * @param {{start:number, end:number, text:string}[]} words  One entry per
+ *   word, in order, real timestamps in seconds.
+ * @param {object} [opts]
+ * @param {number} [opts.maxWords]  Hard cap so a transcript with no
+ *   punctuation and no pauses (a run-on caption model, or the wrong language
+ *   heuristics) still breaks into readable rows instead of one giant line.
+ * @param {number} [opts.maxGap]  A silence at least this long (seconds)
+ *   between two words ends the row even without punctuation.
+ * @returns {{start:number, end:number, text:string, words:object[]}[]}
+ */
+function groupWordsIntoCaptions(words, opts = {}) {
+  const maxWords = opts.maxWords ?? 12;
+  const maxGap = opts.maxGap ?? 0.6;
+
+  const groups = [];
+  let current = [];
+
+  function flush() {
+    if (!current.length) return;
+    groups.push({
+      start: current[0].start,
+      end: current[current.length - 1].end,
+      text: current.map(w => w.text).join(' '),
+      words: current.map(w => ({ start: w.start, end: w.end, text: w.text }))
+    });
+    current = [];
+  }
+
+  words.forEach((w, i) => {
+    current.push(w);
+    const next = words[i + 1];
+    const gapToNext = next ? next.start - w.end : Infinity;
+    const endsSentence = SENTENCE_END.test(String(w.text || '').trim());
+    if (!next || endsSentence || gapToNext >= maxGap || current.length >= maxWords) flush();
+  });
+
+  return groups;
+}
+
 module.exports = {
   buildExportCommand,
   groupTrackRuns,
   buildAssFile,
   parseSubtitles,
+  groupWordsIntoCaptions,
   clipTimelineDuration,
   clipTimelineEnd,
   projectDuration,

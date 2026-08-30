@@ -1232,8 +1232,24 @@ function renderCaptionStyle() {
     if (st.animation === v) o.selected = true;
     anim.appendChild(o);
   }
-  anim.onchange = () => { st.animation = anim.value; };
+  anim.onchange = () => { st.animation = anim.value; renderCaptionStyle(); };
   box.appendChild(field('Animation', anim));
+
+  if (st.animation === 'typewriter') {
+    const karaokeRow = document.createElement('div');
+    karaokeRow.className = 'row';
+    const karaoke = document.createElement('input');
+    karaoke.type = 'color';
+    karaoke.className = 'input';
+    karaoke.style.height = '28px';
+    // Only the "already sung" state has a colour of its own (st.color);
+    // "not yet sung" has no separate field until the user picks one, so the
+    // swatch previews the same dimmed default buildAssFile falls back to.
+    karaoke.value = st.secondaryColor || st.color;
+    karaoke.onchange = () => { st.secondaryColor = karaoke.value; };
+    karaokeRow.appendChild(field('Karaoke colour (not yet spoken)', karaoke));
+    box.appendChild(karaokeRow);
+  }
 
   const bgCheck = document.createElement('div');
   bgCheck.className = 'check';
@@ -1291,11 +1307,15 @@ function renderCaptions() {
     const start = document.createElement('input');
     start.className = 'cap-time';
     start.value = cap.start.toFixed(2);
-    start.onchange = () => { cap.start = Number(start.value) || 0; renderCaptions(); };
+    // A hand-set time no longer matches the real per-word timestamps this
+    // row may have carried in from transcription, so it goes back to the
+    // even-split estimate buildAssFile falls back to — the same rule the
+    // text edit below follows.
+    start.onchange = () => { cap.start = Number(start.value) || 0; delete cap.words; renderCaptions(); };
     const end = document.createElement('input');
     end.className = 'cap-time';
     end.value = cap.end.toFixed(2);
-    end.onchange = () => { cap.end = Number(end.value) || 0; renderCaptions(); };
+    end.onchange = () => { cap.end = Number(end.value) || 0; delete cap.words; renderCaptions(); };
     trackContinuous(start, 'caption timing');
     trackContinuous(end, 'caption timing');
     times.append(start, end);
@@ -1304,7 +1324,10 @@ function renderCaptions() {
     text.className = 'cap-text';
     text.rows = 1;
     text.value = cap.text;
-    text.oninput = () => { cap.text = text.value; };
+    // Editing the words a row carries real per-word timing for makes that
+    // timing describe a caption that no longer exists, so it is dropped
+    // rather than left to silently mislabel whatever text replaces it.
+    text.oninput = () => { cap.text = text.value; delete cap.words; };
     // A whole burst of typing collapses into one entry, closed on blur —
     // undo per keystroke would take a dozen presses to clear one line.
     trackContinuous(text, 'caption text');
@@ -1333,10 +1356,18 @@ async function transcribeSelected() {
     // Whisper timestamps are relative to the source file. If the clip starts
     // later on the timeline, shift them so captions land in the right place.
     const shift = clip ? (clip.startSec - clip.inSec / (clip.speed || 1)) : 0;
+    const shiftTime = (t) => Math.max(0, t / (clip?.speed || 1) + shift);
     state.project.captions = res.captions.map(c => ({
-      start: Math.max(0, c.start / (clip?.speed || 1) + shift),
-      end: Math.max(0, c.end / (clip?.speed || 1) + shift),
-      text: c.text
+      start: shiftTime(c.start),
+      end: shiftTime(c.end),
+      text: c.text,
+      // Real per-word timing, when the transcription produced it (see
+      // main.js's captions:transcribe) — the same shift/speed remap applies
+      // per word so the karaoke sweep in buildAssFile lines up with the rest
+      // of the caption.
+      ...(Array.isArray(c.words) && c.words.length
+        ? { words: c.words.map(w => ({ start: shiftTime(w.start), end: shiftTime(w.end), text: w.text })) }
+        : {})
     }));
     state.project.captionsEnabled = true;
   });
