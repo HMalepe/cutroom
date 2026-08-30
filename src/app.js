@@ -406,8 +406,10 @@ function sendToTrack(trackId) {
  * through the shader in key-preview.js. Green screen, brightness/contrast/
  * saturation, scale and position all show as you drag the sliders, computed
  * the way ffmpeg computes them so the numbers you settle on are the numbers
- * that will export. Speed, trims and captions are still not shown — the note
- * in the empty pane says so, and Test 3s is still the way to check those.
+ * that will export. The <video> itself loops between the clip's inSec and
+ * outSec at its speed (see applyClipLoop / stepClipLoop), so trims and speed
+ * show too. Captions are still not shown — the note in the empty pane says
+ * so, and Test 3s is still the way to check those.
  *
  * The keyed mode needs a clip, because a key is a per-clip setting. Selecting
  * something in the bin has no clip to read, so it stays plain.
@@ -526,6 +528,19 @@ function stopPreviewLoop() {
   previewRaf = 0;
 }
 
+/**
+ * Keep the <video> element looping the clip's own trim at the clip's own
+ * speed, so the keyed preview shows what the export will show instead of the
+ * whole source file at 1x. The decision is pure and lives in key-preview.js
+ * (stepClipLoop) — this is just the DOM side of applying it, run every tick
+ * so a clip whose trim or speed changes underneath it self-corrects.
+ */
+function applyClipLoop(video, clip) {
+  const step = stepClipLoop(video.currentTime, clip);
+  if (video.playbackRate !== step.playbackRate) video.playbackRate = step.playbackRate;
+  if (step.seekTo !== null) video.currentTime = step.seekTo;
+}
+
 function drawKeyedFrame() {
   const k = getKeyer();
   const clip = previewClipId ? findClip(previewClipId).clip : null;
@@ -541,6 +556,7 @@ function drawKeyedFrame() {
   }
 
   const v = $('video');
+  applyClipLoop(v, clip);
   syncScrub();
 
   // Redraw every frame while playing, and exactly once after an edit. A slider
