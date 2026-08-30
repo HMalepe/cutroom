@@ -166,6 +166,8 @@ test('matrixNameFromTags reads ffprobe tags the way main.js will hand them over'
   assert.equal(M.matrixNameFromTags({ colorSpace: 'smpte170m' }), 'bt601');
   assert.equal(M.matrixNameFromTags({ colorSpace: 'bt470bg' }), 'bt601');
   assert.equal(M.matrixNameFromTags({ colorSpace: 'smpte170m', colorRange: 'pc' }), 'bt601-full');
+  assert.equal(M.matrixNameFromTags({ colorSpace: 'bt709', colorRange: 'pc' }), 'bt709-full',
+    'full range applies to a bt709 tag too, not just bt601');
 });
 
 test('matrixNameFromTags falls through to primaries when matrix coefficients are unset', () => {
@@ -197,6 +199,26 @@ test('the matrix assumption is what it claims to be, and it matters', () => {
   near(d601, 0.0456, 5e-4, 'bt601 green');
   near(d709, 0.0160, 5e-4, 'bt709 green');
   assert.equal(M.DEFAULT_MATRIX, 'bt601');
+});
+
+test('bt709-full agrees with real ffmpeg, value for value', () => {
+  // Captured with: ffmpeg -f rawvideo -pix_fmt rgb24 -s 4x1 -i rgb.raw -vf
+  // "scale=in_range=full:out_range=full:in_color_matrix=bt709:
+  //  out_color_matrix=bt709" -pix_fmt yuv444p -f rawvideo yuv.raw
+  // on four test pixels (green, red, mid-grey, orange), not generated from
+  // the matrix under test.
+  const cases = [
+    { rgb: [0, 255, 0], yuv: [182, 30, 12] },
+    { rgb: [255, 0, 0], yuv: [54, 99, 255] }, // ffmpeg's V clamps 256 to 255
+    { rgb: [128, 128, 128], yuv: [128, 128, 128] },
+    { rgb: [255, 128, 0], yuv: [146, 49, 197] }
+  ];
+  for (const { rgb: [r, g, b], yuv: [y, u, v] } of cases) {
+    const got = M.rgbToYuv(r, g, b, 'bt709-full');
+    near(Math.round(got.y), y, 1, `Y for rgb(${r},${g},${b})`);
+    near(Math.round(got.u), u, 1, `U for rgb(${r},${g},${b})`);
+    near(Math.round(got.v), v, 1, `V for rgb(${r},${g},${b})`);
+  }
 });
 
 // ==========================================================================

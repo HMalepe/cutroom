@@ -191,6 +191,20 @@
         [0.500000, -0.418688, -0.081312]
       ],
       off: [0, 128, 128]
+    },
+    // BT.709 full range. Same relationship to 'bt709' as 'bt601-full' has to
+    // 'bt601' — the 219/224 scaling and the 16-luma floor drop out, chroma
+    // stays centred on 128. Some screen recordings and phone cameras tag
+    // bt709 primaries/matrix with full range rather than the more common
+    // limited range. Verified against real ffmpeg (`scale=in_color_matrix=
+    // bt709:in_range=full`) on a handful of test colours, not just derived.
+    'bt709-full': {
+      m: [
+        [0.2126, 0.7152, 0.0722],
+        [-0.114572, -0.385428, 0.500000],
+        [0.500000, -0.454153, -0.045847]
+      ],
+      off: [0, 128, 128]
     }
   };
 
@@ -229,6 +243,11 @@
    * one people forget. Falling through to primaries in that one case is
    * cheap and catches footage that would otherwise silently default to 601.
    *
+   * colorRange applies to bt709 exactly as it does to bt601: a screen
+   * recording or phone camera can tag full-range bt709 as easily as
+   * full-range bt601, so both get a '-full' row rather than only the one
+   * that happened to be the first one written.
+   *
    * Untagged input (color_space "unknown"/"unspecified", or missing
    * entirely) resolves to DEFAULT_MATRIX, which is bt601 — verified against
    * both ffmpeg's own swscale and a real browser decode (see key-preview's
@@ -249,9 +268,9 @@
     const primaries = String(t.colorPrimaries || '').toLowerCase();
     const full = String(t.colorRange || '').toLowerCase() === 'pc';
 
-    if (BT709_SPACES.has(space)) return 'bt709';
+    if (BT709_SPACES.has(space)) return full ? 'bt709-full' : 'bt709';
     if (BT601_SPACES.has(space)) return full ? 'bt601-full' : 'bt601';
-    if (BT709_SPACES.has(primaries)) return 'bt709';
+    if (BT709_SPACES.has(primaries)) return full ? 'bt709-full' : 'bt709';
     return DEFAULT_MATRIX;
   }
 
