@@ -13,6 +13,7 @@ const fs = require('fs');
 const os = require('os');
 
 const builder = require('./shared/ffmpeg-builder');
+const { validateProject, PROJECT_VERSION } = require('./shared/project-schema');
 const { matrixNameFromTags } = require('./src/chroma-math');
 
 let win = null;
@@ -386,7 +387,10 @@ ipcMain.handle('project:save', async (_e, project) => {
     filters: [{ name: 'Cutroom project', extensions: ['json'] }]
   });
   if (res.canceled) return null;
-  fs.writeFileSync(res.filePath, JSON.stringify(project, null, 2), 'utf8');
+  // The version rides on the file, not on the project in memory: it describes
+  // the format on disk, and nothing in the editor should start reading it.
+  const onDisk = { ...project, version: PROJECT_VERSION };
+  fs.writeFileSync(res.filePath, JSON.stringify(onDisk, null, 2), 'utf8');
   return res.filePath;
 });
 
@@ -399,5 +403,22 @@ ipcMain.handle('project:open', async () => {
     filters: [{ name: 'Cutroom project', extensions: ['json'] }]
   });
   if (res.canceled) return null;
-  return JSON.parse(fs.readFileSync(res.filePaths[0], 'utf8'));
+
+  const file = res.filePaths[0];
+  const name = path.basename(file);
+
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (err) {
+    // A truncated or hand-edited file throws here rather than at the shape
+    // check below. Letting it escape would cross IPC as a rejected promise
+    // that the renderer's `await` never catches, which is the loudest possible
+    // way to say nothing at all.
+    return { ok: false, error: `${name} could not be read.`, detail: String(err.message || err) };
+  }
+
+  const check = validateProject(parsed);
+  if (!check.ok) return { ok: false, error: check.error, detail: name };
+  return { ok: true, project: check.project };
 });

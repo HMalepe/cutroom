@@ -697,3 +697,198 @@ test('a run on one track still composites under a layer on the track above', () 
   assert.match(graph, /\[r0\]overlay=.*\[bg0\]/);
   assert.match(graph, /\[bg0\]\[v2\]overlay=.*\[bg1\]/);
 });
+
+// --------------------------------------------------------------------------
+// The copy path's blind spots
+//
+// canStreamCopy was tested for tracks, clips, speed and chroma and stopped
+// there, so five inspector settings it does not look at went unnoticed: each
+// one exports silently discarded rather than slowly. These test the fields
+// that were actually missing, not the ones next to them.
+// --------------------------------------------------------------------------
+
+/** A single-video-track project carrying one clip with these overrides. */
+function copyCandidate(clipOverrides = {}) {
+  const project = singleVideoTrackProject();
+  project.tracks[0].clips.push(makeClip(clipOverrides));
+  return project;
+}
+
+test('canStreamCopy rejects the inspector settings the copy path cannot honour', () => {
+  // Every one of these is applied by the filter graph and by nothing else:
+  // scale= for the size, the overlay's x/y for the nudge, volume= for the
+  // level. -c copy runs none of them, so a clip carrying one has to re-encode
+  // or the setting is thrown away with no error anywhere.
+  assert.equal(canStreamCopy(copyCandidate({ scale: 0.5 })), false, 'scaled down');
+  assert.equal(canStreamCopy(copyCandidate({ scale: 2 })), false, 'scaled up');
+  assert.equal(canStreamCopy(copyCandidate({ posX: 200 })), false, 'nudged right');
+  assert.equal(canStreamCopy(copyCandidate({ posY: -50 })), false, 'nudged up');
+  assert.equal(canStreamCopy(copyCandidate({ volume: 0.25 })), false, 'quietened');
+  assert.equal(canStreamCopy(copyCandidate({ volume: 0 })), false, 'silenced');
+
+  // Muting lives on the track, and -c copy would carry the source's audio
+  // stream out untouched regardless.
+  const muted = copyCandidate();
+  muted.tracks[0].muted = true;
+  assert.equal(canStreamCopy(muted), false, 'muted track');
+
+  // Hiding is the same trap one field over, and the two paths disagree in
+  // opposite directions: the filter path drops a hidden track before the
+  // canvas and renders black, while -c copy cannot express "show nothing" and
+  // would hand back the hidden footage.
+  const hidden = copyCandidate();
+  hidden.tracks[0].hidden = true;
+  assert.equal(canStreamCopy(hidden), false, 'hidden track');
+});
+
+test('a hidden video track renders black rather than being copied out', () => {
+  // The bug this pins is not that one path is wrong on its own — it is that
+  // the two paths disagree. Assert the filter path's answer (no clip reaches
+  // the canvas) so the copy path has something concrete to match.
+  const hidden = copyCandidate();
+  hidden.tracks[0].hidden = true;
+
+  const { args, mode } = buildExportCommand(hidden, 'out.mp4');
+  assert.equal(mode, 'filter', 'a hidden track must not take the copy path');
+
+  const graph = args[args.indexOf('-filter_complex') + 1];
+  assert.ok(
+    !graph.includes('[0:v]'),
+    `the hidden clip must not enter the video graph, got: ${graph}`
+  );
+});
+
+test('canStreamCopy still takes the fast path for the defaults, however they are spelled', () => {
+  // The fast path is the point of the check, so the defaults have to survive
+  // it. Undefined is not a hypothetical spelling: it is what every project
+  // saved before these fields existed actually looks like.
+  assert.equal(canStreamCopy(copyCandidate({
+    scale: 1, posX: 0, posY: 0, volume: 1
+  })), true, 'explicit defaults');
+
+  assert.equal(canStreamCopy(copyCandidate({
+    scale: undefined, posX: undefined, posY: undefined, volume: undefined
+  })), true, 'absent fields');
+
+  const unmuted = copyCandidate();
+  unmuted.tracks[0].muted = false;
+  assert.equal(canStreamCopy(unmuted), true, 'muted: false');
+});
+
+test('previewSeconds clamps the copy path, not just the filter path', () => {
+  // The existing previewSeconds test used a crossfading project, which takes
+  // the other branch entirely — so "Test 3s" on the boring single clip that
+  // most reaches for it exported the whole thing.
+  const { args, mode, duration } = buildExportCommand(
+    copyCandidate({ inSec: 0, outSec: 10 }), 'out.mp4', { previewSeconds: 3 });
+  assert.equal(mode, 'copy');
+  assert.equal(args[args.indexOf('-to') + 1], '3.0000');
+  // The progress bar divides by this, so the full length made a 3-second test
+  // render stop at 30%.
+  assert.equal(duration, 3);
+});
+
+test('previewSeconds on a trimmed clip stops three seconds into the clip, not into the file', () => {
+  // -ss and -to are both INPUT options here, and an input-side -to is a
+  // position in the source's own timeline rather than a length measured from
+  // -ss: `-ss 2 -to 5` yields three seconds, not five. Verified against a real
+  // ffmpeg in ffmpeg-render.test.js rather than assumed, because the other
+  // reading gives -to 3 for this clip, which starts after it stops and renders
+  // nothing at all.
+  const { args, duration } = buildExportCommand(
+    copyCandidate({ inSec: 4, outSec: 10 }), 'out.mp4', { previewSeconds: 3 });
+  assert.equal(args[args.indexOf('-ss') + 1], '4.0000');
+  assert.equal(args[args.indexOf('-to') + 1], '7.0000');
+  assert.equal(duration, 3);
+});
+
+test('previewSeconds longer than the clip does not stretch the copy path', () => {
+  const { args, duration } = buildExportCommand(
+    copyCandidate({ inSec: 0, outSec: 2 }), 'out.mp4', { previewSeconds: 3 });
+  assert.equal(args[args.indexOf('-to') + 1], '2.0000');
+  assert.equal(duration, 2);
+});
+
+test('the copy path without previewSeconds writes the -to it always wrote', () => {
+  const { args, duration } = buildExportCommand(
+    copyCandidate({ inSec: 1, outSec: 6 }), 'out.mp4');
+  assert.equal(args[args.indexOf('-ss') + 1], '1.0000');
+  assert.equal(args[args.indexOf('-to') + 1], '6.0000');
+  assert.equal(duration, 5);
+});
+
+// --------------------------------------------------------------------------
+// Caption text is data, not markup
+// --------------------------------------------------------------------------
+
+/** The Dialogue line for a one-caption project. */
+function dialogueLine(text, style = {}, extra = {}) {
+  const ass = buildAssFile({
+    width: 1080, height: 1920,
+    captionStyle: style,
+    captions: [{ start: 0, end: 2, text, ...extra }]
+  });
+  return ass.trim().split('\n').pop();
+}
+
+test('a brace in caption text is escaped rather than read as an override block', () => {
+  // libass reads `{` as the start of a tag block and drops everything up to
+  // the matching `}`, so this line used to reach the screen as "costs  today"
+  // with no error raised anywhere.
+  assert.ok(dialogueLine('costs {50} today').endsWith(',costs \\{50\\} today'),
+    dialogueLine('costs {50} today'));
+});
+
+test('a user backslash is separated from the character after it', () => {
+  // \N and \n are line breaks in libass and \h is a hard space, so "C:\Notes"
+  // wrapped onto two lines. Doubling does not fix it — libass reads `\\N` as a
+  // literal backslash AND a line break — so a zero-width space is what breaks
+  // the pair up.
+  const line = dialogueLine('C:\\Notes');
+  assert.ok(line.includes('C:\\\u200BNotes'), JSON.stringify(line));
+  // Nothing that libass would still act on survives in the user's half.
+  assert.ok(!/\\[Nnh]/.test(line.split(',,').pop().replace(/\\\u200B/g, '')),
+    'no live escape left in the body');
+});
+
+test('escaping runs before the builder writes its own markup, not after', () => {
+  // This is the ordering that matters. The user's text is escaped while it is
+  // still only the user's text; the \N and the animation tag are the
+  // builder's own markup and go around the result. Escape afterwards and the
+  // builder defuses its own tags instead.
+  const line = dialogueLine('two\nlines {x}', { animation: 'fade' });
+  assert.ok(line.includes('{\\fad(120,120)}'), 'the fade tag stays live');
+  assert.ok(line.includes('two\\Nlines'), 'the newline stays a real \\N');
+  assert.ok(line.includes('\\{x\\}'), 'the user brace is escaped');
+});
+
+test('karaoke escapes each word without defusing its own \\k tags', () => {
+  const line = dialogueLine('{A} B', { animation: 'typewriter' }, {
+    words: [{ start: 0, end: 1, text: '{A}' }, { start: 1, end: 2, text: 'B' }]
+  });
+  assert.ok(line.endsWith(',{\\k100}\\{A\\} {\\k100}B'), line);
+});
+
+test('the karaoke fallback splits by visible characters, not by the escapes', () => {
+  // Two characters over two seconds is 100cs each way. Counting the escapes
+  // instead would see four characters and halve every highlight.
+  assert.ok(dialogueLine('ab', { animation: 'typewriter' }).includes('{\\k100}'),
+    dialogueLine('ab', { animation: 'typewriter' }));
+  assert.ok(dialogueLine('{}', { animation: 'typewriter' }).includes('{\\k100}'),
+    dialogueLine('{}', { animation: 'typewriter' }));
+});
+
+// --------------------------------------------------------------------------
+// Audio delay
+// --------------------------------------------------------------------------
+
+test('adelay delays every channel, not only the first two', () => {
+  // A two-entry delay list names two channels and ffmpeg leaves the rest
+  // alone, so a 5.1 source keeps its centre, LFE and surrounds at zero while
+  // the front pair moves. all=1 reuses the last delay for the remainder.
+  const project = baseProject();
+  project.tracks[2].clips.push(makeClip({ startSec: 2, hasAudio: true }));
+  const graph = graphOf(project);
+  assert.match(graph, /adelay=2000:all=1/);
+  assert.ok(!/adelay=\d+\|/.test(graph), 'no hardcoded per-channel list');
+});

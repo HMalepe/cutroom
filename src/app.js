@@ -1635,9 +1635,16 @@ $('btnSave').onclick = async () => {
   if (p) toast('Project saved.');
 };
 $('btnOpen').onclick = async () => {
-  const p = await api.openProject();
-  if (!p) return;
-  state.project = p;
+  const res = await api.openProject();
+  if (!res) return;
+  if (!res.ok) {
+    // Nothing has been touched yet, so the project on screen is still the one
+    // that was open before the dialog — which is the point of checking the
+    // file's shape in main.js before any of the replacement below runs.
+    toast('Could not open that project', 'err', res.detail ? `${res.error}\n${res.detail}` : res.error);
+    return;
+  }
+  state.project = res.project;
   state.selectedClipId = null;
   state.playhead = 0;
   // The stack described edits to the project that was just replaced. Undoing

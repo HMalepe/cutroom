@@ -536,3 +536,176 @@ test('despill reads the source\'s real colour tag on its own; the builder passes
   assert.ok(Math.abs(g709 - g601) > 3,
     `identical bytes under different tags should despill to visibly different green, saw ${g709} vs ${g601}`);
 });
+
+// --------------------------------------------------------------------------
+// Caption text that libass would otherwise read as markup
+// --------------------------------------------------------------------------
+
+/** Lit pixels on the frame at t. Text that is on screen puts ink on it. */
+function inkCount(file, t) {
+  const r = spawnSync('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error', '-i', file, '-ss', String(t), '-frames:v', '1',
+    '-f', 'rawvideo', '-pix_fmt', 'gray', '-'
+  ], { encoding: 'buffer', maxBuffer: 1 << 26 });
+  assert.equal(r.status, 0, 'ink probe failed');
+  let lit = 0;
+  for (const b of r.stdout) if (b > 100) lit++;
+  return lit;
+}
+
+/** Burn one caption line over black through the real builder and ffmpeg. */
+function captionRender(name, text) {
+  const assPath = path.join(DIR, `${name}.ass`);
+  fs.writeFileSync(assPath, require('../shared/ffmpeg-builder').buildAssFile({
+    width: 320, height: 240,
+    captionStyle: { font: 'Arial', size: 40, position: 'middle', color: '#FFFFFF' },
+    captions: [{ start: 0, end: 3, text }]
+  }));
+  // As in the karaoke test: the caption is the subject, so the only clip is an
+  // inaudible one on the audio track, there to give the project a length.
+  const proj = project([[], [], [clip(bars(), { startSec: 0, outSec: 2.5, hasAudio: false })]],
+    { captionsEnabled: true, captions: [{ start: 0, end: 3, text }] });
+  return render(name, proj, { assPath });
+}
+
+test('a caption containing braces reaches the screen instead of being deleted', opts, () => {
+  // libass reads `{` as the start of an override block and drops everything up
+  // to the matching `}`, so `costs {50} today` burned in as `costs  today` —
+  // no error, no warning, just missing words.
+  //
+  // Asserting the line is merely "visible" would have passed on the broken
+  // output too, since most of it always rendered. What separates them is that
+  // the broken render was pixel-for-pixel the same as the line with the braces
+  // and their contents removed, so that is what this compares against.
+  const braced = captionRender('braced', 'costs {50} today');
+  const gutted = captionRender('gutted', 'costs  today');
+
+  const withBraces = inkCount(braced, 1);
+  const without = inkCount(gutted, 1);
+  assert.ok(withBraces > without + 200,
+    `"costs {50} today" should carry visibly more ink than "costs  today": ` +
+    `got ${withBraces} vs ${without}`);
+
+  // And a line that is nothing but braces used to render as an empty frame.
+  assert.ok(inkCount(captionRender('all-braces', '{50}'), 1) > 200,
+    'a caption of "{50}" should not be a blank screen');
+});
+
+test('a backslash in a caption does not silently wrap the line', opts, () => {
+  // \N and \n are line breaks to libass and \h is a hard space, so `C:\Notes`
+  // came out as two lines. One line of 40px text is nowhere near as tall as
+  // two, which is what this measures.
+  const out = captionRender('backslash', 'C:\\Notes');
+  const r = spawnSync('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error', '-i', out, '-ss', '1', '-frames:v', '1',
+    '-f', 'rawvideo', '-pix_fmt', 'gray', '-'
+  ], { encoding: 'buffer', maxBuffer: 1 << 26 });
+  assert.equal(r.status, 0);
+  let minY = Infinity, maxY = -1;
+  for (let i = 0; i < r.stdout.length; i++) {
+    if (r.stdout[i] > 100) { const y = Math.floor(i / 320); if (y < minY) minY = y; if (y > maxY) maxY = y; }
+  }
+  assert.ok(maxY >= 0, 'the caption rendered at all');
+  assert.ok(maxY - minY < 40,
+    `"C:\\Notes" should be one line of 40px text, but its ink spans ${maxY - minY}px`);
+});
+
+// --------------------------------------------------------------------------
+// The copy path
+// --------------------------------------------------------------------------
+
+test('previewSeconds on the copy path really is three seconds of ffmpeg output', opts, () => {
+  // The builder writes -ss and -to as INPUT options, and an input-side -to is
+  // a position in the source rather than a length measured from -ss. The whole
+  // clamp depends on that reading, so it is checked here against a real ffmpeg
+  // instead of against the documentation: this clip starts at 4s, and the
+  // other reading would write `-to 3` — a stop point before the start, which
+  // renders nothing at all.
+  //
+  // -g 10 puts a keyframe every third of a second. Stream copy can only start
+  // at a keyframe, and -avoid_negative_ts make_zero keeps everything from the
+  // one before the seek point, so on a source with a sparse GOP the output
+  // runs longer than asked whatever -to says. That is stream copy's nature
+  // rather than something the builder can fix; a dense GOP here keeps this
+  // test measuring the clamp instead of measuring keyframe luck.
+  const src = source('ten', ['-f', 'lavfi', '-i',
+    'testsrc=duration=10:size=320x240:rate=30', '-g', '10', '-pix_fmt', 'yuv420p']);
+
+  // One video track, so the project qualifies for the copy path at all.
+  const proj = {
+    name: 'copy', width: 320, height: 240, fps: 30, captionsEnabled: false, captions: [],
+    tracks: [
+      { id: 'v1', kind: 'video', name: 'Video 1', clips: [clip(src, { inSec: 4, outSec: 10 })] },
+      { id: 'a1', kind: 'audio', name: 'Audio 1', clips: [] }
+    ]
+  };
+
+  const out = path.join(DIR, 'copy-preview.mp4');
+  const { args, mode, duration } = buildExportCommand(proj, out, { previewSeconds: 3 });
+  assert.equal(mode, 'copy', 'this has to be the copy path to be testing anything');
+  assert.equal(duration, 3);
+  assert.equal(args[args.indexOf('-to') + 1], '7.0000', 'inSec + 3, in the source timeline');
+
+  const r = spawnSync('ffmpeg', args, { encoding: 'utf8' });
+  assert.equal(r.status, 0, `ffmpeg refused the copy command:\n${r.stderr.split('\n').slice(-15).join('\n')}`);
+  // Stream copy can only cut on the frames it is given, so the tolerance is
+  // wider than an encode's would be — but nowhere near the six seconds the
+  // whole clip would have been.
+  near(durationOf(out), 3, 0.3, 'a three-second test render');
+});
+
+// --------------------------------------------------------------------------
+// Multi-channel audio
+// --------------------------------------------------------------------------
+
+test('adelay moves every channel of a 5.1 source, not just the front pair', opts, () => {
+  // adelay leaves any channel its delay list does not name completely alone,
+  // so `adelay=1000|1000` moved FL and FR and left the centre, LFE and both
+  // surrounds sitting at zero — a full second of desync on exactly the
+  // material that would notice.
+  //
+  // Each channel carries a short burst at the top of the file and silence
+  // afterwards, so "where does this channel start" is measurable. The LFE tone
+  // is 60Hz because the encoder band-limits that channel and a 500Hz tone in
+  // it does not survive to be measured.
+  const freqs = [440, 460, 480, 60, 520, 540];
+  const src = source('surround51', [
+    '-f', 'lavfi', '-i', 'testsrc=duration=4:size=320x240:rate=30',
+    ...freqs.flatMap(f => ['-f', 'lavfi', '-i', `sine=frequency=${f}:duration=0.5,apad=whole_dur=4`]),
+    '-filter_complex', '[1:a][2:a][3:a][4:a][5:a][6:a]join=inputs=6:channel_layout=5.1[a]',
+    '-map', '0:v', '-map', '[a]', '-pix_fmt', 'yuv420p', '-c:a', 'aac'
+  ]);
+
+  const proj = project([[], [], [
+    clip(src, { startSec: 1, inSec: 0, outSec: 3, hasVideo: false, hasAudio: true })
+  ]]);
+  const out = render('surround-delay', proj);
+
+  // The layout has to survive the graph, or the channel indices below mean
+  // nothing.
+  const layout = spawnSync('ffprobe', ['-v', 'error', '-select_streams', 'a:0',
+    '-show_entries', 'stream=channels', '-of', 'csv=p=0', out], { encoding: 'utf8' }).stdout.trim();
+  assert.equal(layout, '6', 'the export should still be 5.1');
+
+  const raw = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-i', out,
+    '-map', '0:a', '-f', 's16le', '-acodec', 'pcm_s16le', '-ac', '6', '-ar', '48000', '-'],
+    { encoding: 'buffer', maxBuffer: 1 << 28 });
+  assert.equal(raw.status, 0, 'could not decode the exported audio');
+
+  const CH = 6, RATE = 48000;
+  const onset = new Array(CH).fill(null);
+  for (let f = 0; f < raw.stdout.length / 2 / CH; f++) {
+    for (let c = 0; c < CH; c++) {
+      if (onset[c] === null && Math.abs(raw.stdout.readInt16LE((f * CH + c) * 2)) > 800) {
+        onset[c] = f / RATE;
+      }
+    }
+  }
+
+  const NAMES = ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR'];
+  onset.forEach((t, c) => {
+    assert.ok(t !== null, `${NAMES[c]} carried no sound at all`);
+    // The old two-entry list left the last four of these at 0.
+    near(t, 1, 0.15, `${NAMES[c]} should start one second in`);
+  });
+});
