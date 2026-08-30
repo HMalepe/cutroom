@@ -1039,6 +1039,28 @@ function renderInspector() {
   xfNote.textContent = 'Overlap two clips on the SAME video track — that is a crossfade. Overlap them on different tracks instead to layer one over the other.';
   box.appendChild(xfNote);
 
+  // Only the clip on the incoming side of a transition uses this — the same
+  // side whose alpha fade-in gets suppressed by the run it joins. It has no
+  // effect on a clip that never ends up as the second half of an xfade fold,
+  // so there is no harm in always offering it. Keep this list in step with
+  // TRANSITION_TYPES in shared/ffmpeg-builder.js.
+  const xfSelect = document.createElement('select');
+  xfSelect.className = 'input';
+  for (const [v, label] of [
+    ['fade', 'fade'], ['dissolve', 'dissolve'],
+    ['fadeblack', 'dip to black'], ['fadewhite', 'dip to white'],
+    ['wipeleft', 'wipe left'], ['wiperight', 'wipe right'],
+    ['slideleft', 'slide left'], ['slideright', 'slide right'],
+    ['circleopen', 'circle open'], ['circleclose', 'circle close']
+  ]) {
+    const o = document.createElement('option');
+    o.value = v; o.textContent = label;
+    if ((clip.transitionType || 'fade') === v) o.selected = true;
+    xfSelect.appendChild(o);
+  }
+  xfSelect.onchange = () => { clip.transitionType = xfSelect.value; scheduleCommandPreview(); };
+  box.appendChild(field('Crossfade style — used when this clip is the incoming side', xfSelect));
+
   // --- Volume -------------------------------------------------------------
   if (clip.hasAudio) {
     box.appendChild(slider('Volume', clip.volume, 0, 2, 0.05,

@@ -86,10 +86,10 @@ const TEMPLATES = [
     tag: 'vlog',
     overlap: 0.6,
     slots: [
-      { dur: 3.5, speed: 1, fadeIn: 0.6, fadeOut: 0.6 },
-      { dur: 3.5, speed: 1, fadeIn: 0.6, fadeOut: 0.6 },
-      { dur: 3.5, speed: 1, fadeIn: 0.6, fadeOut: 0.6 },
-      { dur: 3.5, speed: 1, fadeIn: 0.6, fadeOut: 0.6 }
+      { dur: 3.5, speed: 1, fadeIn: 0.6, fadeOut: 0.6, transitionType: 'dissolve' },
+      { dur: 3.5, speed: 1, fadeIn: 0.6, fadeOut: 0.6, transitionType: 'dissolve' },
+      { dur: 3.5, speed: 1, fadeIn: 0.6, fadeOut: 0.6, transitionType: 'dissolve' },
+      { dur: 3.5, speed: 1, fadeIn: 0.6, fadeOut: 0.6, transitionType: 'dissolve' }
     ]
   },
   {
@@ -145,7 +145,8 @@ function applyTemplate(template, clips, bpm) {
       outSec: (clip.inSec || 0) + sourceNeeded,
       speed,
       fadeIn: slot.fadeIn || 0,
-      fadeOut: slot.fadeOut || 0
+      fadeOut: slot.fadeOut || 0,
+      transitionType: slot.transitionType || 'fade'
     };
 
     cursor += (sourceNeeded / speed) - overlap;

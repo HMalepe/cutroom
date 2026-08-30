@@ -291,6 +291,27 @@ function groupTrackRuns(clips, minOverlap = 0) {
 }
 
 /**
+ * xfade ships about fifty transitions of uneven reliability and visual
+ * distinctness. This is the curated subset the inspector offers: the classic
+ * dissolve family (fade/dissolve/fadeblack/fadewhite), a directional wipe and
+ * slide each way, and a circle reveal each way. Every name here is proven
+ * against a real ffmpeg in test/ffmpeg-render.test.js — that is what this
+ * list exists to constrain.
+ */
+const TRANSITION_TYPES = [
+  'fade', 'dissolve', 'fadeblack', 'fadewhite',
+  'wipeleft', 'wiperight', 'slideleft', 'slideright',
+  'circleopen', 'circleclose'
+];
+const DEFAULT_TRANSITION = 'fade';
+
+/** Falls back to the default rather than handing ffmpeg a name it might reject. */
+function transitionFor(clip) {
+  const name = clip && clip.transitionType;
+  return TRANSITION_TYPES.includes(name) ? name : DEFAULT_TRANSITION;
+}
+
+/**
  * Fold one run into a single labelled stream and return where it sits on the
  * timeline, so the caller can overlay it like any other layer.
  *
@@ -355,7 +376,7 @@ function buildVideoRun(run, project, inputIndex, filters, labelNo) {
 
     const out = `x${labelNo + i}`;
     filters.push(
-      `[${acc}][${label}]xfade=transition=fade:duration=${d.toFixed(4)}:offset=${offset.toFixed(4)}[${out}]`
+      `[${acc}][${label}]xfade=transition=${transitionFor(clip)}:duration=${d.toFixed(4)}:offset=${offset.toFixed(4)}[${out}]`
     );
     acc = out;
     // xfade runs the first stream to `offset`, blends for `d`, then plays out
@@ -657,5 +678,8 @@ module.exports = {
   clipTimelineEnd,
   projectDuration,
   canStreamCopy,
-  atempoChain
+  atempoChain,
+  TRANSITION_TYPES,
+  DEFAULT_TRANSITION,
+  transitionFor
 };
