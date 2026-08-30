@@ -38,7 +38,34 @@ contextBridge.exposeInMainWorld('cutroom', {
     ipcRenderer.invoke('captions:transcribe', { sourcePath, language }),
   importCaptions: () => ipcRenderer.invoke('captions:import'),
 
-  saveProject: (project) => ipcRenderer.invoke('project:save', project),
+  // `saveAs` is the whole difference between Save and Save As; main decides
+  // what that means against the path it is holding.
+  saveProject: (project, saveAs) => ipcRenderer.invoke('project:save', { project, saveAs }),
   openProject: () => ipcRenderer.invoke('project:open'),
+  newProject: () => ipcRenderer.invoke('project:new'),
+
+  // Save protection. The renderer owns the project and computes whether it
+  // differs from the file; main owns the window, so it is main that has to be
+  // told, rather than asked at the moment a close is already happening.
+  reportProjectState: (state) => ipcRenderer.send('project:state', state),
+  autosave: (project) => ipcRenderer.send('project:autosave', project),
+  confirmDiscard: () => ipcRenderer.invoke('project:confirm-discard'),
+  // How a save that main asked for reports back. Only sent for a save main
+  // started, since it is main's close that is waiting on the answer.
+  saveFinished: (result) => ipcRenderer.send('project:save-finished', result),
+
+  // File and Edit menu items, and the restored project after a crash. One
+  // channel each, both one-way: the menu is main's, the project is not.
+  onMenuCommand: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('menu:command', handler);
+    return () => ipcRenderer.removeListener('menu:command', handler);
+  },
+  onRestoreProject: (cb) => {
+    const handler = (_e, data) => cb(data);
+    ipcRenderer.on('project:restore', handler);
+    return () => ipcRenderer.removeListener('project:restore', handler);
+  },
+
   reveal: (filePath) => ipcRenderer.invoke('shell:reveal', filePath)
 });

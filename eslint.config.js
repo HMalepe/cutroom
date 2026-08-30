@@ -49,6 +49,9 @@ module.exports = [
         // can't see the declarations in history.js / templates.js /
         // key-preview.js, so they have to be listed here instead.
         createHistory: 'readonly',
+        createDirtyTracker: 'readonly',
+        createCommandGuard: 'readonly',
+        autosaveDue: 'readonly',
         TEMPLATES: 'readonly',
         applyTemplate: 'readonly',
         createKeyPreview: 'readonly',

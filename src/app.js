@@ -19,8 +19,13 @@ const api = window.cutroom;
 // State
 // ==========================================================================
 
-const state = {
-  project: {
+/**
+ * A fresh project. A function rather than a literal because File > New needs
+ * to build a second one, and two clips of a shared literal would be the same
+ * object — editing the new project would edit the template it came from.
+ */
+function defaultProject() {
+  return {
     name: 'untitled',
     width: 1080,
     height: 1920,
@@ -49,7 +54,11 @@ const state = {
       { id: 'v2', kind: 'video', name: 'Video 2', clips: [] },
       { id: 'a1', kind: 'audio', name: 'Audio 1', clips: [] }
     ]
-  },
+  };
+}
+
+const state = {
+  project: defaultProject(),
   bin: [],
   binSelection: [],
   selectedClipId: null,
@@ -222,6 +231,10 @@ function updateHistoryButtons() {
   r.disabled = !history.canRedo();
   u.title = history.canUndo() ? `Undo ${history.undoLabel()}` : 'Nothing to undo';
   r.title = history.canRedo() ? `Redo ${history.redoLabel()}` : 'Nothing to redo';
+  // Every path that changes the project passes through here, which makes this
+  // the one hook that cannot fall out of step with the edits. See
+  // notifyProjectChanged.
+  notifyProjectChanged();
 }
 
 /**
@@ -250,14 +263,16 @@ function historyToast(msg, kind = 'ok') {
  * edit before — and without the commit, the half-finished edit would be lost
  * silently rather than recorded.
  */
-function doUndo() {
+function doUndo(source = 'ui') {
+  if (!commandGuard.allow('undo', source, Date.now())) return;
   history.commit();
   const label = history.undo();
   updateHistoryButtons();
   historyToast(label ? `Undid ${label}.` : 'Nothing left to undo.', label ? 'ok' : 'warn');
 }
 
-function doRedo() {
+function doRedo(source = 'ui') {
+  if (!commandGuard.allow('redo', source, Date.now())) return;
   history.commit();
   const label = history.redo();
   updateHistoryButtons();
@@ -277,6 +292,180 @@ function trackContinuous(el, label) {
   el.addEventListener('change', () => { history.commit(); updateHistoryButtons(); });
   el.addEventListener('blur', () => { history.commit(); updateHistoryButtons(); });
   return el;
+}
+
+// ==========================================================================
+// Save state — dirty tracking, autosave, and the file we came from
+// ==========================================================================
+
+/*
+ * Dirty is a comparison against the last-saved content, not a flag any edit
+ * sets — dirty-state.js has the reasoning, and the short version is that an
+ * edit followed by its own undo leaves you clean, because you are.
+ */
+const dirtyTracker = createDirtyTracker({ read: () => state.project });
+const commandGuard = createCommandGuard();
+
+/*
+ * Autosave timing. `pendingSince` is when the oldest unsaved change arrived
+ * and `lastChangeAt` the newest; autosaveDue() reads both, so a pause in
+ * editing writes an autosave and so does editing for long enough without one.
+ */
+let pendingSince = null;
+let lastChangeAt = null;
+let lastSeenSnapshot = null;
+let reported = { dirty: false, name: null };
+
+/**
+ * Notice that the project may have changed, and tell main if the answer moved.
+ *
+ * Hooked into updateHistoryButtons() rather than into each edit site, because
+ * every path that changes the project already ends there — edit(), undo, redo,
+ * and the change/blur handlers trackContinuous puts on the static controls. A
+ * per-site hook is a list to keep in step with; this is one that maintains
+ * itself. The interval below is the backstop for anything that ever escapes it.
+ *
+ * @returns {boolean} whether the project differs from the file.
+ */
+function notifyProjectChanged() {
+  const snapshot = dirtyTracker.snapshot();
+  const dirty = dirtyTracker.isDirty(snapshot);
+
+  if (snapshot !== lastSeenSnapshot) {
+    lastSeenSnapshot = snapshot;
+    lastChangeAt = Date.now();
+    if (pendingSince === null) pendingSince = lastChangeAt;
+  }
+
+  // Clean means the file on disk already has everything, so whatever was
+  // pending is not worth writing to an autosave any more. This is the gate
+  // that stops a project undone back to its saved state from going on
+  // autosaving. Stated unconditionally, above the report check below, because
+  // the invariant is about the project rather than about whether the report
+  // moved — the two coincide today, and this way it does not matter if they
+  // ever stop.
+  if (!dirty) pendingSince = null;
+
+  const name = state.project.name || 'untitled';
+  if (dirty === reported.dirty && name === reported.name) return dirty;
+  reported = { dirty, name };
+  // Main deletes the autosave whenever it hears "clean", so the next launch
+  // has nothing stale to offer.
+  api.reportProjectState({ dirty, name });
+  return dirty;
+}
+
+/**
+ * Polled rather than scheduled. A timer set per edit has to be cancelled and
+ * re-armed correctly on every path that can change or save the project; a tick
+ * that asks a pure function whether anything is due cannot get that wrong, and
+ * once a second is imperceptible against a two-second quiet window.
+ */
+const AUTOSAVE_TICK_MS = 1000;
+function autosaveTick() {
+  notifyProjectChanged();
+  if (!autosaveDue({ pendingSince, lastChangeAt, now: Date.now() })) return;
+  // Cleared before the write, not after: it is what marks these changes as
+  // dealt with, and leaving it set would autosave the same project on every
+  // subsequent tick for as long as the app sat idle.
+  pendingSince = null;
+  api.autosave(state.project);
+}
+
+/**
+ * Save, or Save As. Returns the result so the callers that have to know
+ * whether it actually happened — the close guard, and the confirm before New
+ * or Open — can act on a cancelled dialog rather than assume a success.
+ */
+async function doSave(saveAs = false) {
+  // Any half-finished edit is part of what is being saved.
+  history.commit();
+  updateHistoryButtons();
+
+  // Captured before the await, so the baseline records what was written rather
+  // than whatever the project drifted to while the dialog was open.
+  const snapshot = dirtyTracker.snapshot();
+  const res = await api.saveProject(state.project, saveAs);
+
+  if (!res || res.canceled) return { canceled: true };
+  if (!res.ok) {
+    toast('Could not save the project', 'err',
+      res.detail ? `${res.error}\n${res.detail}` : (res.error || ''));
+    return { ok: false };
+  }
+
+  dirtyTracker.markSaved(snapshot);
+  notifyProjectChanged();
+  toast('Project saved.');
+  return res;
+}
+
+/**
+ * The prompt before anything that walks away from unsaved work. Resolves true
+ * if the caller may go ahead.
+ *
+ * Cancelling the Save dialog has to stop the whole thing, not fall through to
+ * the discard it was standing in front of — which is the bug this shape exists
+ * to make impossible to write by accident.
+ */
+async function confirmDiscard() {
+  // Recomputed rather than read off the last report: this is the moment the
+  // answer decides whether work survives, and it also pushes the fresh value
+  // to main, which re-checks its own mirror before showing the dialog.
+  if (!notifyProjectChanged()) return true;
+  const choice = await api.confirmDiscard();
+  if (choice === 'cancel') return false;
+  if (choice === 'save') {
+    const res = await doSave(false);
+    return Boolean(res && res.ok);
+  }
+  return true;
+}
+
+/**
+ * Put a project on screen. Shared by Open and by an autosave restore, because
+ * the seven things that have to happen are the same either way and the one
+ * that gets forgotten — clearing the undo stack — is the one whose absence
+ * lets an undo reach back into a project that is no longer open.
+ */
+function adoptProject(project) {
+  state.project = project;
+  state.selectedClipId = null;
+  state.playhead = 0;
+  history.clear();
+  updateHistoryButtons();
+  syncProjectInputs();
+  renderAll(); renderCaptions(); renderCaptionStyle(); renderTemplates();
+}
+
+async function doOpen() {
+  if (!await confirmDiscard()) return;
+  const res = await api.openProject();
+  if (!res) return;
+  if (!res.ok) {
+    // Nothing has been touched yet, so the project on screen is still the one
+    // that was open before the dialog — which is the point of checking the
+    // file's shape in main.js before any of the replacement below runs.
+    toast('Could not open that project', 'err', res.detail ? `${res.error}\n${res.detail}` : res.error);
+    return;
+  }
+  adoptProject(res.project);
+  // Opened means saved: what is on screen is exactly what is in the file.
+  dirtyTracker.markSaved();
+  notifyProjectChanged();
+  toast('Project opened.');
+}
+
+async function doNew() {
+  if (!await confirmDiscard()) return;
+  await api.newProject();
+  adoptProject(defaultProject());
+  // The media bin survives, for the reason undo leaves it alone: importing a
+  // file is not an edit, and making someone re-find their footage to start a
+  // second cut of it would be a strange thing to call New.
+  dirtyTracker.markSaved();
+  notifyProjectChanged();
+  toast('New project.');
 }
 
 // ==========================================================================
@@ -1629,36 +1818,57 @@ $('btnCopyCmd').onclick = () => {
   toast('Command copied. Paste it in a terminal to run it yourself.');
 };
 
-// Save / open
-$('btnSave').onclick = async () => {
-  const p = await api.saveProject(state.project);
-  if (p) toast('Project saved.');
-};
-$('btnOpen').onclick = async () => {
-  const res = await api.openProject();
-  if (!res) return;
-  if (!res.ok) {
-    // Nothing has been touched yet, so the project on screen is still the one
-    // that was open before the dialog — which is the point of checking the
-    // file's shape in main.js before any of the replacement below runs.
-    toast('Could not open that project', 'err', res.detail ? `${res.error}\n${res.detail}` : res.error);
-    return;
-  }
-  state.project = res.project;
-  state.selectedClipId = null;
-  state.playhead = 0;
-  // The stack described edits to the project that was just replaced. Undoing
-  // past an Open back into a different project's history would be nonsense.
-  history.clear();
-  updateHistoryButtons();
-  syncProjectInputs();
-  renderAll(); renderCaptions(); renderCaptionStyle(); renderTemplates();
-  toast('Project opened.');
-};
+// Save / open. The toolbar buttons and the File menu run the same functions,
+// so there is one behaviour to get right rather than two to keep in step.
+$('btnSave').onclick = () => doSave(false);
+$('btnOpen').onclick = () => doOpen();
 
 // Undo / redo
-$('btnUndo').onclick = doUndo;
-$('btnRedo').onclick = doRedo;
+$('btnUndo').onclick = () => doUndo('ui');
+$('btnRedo').onclick = () => doRedo('ui');
+
+/*
+ * The File and Edit menus live in main.js — they have to, an application menu
+ * is not the renderer's to build — so they arrive here as commands.
+ *
+ * `reply` marks a save main is waiting on: the close guard cannot let the
+ * window go until it knows whether the save happened or the user backed out of
+ * the dialog, and a cancelled Save has to abort the close rather than fall
+ * through it. Every other command answers to nobody.
+ */
+api.onMenuCommand(async ({ command, reply } = {}) => {
+  switch (command) {
+    case 'new': await doNew(); break;
+    case 'open': await doOpen(); break;
+    case 'save-as': {
+      const res = await doSave(true);
+      if (reply) api.saveFinished(res);
+      break;
+    }
+    case 'save': {
+      const res = await doSave(false);
+      if (reply) api.saveFinished(res);
+      break;
+    }
+    case 'undo': doUndo('menu'); break;
+    case 'redo': doRedo('menu'); break;
+  }
+});
+
+/*
+ * A project recovered from an autosave. It is adopted exactly like an opened
+ * one except for the last line: recovered work is unsaved by definition, so
+ * the tracker is left with no baseline and the project stays dirty until the
+ * user puts it somewhere. Marking it saved here would be a lie that costs the
+ * work the second time.
+ */
+api.onRestoreProject(({ project } = {}) => {
+  if (!project) return;
+  adoptProject(project);
+  dirtyTracker.markUnsaved();
+  notifyProjectChanged();
+  toast('Recovered unsaved work from the last session. Save it somewhere.', 'warn');
+});
 
 // Keyboard
 document.addEventListener('keydown', (e) => {
@@ -1666,12 +1876,12 @@ document.addEventListener('keydown', (e) => {
   // still undo the edit, which is what every other editor does.
   if ((e.metaKey || e.ctrlKey) && (e.key === 'z' || e.key === 'Z')) {
     e.preventDefault();
-    if (e.shiftKey) doRedo(); else doUndo();
+    if (e.shiftKey) doRedo('key'); else doUndo('key');
     return;
   }
   if ((e.metaKey || e.ctrlKey) && (e.key === 'y' || e.key === 'Y')) {
     e.preventDefault();
-    doRedo();
+    doRedo('key');
     return;
   }
 
@@ -1696,4 +1906,8 @@ renderAll();
 renderCaptions();
 renderCaptionStyle();
 renderTemplates();
+// The empty project is what is "saved" at boot: an untouched app must not ask
+// to save anything on the way out.
+dirtyTracker.markSaved();
 updateHistoryButtons();
+setInterval(autosaveTick, AUTOSAVE_TICK_MS);

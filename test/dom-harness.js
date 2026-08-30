@@ -72,6 +72,18 @@ function boot() {
   // exercises the fallback to the plain <video> for real.
   win.HTMLCanvasElement.prototype.getContext = () => null;
 
+  // app.js polls for autosaves on an interval. A real interval inside jsdom is
+  // a real Node timer that never stops, which would keep `node --test` from
+  // ever exiting — and a test that waits a second per tick is a test nobody
+  // will keep. Captured instead, so `tick()` below drives it deliberately.
+  const intervals = [];
+  win.setInterval = (fn) => { intervals.push(fn); return intervals.length; };
+
+  // What the app pushed at main, and what main would push back. Recorded
+  // rather than asserted here so each test can ask its own question of them.
+  const calls = { state: [], autosaves: [], saveFinished: [] };
+  const handlers = { menuCommand: null, restoreProject: null };
+
   // Stand-in for preload.js. Only the calls the boot path makes need to work.
   win.cutroom = {
     checkEnv: async () => ({ ffmpeg: '/usr/bin/ffmpeg', ffprobe: null, whisper: null, platform: 'linux' }),
@@ -84,8 +96,19 @@ function boot() {
     onExportProgress: () => () => {},
     transcribe: async () => ({ ok: false, error: 'no whisper' }),
     importCaptions: async () => null,
-    saveProject: async () => null,
+    saveProject: async () => ({ canceled: true }),
     openProject: async () => null,
+    newProject: async () => ({ ok: true }),
+    // The save-protection surface. `menuCommand` and `restoreProject` are
+    // handed back to the tests so they can fire a menu item or a recovery the
+    // way main.js does, which is the only way to reach those paths without
+    // Electron.
+    reportProjectState: (s) => { calls.state.push(s); },
+    autosave: (project) => { calls.autosaves.push(project); },
+    confirmDiscard: async () => 'discard',
+    saveFinished: (result) => { calls.saveFinished.push(result); },
+    onMenuCommand: (cb) => { handlers.menuCommand = cb; return () => {}; },
+    onRestoreProject: (cb) => { handlers.restoreProject = cb; return () => {}; },
     reveal: () => {},
     pathForFile: () => null
   };
@@ -99,7 +122,17 @@ function boot() {
     doc.body.appendChild(el);
   }
 
-  return { dom, win, doc };
+  return {
+    dom, win, doc, calls,
+    /** Fire a File/Edit menu item the way main.js's menu does. */
+    menu: (command, extra) => handlers.menuCommand({ command, ...extra }),
+    /** Deliver a recovered project the way main.js does after a crash. */
+    restore: (payload) => handlers.restoreProject(payload),
+    /** The dirty flag as last reported to main, which is what the title uses. */
+    dirty: () => (calls.state.length ? calls.state[calls.state.length - 1].dirty : false),
+    /** Run app.js's autosave poll once, as its interval would. */
+    tick: () => intervals.forEach(fn => fn())
+  };
 }
 
 /**
