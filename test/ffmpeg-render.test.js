@@ -20,7 +20,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
-const { buildExportCommand } = require('../shared/ffmpeg-builder');
+const { buildExportCommand, TRANSITION_TYPES } = require('../shared/ffmpeg-builder');
 
 const FFMPEG = probe('ffmpeg');
 const FFPROBE = probe('ffprobe');
@@ -58,6 +58,9 @@ function source(name, args) {
 
 const white = () => source('white', ['-f', 'lavfi', '-i', 'color=c=white:s=320x240:r=30:d=6', '-pix_fmt', 'yuv420p']);
 const bars = () => source('bars', ['-f', 'lavfi', '-i', 'testsrc=duration=6:size=320x240:rate=30', '-pix_fmt', 'yuv420p']);
+/** Full-canvas solids, for telling which of two clips a pixel came from. */
+const red = () => source('red', ['-f', 'lavfi', '-i', 'color=c=red:s=320x240:r=30:d=6', '-pix_fmt', 'yuv420p']);
+const solidBlue = () => source('solid-blue', ['-f', 'lavfi', '-i', 'color=c=blue:s=320x240:r=30:d=6', '-pix_fmt', 'yuv420p']);
 /** Deliberately a different size and frame rate, to exercise the agreement rules. */
 const odd = () => source('odd', ['-f', 'lavfi', '-i', 'testsrc=duration=6:size=640x360:rate=25', '-pix_fmt', 'yuv420p']);
 /** Short and wide, so scaling into a 4:3 canvas leaves transparent bars. */
@@ -359,6 +362,80 @@ test('abutting clips, which take no xfade at all, still render', opts, () => {
     clip(white(), { startSec: 3 })
   ]]));
   near(durationOf(out), 6, 0.15, 'abutting clips are appended, not overlapped');
+});
+
+// --------------------------------------------------------------------------
+// Transition type: every curated name has to be a graph real ffmpeg accepts,
+// not just a string ffmpeg-builder.test.js is happy with. xfade's own docs
+// are not trusted here either — each one is run for real and its pixels
+// inspected, the same standard the plain `fade` crossfade above is held to.
+// --------------------------------------------------------------------------
+
+test('every curated transition type is a graph real ffmpeg accepts', opts, () => {
+  for (const t of TRANSITION_TYPES) {
+    const out = render(`xf-${t}`, project([[
+      clip(bars(), { startSec: 0 }),
+      clip(white(), { startSec: 2, transitionType: t })
+    ]]));
+    near(durationOf(out), 5, 0.15, `${t}: crossfade output duration`);
+  }
+});
+
+test('an unrecognised transitionType still renders, falling back to fade', opts, () => {
+  const out = render('xf-unknown', project([[
+    clip(bars(), { startSec: 0 }),
+    clip(white(), { startSec: 2, transitionType: 'not-a-real-transition' })
+  ]]));
+  near(durationOf(out), 5, 0.15, 'fallback crossfade duration');
+});
+
+test('wipeleft sweeps the incoming clip in from the right, closing on the left', opts, () => {
+  // "left" names the direction the wipe boundary travels, not which side
+  // changes first — the boundary moves leftward, so the right side of the
+  // frame turns over to the incoming clip before the left side does.
+  const out = render('wipeleft', project([[
+    clip(red(), { startSec: 0, outSec: 3 }),
+    clip(solidBlue(), { startSec: 2, outSec: 3, transitionType: 'wipeleft' })
+  ]]));
+  // Mid-transition (t=2.5, halfway through the 1s overlap): right has already
+  // turned over to blue, left is still red.
+  const left = pixel(out, 2.5, 40, 116);
+  const right = pixel(out, 2.5, 280, 116);
+  assert.ok(left[0] > 200 && left[2] < 60, `left should still be red mid-wipe, saw ${left}`);
+  assert.ok(right[2] > 200 && right[0] < 60, `right should already be blue mid-wipe, saw ${right}`);
+});
+
+test('circleopen reveals the incoming clip from the centre outward', opts, () => {
+  const out = render('circleopen', project([[
+    clip(red(), { startSec: 0, outSec: 3 }),
+    clip(solidBlue(), { startSec: 2, outSec: 3, transitionType: 'circleopen' })
+  ]]));
+  // Mid-transition: the centre has opened to blue, a corner has not.
+  const centre = pixel(out, 2.5, 156, 116);
+  const corner = pixel(out, 2.5, 4, 4);
+  assert.ok(centre[2] > 200 && centre[0] < 60, `centre should already be blue, saw ${centre}`);
+  assert.ok(corner[0] > 200 && corner[2] < 60, `corner should still be red, saw ${corner}`);
+});
+
+test('fadeblack dips through black on its way from one clip to the next', opts, () => {
+  const out = render('fadeblack', project([[
+    clip(red(), { startSec: 0, outSec: 3 }),
+    clip(solidBlue(), { startSec: 2, outSec: 3, transitionType: 'fadeblack' })
+  ]]));
+  // The 1s overlap runs from t=2 to t=3. fadeblack is not symmetric — it dips
+  // to true black about a fifth of the way through, not at the midpoint —
+  // confirmed against this exact ffmpeg build rather than assumed.
+  const [r, g, b] = pixel(out, 2.2);
+  assert.ok(r < 20 && g < 20 && b < 20, `should be near-black just after the halfway mark, saw rgb(${r},${g},${b})`);
+});
+
+test('dissolve ends on the incoming clip, same as every other transition', opts, () => {
+  const out = render('dissolve', project([[
+    clip(red(), { startSec: 0, outSec: 3 }),
+    clip(solidBlue(), { startSec: 2, outSec: 3, transitionType: 'dissolve' })
+  ]]));
+  near(durationOf(out), 5, 0.15, 'dissolve crossfade duration');
+  near(pixel(out, 4.5)[2], 255, 8, 'should have settled on the incoming blue clip');
 });
 
 // --------------------------------------------------------------------------

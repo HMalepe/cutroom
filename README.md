@@ -81,7 +81,11 @@ shifts anything downstream by accident.
 **Crossfades.** Overlap two clips on the same track and the overlap becomes a
 real transition — drag one further over its neighbour to make the dissolve
 longer. Overlapping on *different* tracks still layers rather than transitions,
-which is what you want for a keyed clip over a background.
+which is what you want for a keyed clip over a background. The inspector's
+**Crossfade style** dropdown, shown on the incoming clip, picks which of ten
+curated `xfade` effects plays — dissolve, a dip to black or white, a wipe or
+slide either way, or a circle reveal either way. It defaults to `fade`, so
+every project made before this existed still renders exactly as it did.
 
 **Green screen.** Per clip, two sliders. Use **Pick colour from clip** first —
 a real green screen is never exactly `#00FF00`, and a mismatched key colour
@@ -164,7 +168,9 @@ One clip:
 {
   inSec, outSec,   // the region of the SOURCE file
   startSec,        // where that region lands on the OUTPUT timeline
-  speed            // playback multiplier
+  speed,           // playback multiplier
+  transitionType   // xfade effect used when this clip is the incoming side
+                    // of a crossfade; defaults to 'fade'
 }
 ```
 
@@ -287,15 +293,24 @@ across — which is exactly what overlapping alpha fades used to do, and the
 reason this replaced them. The *audio* fades stay: overlapping `afade`s under
 `amix` are what crossfades the sound.
 
+`xfade`'s own `transition` option picks the effect, and the builder reads it
+from `transitionType` on the clip joining the run — the same clip whose
+`fadeIn` is suppressed by `noFadeIn`, since it is the one on the incoming side
+of the fold. `transitionFor` in `ffmpeg-builder.js` falls back to `'fade'` for
+a missing or unrecognised name rather than handing ffmpeg one it might reject,
+the same defensive shape `matrixFor` uses in `chroma-math.js`. `xfade` ships
+around fifty transitions of uneven reliability; `TRANSITION_TYPES` is a
+curated ten — the dissolve family (`fade`, `dissolve`, `fadeblack`,
+`fadewhite`), a directional wipe and slide each way, and a circle reveal each
+way — every one proven against a real ffmpeg in `test/ffmpeg-render.test.js`
+rather than trusted from `xfade`'s documentation.
+
 ## Extending it
 
 Reasonable next moves, roughly by effort:
 
 - **More tracks.** `state.project.tracks` is an array; the builder already
   loops it. Adding a fourth is a one-line change plus a UI button.
-- **Other transitions.** `xfade` has about fifty; the builder always asks for
-  `fade`. Choosing per overlap is a couple of lines in `buildVideoRun` plus
-  somewhere in the inspector to put the control.
 - **Word-level captions.** whisper.cpp emits word timings with `-ml 1`. The
   ASS writer already supports karaoke tags.
 

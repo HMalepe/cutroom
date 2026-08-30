@@ -12,7 +12,10 @@ const {
   projectDuration,
   canStreamCopy,
   atempoChain,
-  groupTrackRuns
+  groupTrackRuns,
+  TRANSITION_TYPES,
+  DEFAULT_TRANSITION,
+  transitionFor
 } = require('../shared/ffmpeg-builder');
 
 function baseProject(overrides = {}) {
@@ -288,6 +291,58 @@ test('overlapping clips on one track become an xfade of the overlap length', () 
   const graph = graphOf(overlapProject(0.6));
   // 0.6s of overlap, beginning 3.4s into the folded stream.
   assert.match(graph, /xfade=transition=fade:duration=0\.6000:offset=3\.4000/);
+});
+
+// --------------------------------------------------------------------------
+// Transition type: which xfade effect plays at a fold.
+// --------------------------------------------------------------------------
+
+test('transitionFor returns a recognised name unchanged', () => {
+  for (const name of TRANSITION_TYPES) {
+    assert.equal(transitionFor({ transitionType: name }), name);
+  }
+});
+
+test('transitionFor falls back to the default for an unrecognised or missing name', () => {
+  assert.equal(transitionFor({ transitionType: 'not-a-real-transition' }), DEFAULT_TRANSITION);
+  assert.equal(transitionFor({}), DEFAULT_TRANSITION);
+  assert.equal(transitionFor(null), DEFAULT_TRANSITION);
+});
+
+test('DEFAULT_TRANSITION is fade, so every existing project renders unchanged', () => {
+  assert.equal(DEFAULT_TRANSITION, 'fade');
+  assert.ok(TRANSITION_TYPES.includes('fade'));
+});
+
+test('the incoming clip of a fold picks the xfade transition', () => {
+  // transitionType lives on the clip joining the run — the same clip whose
+  // alpha fade-in is suppressed by noFadeIn. The first clip's own value, if
+  // any, is never consulted: there is no fold before it.
+  const project = baseProject();
+  project.tracks[0].clips.push(
+    makeClip({ src: '/tmp/a.mp4', inSec: 0, outSec: 4, startSec: 0, transitionType: 'circleopen' }),
+    makeClip({ src: '/tmp/b.mp4', inSec: 0, outSec: 4, startSec: 3.4, transitionType: 'wipeleft' })
+  );
+  const graph = graphOf(project);
+  assert.match(graph, /xfade=transition=wipeleft:duration=0\.6000:offset=3\.4000/);
+  assert.ok(!graph.includes('transition=circleopen'), 'the outgoing clip\'s value must not be used');
+});
+
+test('an unrecognised transitionType falls back to fade in the built graph', () => {
+  const graph = graphOf(overlapProject(0.6, { transitionType: 'not-a-real-transition' }));
+  assert.match(graph, /xfade=transition=fade:duration=0\.6000:offset=3\.4000/);
+});
+
+test('a three-clip run can use a different transition at each fold', () => {
+  const project = baseProject();
+  project.tracks[0].clips.push(
+    makeClip({ src: '/tmp/a.mp4', inSec: 0, outSec: 4, startSec: 0 }),
+    makeClip({ src: '/tmp/b.mp4', inSec: 0, outSec: 4, startSec: 3.5, transitionType: 'dissolve' }),
+    makeClip({ src: '/tmp/c.mp4', inSec: 0, outSec: 4, startSec: 7, transitionType: 'slideright' })
+  );
+  const graph = graphOf(project);
+  assert.match(graph, /xfade=transition=dissolve:duration=0\.5000:offset=3\.5000\[x1\]/);
+  assert.match(graph, /\[x1\]\[v2\]xfade=transition=slideright:duration=0\.5000:offset=7\.0000/);
 });
 
 test('overlapping clips on DIFFERENT tracks stay an overlay, not a transition', () => {

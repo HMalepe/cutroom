@@ -132,6 +132,36 @@ test('a speed change is undoable from the inspector', opts, async () => {
   assert.equal(doc.querySelector('#lanes .clip .badge.spd'), null, 'speed reverted');
 });
 
+test('picking a crossfade style from the inspector is undoable', opts, async () => {
+  const { win, doc } = boot();
+  seedBin(win, doc, ['a.mp4']);
+  await flush();
+
+  doc.querySelector('#binList .bin-item')
+    .dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  doc.getElementById('btnSendV1').click();
+
+  const clip = doc.querySelector('#lanes .clip');
+  clip.dispatchEvent(new win.MouseEvent('pointerdown', { bubbles: true, clientX: 5, clientY: 5 }));
+  doc.getElementById('tlScroll')
+    .dispatchEvent(new win.MouseEvent('pointerup', { bubbles: true, clientX: 5, clientY: 5 }));
+
+  const select = doc.querySelector('#inspector select');
+  assert.ok(select, 'the crossfade style dropdown is rendered');
+  assert.equal(select.value, 'fade', 'defaults to fade, so existing projects are unaffected');
+
+  select.dispatchEvent(new win.Event('focus'));
+  select.value = 'circleopen';
+  select.dispatchEvent(new win.Event('change', { bubbles: true }));
+
+  assert.equal(doc.getElementById('btnUndo').disabled, false, 'the change is undoable');
+  doc.getElementById('btnUndo').click();
+
+  // Re-render pulls the value back from the reverted project, so re-query it.
+  const revertedSelect = doc.querySelector('#inspector select');
+  assert.equal(revertedSelect.value, 'fade', 'undo reverted the transition type');
+});
+
 test('adding a caption line is undoable', opts, async () => {
   const { doc } = boot();
   await flush();
