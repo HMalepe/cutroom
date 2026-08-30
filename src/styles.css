@@ -244,6 +244,9 @@ button { cursor: pointer; }
   justify-content: center;
   padding: 16px;
   min-height: 0;
+  /* The checkerboard is the point of this pane once a key is on: whatever it
+     shows through is what the export will leave transparent. */
+  position: relative;
   background:
     repeating-conic-gradient(#181d24 0% 25%, #14181e 0% 50%) 50% / 22px 22px;
 }
@@ -252,6 +255,35 @@ button { cursor: pointer; }
   max-height: 100%;
   background: #000;
   border: 1px solid var(--line);
+}
+
+/* When the keyed canvas is showing, the <video> is demoted to a texture
+   source. Deliberately not display:none — a video that is not laid out can
+   have its decoding throttled, and then there is nothing to draw. */
+.viewer video.texture-only {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 2px;
+  height: 2px;
+  opacity: 0.01;
+  border: 0;
+  pointer-events: none;
+}
+
+.key-canvas {
+  max-width: 100%;
+  max-height: 100%;
+  /* No background: transparent has to read as transparent, not as black. */
+  border: 1px solid var(--line);
+  cursor: pointer;
+}
+
+.scrub {
+  flex: 1;
+  min-width: 60px;
+  max-width: 260px;
+  accent-color: var(--amber);   /* it is a position in time, so it is amber */
 }
 .viewer-empty {
   color: var(--ink-dim);

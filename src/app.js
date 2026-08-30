@@ -395,13 +395,170 @@ function sendToTrack(trackId) {
 // Preview
 // ==========================================================================
 
-function loadPreview(path) {
+/*
+ * The pane has two modes.
+ *
+ * Plain — the <video> element playing the source file with its own controls.
+ * That is what this pane always did, and it is still what a machine without
+ * WebGL gets, and what a bin item gets before it is on the timeline.
+ *
+ * Keyed — the same <video>, demoted to a texture source, drawn to a canvas
+ * through the shader in key-preview.js. Green screen, brightness/contrast/
+ * saturation, scale and position all show as you drag the sliders, computed
+ * the way ffmpeg computes them so the numbers you settle on are the numbers
+ * that will export. Speed, trims and captions are still not shown — the note
+ * in the empty pane says so, and Test 3s is still the way to check those.
+ *
+ * The keyed mode needs a clip, because a key is a per-clip setting. Selecting
+ * something in the bin has no clip to read, so it stays plain.
+ */
+
+// Built once, lazily, and only when a keyed preview is actually wanted:
+// creating a GL context costs something, and a project that never keys never
+// needs one. null means WebGL is unavailable — a machine without it, a lost
+// context, or jsdom in the test suite — and every path below falls back.
+let keyer = null;
+let keyerTried = false;
+
+function getKeyer() {
+  if (!keyerTried) {
+    keyerTried = true;
+    try {
+      keyer = typeof createKeyPreview === 'function'
+        ? createKeyPreview($('keyCanvas'))
+        : null;
+    } catch (err) {
+      keyer = null;
+    }
+  }
+  return keyer;
+}
+
+let previewPath = null;    // what the <video> is loaded with
+let previewClipId = null;  // whose settings the canvas is keying, if any
+let previewRaf = 0;
+let previewDirty = false;
+
+/**
+ * Point the preview at a file. Pass the clip too and it keys; pass only a path
+ * — a bin item — and it plays plain.
+ */
+function loadPreview(path, clip) {
   const v = $('video');
   const empty = $('viewerEmpty');
-  if (!path) { v.style.display = 'none'; empty.style.display = 'block'; return; }
-  v.src = fileUrl(path);
+
+  if (!path) {
+    previewPath = null;
+    previewClipId = null;
+    v.removeAttribute('src');
+    v.style.display = 'none';
+    empty.style.display = 'block';
+    applyPreviewMode();
+    return;
+  }
+
+  if (previewPath !== path) {
+    previewPath = path;
+    v.src = fileUrl(path);
+  }
   v.style.display = 'block';
   empty.style.display = 'none';
+
+  // An audio-only clip has no frames to key, so it stays on the plain element.
+  previewClipId = clip && clip.hasVideo !== false ? clip.id : null;
+  applyPreviewMode();
+}
+
+/**
+ * Choose between the canvas and the <video>, and start or stop the draw loop
+ * to match. Every path that changes the selection or the clip ends up here, so
+ * the pane can never be left keying a clip you have moved on from.
+ */
+function applyPreviewMode() {
+  const v = $('video');
+  const canvas = $('keyCanvas');
+  const scrub = $('scrub');
+  const clip = previewClipId ? findClip(previewClipId).clip : null;
+  const keyed = !!(previewPath && clip && getKeyer());
+
+  canvas.style.display = keyed ? 'block' : 'none';
+  scrub.style.display = keyed ? '' : 'none';
+  v.classList.toggle('texture-only', keyed);
+  // The canvas has no controls of its own, so the <video> keeps its when it is
+  // the thing on screen and gives them up when it is only a texture.
+  v.controls = !keyed;
+
+  if (keyed) {
+    requestPreviewFrame();
+    startPreviewLoop();
+  } else {
+    stopPreviewLoop();
+  }
+}
+
+/** Follow the selection. Called from renderAll, so undo moves the preview too. */
+function syncPreviewToSelection() {
+  const clip = selectedClip();
+  if (clip && clip.src) {
+    loadPreview(clip.src, clip);
+  } else if (previewClipId) {
+    // Selection went away while a key was showing. Fall back rather than
+    // keying with settings nothing on the timeline has any more.
+    previewClipId = null;
+    applyPreviewMode();
+  }
+}
+
+/** Ask for one more frame. Cheap, and safe to call from anywhere. */
+function requestPreviewFrame() { previewDirty = true; }
+
+function startPreviewLoop() {
+  if (previewRaf || typeof requestAnimationFrame !== 'function') return;
+  const tick = () => {
+    previewRaf = requestAnimationFrame(tick);
+    drawKeyedFrame();
+  };
+  previewRaf = requestAnimationFrame(tick);
+}
+
+function stopPreviewLoop() {
+  if (previewRaf) cancelAnimationFrame(previewRaf);
+  previewRaf = 0;
+}
+
+function drawKeyedFrame() {
+  const k = getKeyer();
+  const clip = previewClipId ? findClip(previewClipId).clip : null;
+  if (!k || !clip) return;
+
+  if (k.isLost()) {
+    // The GPU took the context away — a driver reset, a laptop waking up.
+    // Give up on it for the session rather than drawing a frozen frame.
+    keyer = null;
+    applyPreviewMode();
+    toast('Lost the graphics context — the preview is back to the plain player.', 'warn');
+    return;
+  }
+
+  const v = $('video');
+  syncScrub();
+
+  // Redraw every frame while playing, and exactly once after an edit. A slider
+  // dragged with the video paused still has to show its result immediately,
+  // and that is the only reason to redraw a still frame.
+  if (v.paused && !previewDirty) return;
+  previewDirty = false;
+  k.draw(v, clip, state.project);
+}
+
+function syncScrub() {
+  const v = $('video');
+  const scrub = $('scrub');
+  // Leave it alone while it is being dragged, or it fights the pointer.
+  if (document.activeElement === scrub) return;
+  const dur = v.duration;
+  if (!dur || !isFinite(dur)) return;
+  scrub.value = String(Math.round((v.currentTime / dur) * 1000));
 }
 
 // ==========================================================================
@@ -582,7 +739,7 @@ $('tlScroll').addEventListener('pointerdown', (e) => {
   const id = clipEl.dataset.clipId;
   state.selectedClipId = id;
   const { clip, track } = findClip(id);
-  loadPreview(clip.src);
+  loadPreview(clip.src, clip);
 
   const handle = e.target.dataset.handle;
   // Opened whether or not the pointer ends up moving. A click that only
@@ -862,7 +1019,7 @@ function renderInspector() {
   const xfNote = document.createElement('div');
   xfNote.className = 'empty-note';
   xfNote.style.marginBottom = '10px';
-  xfNote.textContent = 'Overlap two clips on different video tracks and give them matching fades — that is a crossfade.';
+  xfNote.textContent = 'Overlap two clips on the SAME video track — that is a crossfade. Overlap them on different tracks instead to layer one over the other.';
   box.appendChild(xfNote);
 
   // --- Volume -------------------------------------------------------------
@@ -1212,6 +1369,10 @@ function renderTemplates() {
 
 let cmdTimer = null;
 function scheduleCommandPreview() {
+  // Every control that writes into the project already calls this, which makes
+  // it the one hook a live preview needs. A new inspector row gets a redraw
+  // for free, the same way it gets undo for free from field() and slider().
+  requestPreviewFrame();
   clearTimeout(cmdTimer);
   cmdTimer = setTimeout(async () => {
     try {
@@ -1272,6 +1433,7 @@ function renderAll() {
   renderHeads();
   renderTimeline();
   renderInspector();
+  syncPreviewToSelection();
   scheduleCommandPreview();
 }
 
@@ -1299,10 +1461,27 @@ $('btnSendV2').onclick = () => sendToTrack('v2');
 $('btnSendA1').onclick = () => sendToTrack('a1');
 
 // Transport
-$('btnPlay').onclick = () => {
+function togglePlay() {
   const v = $('video');
   if (v.paused) v.play(); else v.pause();
+}
+$('btnPlay').onclick = togglePlay;
+// The keyed canvas covers the video's own controls, so it takes over the
+// click-to-play everyone expects of a video.
+$('keyCanvas').onclick = togglePlay;
+
+$('scrub').oninput = () => {
+  const v = $('video');
+  if (!v.duration || !isFinite(v.duration)) return;
+  v.currentTime = (Number($('scrub').value) / 1000) * v.duration;
+  requestPreviewFrame();
 };
+
+// A seek, a first frame or a resumed play all need one more draw — while
+// paused nothing else would ask for it.
+for (const ev of ['seeked', 'loadeddata', 'loadedmetadata', 'play', 'ended']) {
+  $('video').addEventListener(ev, requestPreviewFrame);
+}
 $('btnSplit').onclick = splitAtPlayhead;
 $('btnSetIn').onclick = setInAtPlayhead;
 $('btnSetOut').onclick = setOutAtPlayhead;
