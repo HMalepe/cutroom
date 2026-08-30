@@ -100,6 +100,73 @@ test('the shader uses ffmpeg\'s constants, not rounded-off versions of them', ()
 });
 
 // ==========================================================================
+// Loop / speed
+// ==========================================================================
+
+/*
+ * stepClipLoop is the whole decision behind looping the preview's <video>
+ * between a clip's trim points at its speed: given where playback currently
+ * sits and the clip's inSec/outSec/speed, what should the caller do. No DOM,
+ * no video element, so every case below is a plain call and assert.
+ */
+
+test('inside the trim, no seek and playbackRate matches speed', () => {
+  const step = KP.stepClipLoop(5, { inSec: 2, outSec: 8, speed: 2 });
+  assert.equal(step.seekTo, null);
+  assert.equal(step.playbackRate, 2);
+});
+
+test('at the very start of the trim, no seek', () => {
+  const step = KP.stepClipLoop(2, { inSec: 2, outSec: 8, speed: 1 });
+  assert.equal(step.seekTo, null);
+});
+
+test('reaching outSec loops back to inSec', () => {
+  // "Reaches" means currentTime has arrived at or passed outSec — the exact
+  // moment ffmpeg's own trim would stop reading source frames.
+  const step = KP.stepClipLoop(8, { inSec: 2, outSec: 8, speed: 1 });
+  assert.equal(step.seekTo, 2);
+});
+
+test('past outSec also loops back, not just exactly on it', () => {
+  const step = KP.stepClipLoop(9.5, { inSec: 2, outSec: 8, speed: 1 });
+  assert.equal(step.seekTo, 2);
+});
+
+test('before inSec (a fresh load, or a trim moved forward) seeks up to it', () => {
+  const step = KP.stepClipLoop(0, { inSec: 2, outSec: 8, speed: 1 });
+  assert.equal(step.seekTo, 2);
+});
+
+test('a degenerate trim (outSec <= inSec) holds at inSec instead of looping nothing', () => {
+  const holds = KP.stepClipLoop(5, { inSec: 5, outSec: 5, speed: 1 });
+  assert.equal(holds.seekTo, 5);
+  const inverted = KP.stepClipLoop(3, { inSec: 5, outSec: 1, speed: 1 });
+  assert.equal(inverted.seekTo, 5);
+});
+
+test('a clip missing inSec/outSec/speed defaults to a 1x full-source read', () => {
+  const step = KP.stepClipLoop(0, {});
+  assert.equal(step.seekTo, 0);
+  assert.equal(step.playbackRate, 1);
+});
+
+test('playbackRate is clamped to what HTMLMediaElement actually supports', () => {
+  assert.equal(KP.clampPlaybackRate(50), KP.MAX_PLAYBACK_RATE);
+  assert.equal(KP.clampPlaybackRate(0.001), KP.MIN_PLAYBACK_RATE);
+  assert.equal(KP.clampPlaybackRate(2), 2, 'a normal clip speed is untouched');
+  assert.equal(KP.clampPlaybackRate(NaN), 1, 'not-a-number falls back to 1x rather than clamping to a bound');
+  assert.equal(KP.clampPlaybackRate(undefined), 1);
+});
+
+test('the app\'s own speed range (0.25x-4x) sits well inside the clamp', () => {
+  // If a future PR widens the speed slider past this, it should still be a
+  // deliberate decision against the real HTMLMediaElement limits, not a
+  // silent clamp discovered in the field.
+  assert.ok(KP.MIN_PLAYBACK_RATE <= 0.25 && KP.MAX_PLAYBACK_RATE >= 4);
+});
+
+// ==========================================================================
 // How the page loads it
 // ==========================================================================
 
@@ -211,4 +278,123 @@ test('a bin selection previews plain, because a bin item has no key to show', op
   assert.equal(doc.getElementById('keyCanvas').style.display, 'none');
   assert.equal(doc.getElementById('video').controls, true);
   assert.match(doc.getElementById('video').src, /a\.mp4$/);
+});
+
+// ==========================================================================
+// Loop wiring: does the keyed pane actually drive the <video>
+// ==========================================================================
+
+/*
+ * jsdom has no WebGL, so without help getKeyer() falls back to the plain
+ * <video> before app.js ever reaches the loop logic — which is what every
+ * test above this point relies on. These tests instead hand app.js a fake
+ * keyer with the real one's shape (draw/resize/destroy/isLost), the same way
+ * a browser with a working driver would, so the "keyed" branch — the one
+ * that drives currentTime and playbackRate — runs for real. What is under
+ * test is app.js's wiring: does selecting a clip and changing its speed or
+ * trim reach the <video>. The draw call itself, and the shader it feeds,
+ * are covered elsewhere (chroma-math.test.js, and by hand against real
+ * ffmpeg output per the header comments) — nothing here asserts a pixel.
+ */
+function stubKeyer() {
+  return {
+    draw: () => true,
+    resize: () => ({ width: 1920, height: 1080 }),
+    destroy: () => {},
+    isLost: () => false
+  };
+}
+
+// app.js redraws on a requestAnimationFrame loop; jsdom's rAF runs on real
+// timers (see the loop in key-preview.js's own draw scheduling), so the tests
+// below wait out a real tick rather than calling any internal function —
+// app.js exposes nothing to call directly, on purpose, so these exercise
+// exactly what a browser would run.
+const rafTick = () => new Promise((r) => setTimeout(r, 100));
+
+function setSpeed(doc, factor) {
+  const btn = [...doc.querySelectorAll('#inspector .speed-chips button')]
+    .find((b) => b.textContent === `${factor}×`);
+  btn.click();
+}
+
+function setTrim(win, doc, inSec, outSec) {
+  const [inInput, outInput] = doc.querySelectorAll('#inspector .row')[0].querySelectorAll('input');
+  inInput.value = String(inSec);
+  inInput.dispatchEvent(new win.Event('change', { bubbles: true }));
+  outInput.value = String(outSec);
+  outInput.dispatchEvent(new win.Event('change', { bubbles: true }));
+}
+
+// The stub keyer above makes app.js actually start its requestAnimationFrame
+// redraw loop, which real WebGL-less tests never trigger. That loop reschedules
+// itself on a real timer with nothing to stop it once the test's assertions
+// are done, which is enough to keep `node --test` from ever exiting — so every
+// test below deletes the clip in a `finally`, which is the app's own way of
+// tearing the loop down (see "deleting the selected clip drops the preview
+// back", above), win or lose on the assertions.
+function stopLoop(doc) {
+  doc.getElementById('btnDeleteClip').click();
+}
+
+test('selecting a clip loops the video to its inSec and sets playbackRate to its speed', opts, async () => {
+  const { win, doc } = boot();
+  win.createKeyPreview = stubKeyer;
+  try {
+    await selectAClip(win, doc);
+    setTrim(win, doc, 2, 6);
+    setSpeed(doc, 2);
+    await rafTick();
+
+    const video = doc.getElementById('video');
+    assert.equal(video.playbackRate, 2, 'playbackRate follows the clip speed');
+    assert.equal(video.currentTime, 2, 'the loop puts a fresh clip at its own inSec, not the start of the source');
+  } finally {
+    stopLoop(doc);
+  }
+});
+
+test('playback reaching outSec loops back to inSec', opts, async () => {
+  const { win, doc } = boot();
+  win.createKeyPreview = stubKeyer;
+  try {
+    await selectAClip(win, doc);
+    setTrim(win, doc, 2, 6);
+    await rafTick();
+
+    const video = doc.getElementById('video');
+    assert.equal(video.currentTime, 2, 'settled at inSec before the next step');
+
+    // Nothing in jsdom actually decodes video, so playback reaching outSec is
+    // simulated the way the scrub bar itself sets currentTime — the only path
+    // in this app that writes it other than the loop under test.
+    Object.defineProperty(video, 'duration', { value: 8, configurable: true });
+    const scrub = doc.getElementById('scrub');
+    scrub.value = String((6 / 8) * 1000);
+    scrub.dispatchEvent(new win.Event('input', { bubbles: true }));
+    assert.equal(video.currentTime, 6, 'scrubbing landed exactly on outSec');
+
+    await rafTick();
+    assert.equal(video.currentTime, 2, 'the loop caught it on the next tick and jumped back to inSec');
+  } finally {
+    stopLoop(doc);
+  }
+});
+
+test('changing speed alone updates playbackRate without moving the loop window', opts, async () => {
+  const { win, doc } = boot();
+  win.createKeyPreview = stubKeyer;
+  try {
+    await selectAClip(win, doc);
+    await rafTick();
+
+    setSpeed(doc, 4);
+    await rafTick();
+
+    const video = doc.getElementById('video');
+    assert.equal(video.playbackRate, 4);
+    assert.equal(video.currentTime, 0, 'the default trim starts at 0, untouched by a speed-only change');
+  } finally {
+    stopLoop(doc);
+  }
 });

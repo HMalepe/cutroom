@@ -51,7 +51,8 @@ module.exports = [
         createHistory: 'readonly',
         TEMPLATES: 'readonly',
         applyTemplate: 'readonly',
-        createKeyPreview: 'readonly'
+        createKeyPreview: 'readonly',
+        stepClipLoop: 'readonly'
       }
     },
     rules: {

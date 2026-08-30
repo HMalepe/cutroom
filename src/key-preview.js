@@ -214,6 +214,58 @@ void main() {
     return Number.isFinite(n) ? n : fallback;
   }
 
+  // --------------------------------------------------------------------------
+  // Loop / speed
+  // --------------------------------------------------------------------------
+
+  /*
+   * The preview draws whatever frame is currently decoded, so making it show
+   * the clip's trim and speed is entirely a matter of driving the <video>
+   * element's own playback rather than anything in the shader: play between
+   * inSec and outSec, at playbackRate = clip.speed, and jump back to inSec
+   * whenever playback reaches outSec.
+   *
+   * HTMLMediaElement.playbackRate has no clamp in the spec — a UA is free to
+   * just ignore an unsupported value — but real browsers do clamp rather than
+   * ignore. Chromium's HTMLMediaElement (kMinRate/kMaxRate in
+   * html_media_element.cc) enforces exactly [0.0625, 16], and other engines
+   * land in the same neighbourhood. The UI never offers a clip speed outside
+   * 0.25-4x, so this is a defensive floor/ceiling for a value that should
+   * never reach it, not a range normal use will hit.
+   */
+  const MIN_PLAYBACK_RATE = 0.0625;
+  const MAX_PLAYBACK_RATE = 16;
+
+  function clampPlaybackRate(speed) {
+    return Math.min(MAX_PLAYBACK_RATE, Math.max(MIN_PLAYBACK_RATE, num(speed, 1)));
+  }
+
+  /**
+   * Decide how to drive the <video> element for one tick of the loop, given
+   * where its playback currently sits. Pure and DOM-free — no video element
+   * touched here — so the decision can be tested without a real one; the
+   * caller is the part that reads video.currentTime and writes the result
+   * back.
+   *
+   * @param {number} currentTime  video.currentTime, source seconds
+   * @param {object} clip         a timeline clip, for inSec/outSec/speed
+   * @returns {{ seekTo: number|null, playbackRate: number }}
+   *   seekTo is the source time to jump to when currentTime has left
+   *   [inSec, outSec), or null when the current position is fine as is.
+   */
+  function stepClipLoop(currentTime, clip) {
+    const inSec = num(clip && clip.inSec, 0);
+    const outSecRaw = num(clip && clip.outSec, inSec);
+    // A zero-length or inverted trim has no window to loop across; hold at
+    // inSec rather than dividing the loop away to nothing.
+    const outSec = outSecRaw > inSec ? outSecRaw : inSec;
+    const playbackRate = clampPlaybackRate(clip && clip.speed);
+    const t = num(currentTime, inSec);
+
+    const inRange = outSec > inSec && t >= inSec && t < outSec;
+    return { seekTo: inRange ? null : inSec, playbackRate };
+  }
+
   /**
    * @param {HTMLCanvasElement} canvas
    * @returns {object|null} null when there is no WebGL to be had, which is the
@@ -408,9 +460,13 @@ void main() {
   // Exported so the shader can be compiled and compared against ChromaMath
   // outside the app.
   root.KEY_PREVIEW_SHADERS = { VERT, FRAG };
+  root.stepClipLoop = stepClipLoop;
 
   if (typeof module !== 'undefined') {
-    module.exports = { createKeyPreview, VERT, FRAG, MAX_EDGE };
+    module.exports = {
+      createKeyPreview, VERT, FRAG, MAX_EDGE,
+      stepClipLoop, clampPlaybackRate, MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE
+    };
   }
 
 })(typeof globalThis !== 'undefined' ? globalThis : this);

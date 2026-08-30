@@ -102,9 +102,11 @@ proportions drawn to scale, so you can see the rhythm before applying it.
 Bauhaus Grid is beat-based: set your BPM first.
 
 **Preview.** Shows the selected clip keyed, colour-corrected, scaled and
-positioned — the same maths the export runs, per frame, on the GPU. What it
-does not show is speed, trims and captions; for those, Test 3s. On a machine
-with no WebGL it quietly goes back to playing the source file.
+positioned — the same maths the export runs, per frame, on the GPU. The
+`<video>` element loops between the clip's in and out points at the clip's
+speed, so trims and speed changes show live too; what it does not show is
+captions — for those, Test 3s. On a machine with no WebGL it quietly goes
+back to playing the source file, at 1x, start to end.
 
 **Test 3s.** Renders the first three seconds only. Use it to check speed or a
 caption instead of waiting for a full export.
@@ -275,9 +277,6 @@ Reasonable next moves, roughly by effort:
 
 - **More tracks.** `state.project.tracks` is an array; the builder already
   loops it. Adding a fourth is a one-line change plus a UI button.
-- **Speed and trims in the preview.** The key preview shows the clip's
-  appearance but plays the whole source at 1x. Looping between in and out at
-  the clip's speed is the obvious next piece.
 - **Colour tags from the source.** The preview assumes limited-range BT.601
   when it reconstructs chroma; probing the stream's real tags in `main.js` and
   passing the matrix name through would close the last gap on BT.709 footage.
