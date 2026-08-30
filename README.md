@@ -44,8 +44,8 @@ npm test
 ```
 
 `node --test`, no framework. Three kinds: unit tests over the pure modules
-(`ffmpeg-builder`, `history`, `templates`, `chroma-math`, `save-state`,
-`dirty-state`), integration tests
+(`ffmpeg-builder`, `history`, `templates`, `chroma-math`, `timeline-preview`,
+`save-state`, `dirty-state`), integration tests
 that load the real `index.html` and `app.js` into jsdom and drive actual
 buttons and pointer events, and render tests that put the built ffmpeg command
 through a real ffmpeg and inspect the pixels. The second kind is what stops
@@ -115,12 +115,25 @@ fades that your clips get poured into. The bars under each name are the slot
 proportions drawn to scale, so you can see the rhythm before applying it.
 Bauhaus Grid is beat-based: set your BPM first.
 
-**Preview.** Shows the selected clip keyed, colour-corrected, scaled and
-positioned — the same maths the export runs, per frame, on the GPU. The
-`<video>` element loops between the clip's in and out points at the clip's
-speed, so trims and speed changes show live too; what it does not show is
-captions — for those, Test 3s. On a machine with no WebGL it quietly goes
-back to playing the source file, at 1x, start to end.
+**Preview.** Shows the timeline itself, not a clip you happened to select:
+whatever is under the playhead, keyed, colour-corrected, scaled and
+positioned — the same maths the export runs, per frame, on the GPU — with
+Video 2 composited over Video 1, exactly the order the export uses. Drag the
+playhead and the composite updates live; press Play and a timeline clock
+advances it, seeking every active clip's own hidden `<video>` to keep pace
+rather than the old design, where a single `<video>`'s own playback *was*
+the clock. Trims and speed still show live, now driven by the clock instead
+of a clip looping on its own. A crossfade shows both clips cross-dissolving
+by opacity for the overlap, with a small label naming the export's real
+`xfade` transition underneath — the dissolve is a stand-in for whichever of
+the ten curated effects is actually picked, not a reproduction of its curve,
+and the label exists so nobody mistakes one for the other. Captions still do
+not show here — for those, Test 3s. On a machine with no WebGL it quietly
+falls back to whichever clip is topmost at the playhead, plain, at 1x, start
+to end, same as it always did; it does not attempt the clock or the trim
+loop in that state, on the theory that a feature this dependent on a real
+GPU is better served by keeping its one un-provable fallback exactly as
+small as it already was. See "How the composited preview works" below.
 
 **Test 3s.** Renders the first three seconds only. Use it to check speed or a
 caption instead of waiting for a full export. It clamps on both export paths.
@@ -205,6 +218,10 @@ src/
                      Pure, no DOM, no WebGL, so it is testable — and it is,
                      hard, because this is where being wrong costs most.
   key-preview.js     The WebGL plumbing that runs that maths per frame.
+  timeline-preview.js  Which clip (or crossfading pair) is active on a video
+                     track at a given timeline time, and how the timeline
+                     clock advances. Pure, no DOM — app.js is the layer-pool
+                     lifecycle and the <video>/<canvas> wiring on top of it.
   templates.js       Edit rhythms. Pure data plus one function.
   index.html         Structure.
   styles.css         Tokens at the top.
@@ -457,6 +474,121 @@ briefly touch RGB — already gets it right from swscale's own automatic,
 tag-aware conversion, confirmed by running a BT.709/BT.601-tagged pair
 through the real filter chain and diffing the output.
 
+### How the composited preview works
+
+Until this feature, "preview" meant one clip: whichever was selected,
+looping between its own trim points on the pane's single `<video>`, with
+`state.playhead` — the timeline ruler's own position — connected to none of
+it. Scrubbing the ruler did nothing to the pane; playing the pane did
+nothing to the ruler; nothing ever showed two tracks composited, a
+crossfade, or the export's actual maths at a specific instant rather than
+across one clip's whole loop. The only way to see the real edit was a full
+Test 3s.
+
+`timeline-preview.js`'s `trackStateAt` answers one question per video track,
+pure and DOM-free: given a timeline time `t`, is anything active there, and
+is it one clip (`solo`) or two mid-crossfade (`crossfade`, with a 0..1
+`progress`)? The crossfade rule is a deliberate re-derivation of
+`groupTrackRuns` in `shared/ffmpeg-builder.js` — same-track overlap, the
+later clip outlasting the earlier one — rather than an import of it, because
+`shared/` is main-process-only and never reaches the renderer;
+`test/timeline-preview.test.js` pins the two files' `TRANSITION_TYPES` lists
+against each other so they cannot quietly drift apart. `layersAt` runs that
+per video track, bottom to top — `project.tracks[0]` first, same order
+`buildExportCommand` composites in — so Video 2 landing over Video 1 in the
+preview is a property of iteration order, not a separate compositing step
+that could disagree with the export's.
+
+app.js turns those answers into pixels through a small, fixed **layer
+pool** (`layerPool`, capped at `POOL_SIZE = 4`): each entry owns one
+`<canvas>` and one hidden `<video>`, reused for the life of the session
+rather than created and torn down at every clip or crossfade boundary.
+Recreating a WebGL context is real work and browsers cap how many can be
+live at once, so a fixed pool of four hidden, paused elements — enough for
+both video tracks to be mid-crossfade at the same instant, which is the
+most `layersAt` can ever ask for — is the more defensible choice than
+churning contexts every time the playhead crosses a cut. `#keyCanvas` is
+pool entry 0 and is the only one that exists in `index.html`; the rest are
+created lazily and stacked into `#previewStage` with plain CSS (each
+non-base layer positioned to fill the base layer's box exactly), so Video 2
+drawing over Video 1 — and the two halves of a crossfade dissolving into
+each other — is ordinary DOM paint order, not anything the shader itself
+had to learn. **The shader in `key-preview.js` is untouched**: every layer
+reuses the exact single-clip `createKeyPreview`/`draw` this preview already
+had, once per canvas.
+
+A **crossfade** draws both clips and cross-dissolves them by canvas
+`opacity` for the overlap's duration, with a small label
+(`#xfadeBadge`) naming the export's real `xfade` transition underneath.
+This is a deliberate, bounded approximation, not the real curve: reproducing
+`xfade`'s per-transition-type maths (a wipe's edge, a slide's motion, a
+circle reveal's radius) pixel-for-pixel in a fragment shader is a
+significantly larger effort than this preview otherwise needed, for a
+detail — the shape of a transition mid-scrub — that a plain dissolve
+communicates well enough to edit by, as long as nobody mistakes it for the
+real thing. The badge is what stops that: it names the actual effect so a
+`wipeleft` reads as "will wipe" even though what's on screen right now is
+fading.
+
+**Captions are not drawn in the preview at all**, the same gap the old
+single-clip pane had — Test 3s remains the way to check them. Rendering the
+caption style panel's font, colour, position and background as a positioned
+HTML overlay was considered for this PR and cut: everything above it already
+needed proving out in a real browser this repository's test harness cannot
+launch, and stacking a second unverified approximation — an HTML
+approximation of an ASS/libass render, on top of a canvas approximation of
+an `xfade` curve — was worse than shipping the video layers honestly and
+leaving captions exactly where they already were.
+
+**Audio is muted on every layer.** Mixing several simultaneously-active
+clips' audio live was ruled out of scope from the start — a browser has no
+built-in multi-track audio mixer, and building one was a separate feature —
+so rather than pick one layer's audio arbitrarily to play (which one, when
+two tracks are both audible in the export?), every layer `<video>` in the
+composited and no-WebGL-fallback paths is muted. This is new: the old
+single-clip pane did play its one `<video>`'s own audio. A silent preview
+that never mixes wrongly was judged better than a preview that sounds right
+only by accident of which track happened to be selected.
+
+**Pressing Play** now advances a timeline clock
+(`stepTimelineClock`) — a wall-clock-driven `state.playhead`, ticking on
+`requestAnimationFrame` — rather than a single `<video>`'s own playback
+being the clock, which is what made driving more than one `<video>` off it
+impossible before. Each active layer's `<video>` is seeked to keep pace with
+that clock, correcting only once it drifts past a threshold
+(`driftSeek`, `DRIFT_THRESHOLD` — 150ms) rather than on every tick, so a
+decoder that is merely running a frame or two behind wall-clock time is left
+alone instead of fought.
+
+**On a machine with no WebGL**, the pane falls back to the plain `<video>`
+showing whichever clip is topmost at the playhead — playhead-driven clip
+*selection* still works — but that fallback does not run the timeline clock
+or the per-clip trim loop the single-clip pane used to run: it plays the
+source file plain, at 1x, start to end, same as it always did. This is a
+deliberate, smaller scope than the composited path, not an oversight.
+Driving several `<video>` elements off one JS clock and proving it does not
+drift is exactly the part of this feature only a real browser can verify,
+and nothing in this repository's test suite launches one; keeping the
+degraded path exactly as small and already-understood as it was before this
+PR was judged better than shipping a second, differently-shaped clock
+implementation with no way to check it here either.
+
+**What is and is not verified.** `test/timeline-preview.test.js` covers
+`trackStateAt`, `layersAt`, `sourceTimeFor`, `stepTimelineClock` and
+`driftSeek` as pure functions, mutation-tested by hand against the code they
+cover. `test/key-preview.test.js` drives the real `app.js` in jsdom to prove
+the *wiring*: a second active track gets a second canvas stacked above the
+first, a same-track overlap gets two pool entries split by dissolve
+progress with the badge shown, scrubbing across a clip or track boundary
+swaps which `<video>` is playing and where, Play advances the clock and
+Pause leaves it parked, and a layer that drops out of the composite is
+hidden and paused rather than left decoding off-screen. jsdom has no real
+WebGL context, no real video decoder and no real frame timing, so none of
+that proves a pixel lands correctly, that a real decoder's drift behaves the
+way `DRIFT_THRESHOLD` assumes, or that four concurrent WebGL contexts behave
+inside a real browser's limits — those are the claims this PR states rather
+than demonstrates.
+
 ### Filter order matters
 
 Inside `buildVideoClipChain` every step runs in **clip-local time** — zero is
@@ -589,7 +721,18 @@ screen and not just in the string the builder produced.
 Reasonable next moves, roughly by effort:
 
 - **More tracks.** `state.project.tracks` is an array; the builder already
-  loops it. Adding a fourth is a one-line change plus a UI button.
+  loops it, and so does `layersAt`. Adding a second audio track is a one-line
+  change plus a UI button. A third *video* track needs one more thing: the
+  preview's layer pool (`POOL_SIZE` in app.js) is sized for two video tracks
+  each possibly mid-crossfade at once — a third would need a bigger pool, or
+  an explicit decision about what happens when a fourth-and-up simultaneous
+  layer is asked for.
+
+- **Captions in the preview.** Left out of this PR on purpose — see "How the
+  composited preview works". Whenever this is picked up, a positioned
+  HTML/CSS overlay reading the caption style panel's font, size, colour,
+  position and background is the reasonable next approximation, clearly
+  short of real libass rendering.
 
 ## Licence
 

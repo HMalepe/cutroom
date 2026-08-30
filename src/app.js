@@ -544,7 +544,7 @@ function renderBin() {
         state.binSelection = i >= 0 && state.binSelection.length === 1 ? [] : [m.path];
       }
       renderBin();
-      loadPreview(m.path);
+      loadPreviewFromBin(m.path);
     };
     list.appendChild(el);
   }
@@ -577,6 +577,9 @@ function sendToTrack(trackId) {
     }
   });
   state.binSelection = [];
+  // The clip just landed on the timeline — show that, not whatever bin item
+  // happened to be previewing plain a moment ago (often the very same file).
+  binPreviewPath = null;
   renderBin();
   renderAll();
 }
@@ -586,119 +589,358 @@ function sendToTrack(trackId) {
 // ==========================================================================
 
 /*
- * The pane has two modes.
+ * The pane has three modes.
  *
- * Plain — the <video> element playing the source file with its own controls.
- * That is what this pane always did, and it is still what a machine without
- * WebGL gets, and what a bin item gets before it is on the timeline.
+ * Bin — a bin item played plain, own controls, no compositing. Set by
+ * clicking the bin rather than the timeline; binPreviewPath !== null is what
+ * marks it, and any timeline interaction (the ruler, a clip, an arrow key)
+ * clears it and hands the pane back to the timeline.
  *
- * Keyed — the same <video>, demoted to a texture source, drawn to a canvas
- * through the shader in key-preview.js. Green screen, brightness/contrast/
- * saturation, scale and position all show as you drag the sliders, computed
- * the way ffmpeg computes them so the numbers you settle on are the numbers
- * that will export. The <video> itself loops between the clip's inSec and
- * outSec at its speed (see applyClipLoop / stepClipLoop), so trims and speed
- * show too. Captions are still not shown — the note in the empty pane says
- * so, and Test 3s is still the way to check those.
+ * Composited — the pane shows whatever is actually on the timeline at
+ * state.playhead: the active clip on each video track, keyed and graded
+ * exactly as the old per-clip preview did, Video 2 over Video 1. This is
+ * driven by the playhead, not by clip selection — selecting a clip only
+ * changes what the inspector edits, and those edits show up here the moment
+ * the playhead is sitting over that clip, same as it always could. A layer
+ * pool of canvas+<video> pairs (layerPool, below) supplies one pair per
+ * active layer: normally one per video track, up to POOL_SIZE at once if
+ * both tracks happen to be mid-crossfade together. Pressing play now
+ * advances a timeline clock (stepTimelineClock, in timeline-preview.js) that
+ * seeks every active layer's <video> to keep pace with it, rather than the
+ * old design where a single <video>'s own playback WAS the clock.
  *
- * The keyed mode needs a clip, because a key is a per-clip setting. Selecting
- * something in the bin has no clip to read, so it stays plain.
+ * Fallback — composited mode needs a working WebGL context; without one this
+ * degrades to the plain <video> again, showing whichever clip is topmost at
+ * the playhead. It does not attempt the timeline clock or the per-clip trim
+ * loop the keyed pane used to run — same as before this feature existed, it
+ * quietly plays the source file at 1x, start to end, and the playhead does
+ * not track it. That gap is deliberate: driving several <video> elements off
+ * one JS clock is the part of this feature only a real browser can prove out
+ * (nothing here launches one), so the degraded path is kept exactly as small
+ * and well-understood as it already was rather than guessing at a second
+ * un-testable clock implementation for a case meant to be rare.
+ *
+ * Neither the composited nor the fallback path plays audio: every layer
+ * <video> is muted. Mixing several clips' audio live was ruled out of scope
+ * — see the README — and playing just one of several simultaneous layers
+ * unmuted would be arbitrary about which. The bin-preview path is unaffected
+ * and keeps its audio, same as before.
+ *
+ * Crossfades get an explicit, honest approximation rather than either the
+ * real xfade curve (out of scope — this is not a fragment-shader port of
+ * fifty transition types) or nothing: the outgoing and incoming clips both
+ * draw, cross-dissolved by canvas opacity, and a badge under the pane names
+ * the export's real transition so a wipe or slide never gets mistaken for
+ * the dissolve standing in for it here. See timeline-preview.js's
+ * trackStateAt for exactly where that window and its progress come from.
+ *
+ * Captions are not drawn here at all, same gap the old preview had — Test 3s
+ * remains the way to check those. Rendering the caption style panel's font,
+ * colour, position and background as an HTML overlay was considered and cut:
+ * everything else in this feature already needs proving out in a real
+ * browser this harness cannot launch, and a second unverified approximation
+ * layered on top of the first was worse than being honest that this PR ends
+ * at the video layers.
  */
 
-// Built once, lazily, and only when a keyed preview is actually wanted:
-// creating a GL context costs something, and a project that never keys never
-// needs one. null means WebGL is unavailable — a machine without it, a lost
-// context, or jsdom in the test suite — and every path below falls back.
-let keyer = null;
-let keyerTried = false;
+// One canvas+<video> pair per concurrent layer. #keyCanvas (pool[0]) always
+// exists in the markup; the rest are created lazily and kept for the life of
+// the session rather than torn down at every clip boundary — recreating a
+// WebGL context is real work, and a fixed pool of four hidden, paused
+// elements is not the kind of growth "leaking" means. Two video tracks each
+// mid-crossfade is the most layers layersAt can ever hand back at once; a
+// third clip overlapping *inside* an active crossfade on one track (a
+// same-track triple overlap) is not resolved by trackStateAt either, and is
+// not attempted here — see that function's own comment.
+const POOL_SIZE = 4;
+const layerPool = [];
 
-function getKeyer() {
-  if (!keyerTried) {
-    keyerTried = true;
-    try {
-      keyer = typeof createKeyPreview === 'function'
-        ? createKeyPreview($('keyCanvas'))
-        : null;
-    } catch (err) {
-      keyer = null;
-    }
-  }
-  return keyer;
-}
+// A decoder free-running at 1x still drifts a frame or two from wall-clock
+// time; correcting on every tick would fight the decoder instead of letting
+// it run, so a layer is only reseeked once it has drifted past this.
+const DRIFT_THRESHOLD = 0.15;
 
-let previewPath = null;    // what the <video> is loaded with
-let previewClipId = null;  // whose settings the canvas is keying, if any
+let binPreviewPath = null;   // non-null while a bin item, not the timeline, is showing
+let fallbackClipId = null;   // which clip #video is playing in the no-WebGL fallback
+let compositedActive = false; // whether togglePlay should drive the timeline clock
+let timelinePlaying = false;
+let lastTickAt = null;
 let previewRaf = 0;
 let previewDirty = false;
+// Which clips are on screen right now, so crossing a clip or crossfade
+// boundary forces a draw even while paused and otherwise clean — the same
+// job requestPreviewFrame() does for an edit, but for a change nothing
+// called requestPreviewFrame() for: the playhead simply arriving somewhere
+// new.
+let lastLayerSignature = null;
+
+function layerSignature(layers) {
+  return layers.map(({ trackId, state: s }) => (
+    s.kind === 'solo' ? `${trackId}:${s.clip.id}` : `${trackId}:${s.outgoing.id}>${s.incoming.id}`
+  )).join('|');
+}
+
+function createLayerCanvas() {
+  const c = document.createElement('canvas');
+  c.className = 'key-canvas layer';
+  c.style.display = 'none';
+  return c;
+}
+
+function makePoolEntry(idx) {
+  const canvas = idx === 0 ? $('keyCanvas') : createLayerCanvas();
+  if (idx !== 0) $('previewStage').appendChild(canvas);
+  // Muted per the header comment; texture-only keeps it decoding without
+  // showing its own frame (display:none can throttle decode — see the CSS).
+  const video = document.createElement('video');
+  video.muted = true;
+  video.playsInline = true;
+  video.className = 'texture-only';
+  $('viewer').appendChild(video);
+  return { canvas, video, keyer: null, keyerTried: false, currentSrc: null };
+}
+
+function poolEntry(i) {
+  while (layerPool.length <= i) layerPool.push(makePoolEntry(layerPool.length));
+  return layerPool[i];
+}
+
+/** Lazy and sticky per entry, the same shape the old single getKeyer() was. */
+function keyerFor(entry) {
+  if (!entry.keyerTried) {
+    entry.keyerTried = true;
+    try {
+      entry.keyer = typeof createKeyPreview === 'function' ? createKeyPreview(entry.canvas) : null;
+    } catch (err) {
+      entry.keyer = null;
+    }
+  }
+  return entry.keyer;
+}
+
+function pauseAllLayers() {
+  for (const entry of layerPool) {
+    if (entry.video && !entry.video.paused) entry.video.pause();
+  }
+}
 
 /**
- * Point the preview at a file. Pass the clip too and it keys; pass only a path
- * — a bin item — and it plays plain.
+ * play() returns a promise a real browser can reject under an autoplay
+ * policy, but some engines — jsdom among them, since it has no decoder at
+ * all — throw synchronously instead of returning anything. Both are the
+ * same "could not play, and that is fine" outcome to this pane, which never
+ * carries audio (see the header comment) and has nothing riding on it.
  */
-function loadPreview(path, clip) {
-  const v = $('video');
-  const empty = $('viewerEmpty');
+function safePlay(video) {
+  try {
+    const p = video.play();
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+  } catch (err) { /* see above */ }
+}
 
+/**
+ * Drive one layer's <video> toward where the timeline clock says its clip's
+ * source should be. Playing lets the decoder run and only corrects once it
+ * drifts (see DRIFT_THRESHOLD); paused parks it exactly, the way scrubbing
+ * always has.
+ */
+function syncVideoToTime(video, clip, expected, playing) {
+  video.playbackRate = clampPlaybackRate(clip.speed);
+  if (playing) {
+    const seek = TimelinePreview.driftSeek(video.currentTime, expected, DRIFT_THRESHOLD);
+    if (seek !== null) video.currentTime = seek;
+    if (video.paused) safePlay(video);
+  } else {
+    if (!video.paused) video.pause();
+    if (Math.abs((video.currentTime || 0) - expected) > 1e-3) video.currentTime = expected;
+  }
+}
+
+function showEmptyPane() {
+  $('previewStage').style.display = 'none';
+  $('video').style.display = 'none';
+  $('video').controls = false;
+  $('scrub').style.display = 'none';
+  $('xfadeBadge').style.display = 'none';
+  $('viewerEmpty').style.display = 'block';
+  pauseAllLayers();
+}
+
+/** Point the pane at a bin item, plain, own controls — no compositing. */
+function loadPreviewFromBin(path) {
+  binPreviewPath = path || null;
+  const v = $('video');
   if (!path) {
-    previewPath = null;
-    previewClipId = null;
     v.removeAttribute('src');
     v.style.display = 'none';
-    empty.style.display = 'block';
-    applyPreviewMode();
+    $('viewerEmpty').style.display = 'block';
+    return;
+  }
+  v.src = fileUrl(path);
+  v.style.display = 'block';
+  v.controls = true;
+  v.classList.remove('texture-only');
+  $('previewStage').style.display = 'none';
+  $('scrub').style.display = 'none';
+  $('xfadeBadge').style.display = 'none';
+  $('viewerEmpty').style.display = 'none';
+  syncTimelinePreview();
+}
+
+/**
+ * The no-WebGL degraded path: whichever clip is topmost at the playhead,
+ * plain, no loop, no timeline clock — see the header comment for why.
+ */
+function drawPlainFallback(layers) {
+  const top = layers[layers.length - 1].state;
+  const clip = top.kind === 'crossfade' ? top.incoming : top.clip;
+
+  $('previewStage').style.display = 'none';
+  $('scrub').style.display = 'none';
+  $('xfadeBadge').style.display = 'none';
+  $('viewerEmpty').style.display = 'none';
+
+  const v = $('video');
+  v.style.display = 'block';
+  v.controls = true;
+  v.classList.remove('texture-only');
+
+  const changed = fallbackClipId !== clip.id;
+  if (changed) {
+    fallbackClipId = clip.id;
+    v.src = fileUrl(clip.src);
+  }
+  // Only force the frame while paused: fighting an already-playing native
+  // element with a seek on every sync is exactly what this path is meant to
+  // avoid running a clock to prevent.
+  if (changed || v.paused) v.currentTime = TimelinePreview.sourceTimeFor(clip, state.playhead);
+}
+
+/** Composite every active layer onto the stage through its own pool entry. */
+function drawComposited(layers, t) {
+  $('viewerEmpty').style.display = 'none';
+  $('video').style.display = 'none';
+  $('previewStage').style.display = 'inline-block';
+  $('scrub').style.display = '';
+
+  const slots = [];
+  let transition = null;
+  for (const { state: layerState } of layers) {
+    if (layerState.kind === 'solo') {
+      slots.push({ clip: layerState.clip, opacity: 1 });
+    } else {
+      transition = layerState.transition;
+      slots.push({ clip: layerState.outgoing, opacity: 1 - layerState.progress });
+      slots.push({ clip: layerState.incoming, opacity: layerState.progress });
+    }
+  }
+
+  const badge = $('xfadeBadge');
+  if (transition) {
+    badge.textContent = `crossfade preview: dissolve (export uses "${transition}")`;
+    badge.style.display = 'block';
+  } else {
+    badge.style.display = 'none';
+  }
+
+  const used = Math.min(slots.length, POOL_SIZE);
+  for (let i = 0; i < used; i++) {
+    const entry = poolEntry(i);
+    const slot = slots[i];
+    const srcTime = TimelinePreview.sourceTimeFor(slot.clip, t);
+
+    if (entry.currentSrc !== slot.clip.src) {
+      entry.currentSrc = slot.clip.src;
+      entry.video.src = fileUrl(slot.clip.src);
+    }
+    syncVideoToTime(entry.video, slot.clip, srcTime, timelinePlaying);
+
+    entry.canvas.style.display = 'block';
+    entry.canvas.style.opacity = String(slot.opacity);
+
+    const keyer = keyerFor(entry);
+    // A keyer that fails only for this one entry (a context limit, say) just
+    // leaves its canvas blank rather than pulling the whole pane back to the
+    // fallback — pool[0] having worked is what got us into this branch.
+    if (keyer && !keyer.isLost()) keyer.draw(entry.video, slot.clip, state.project);
+  }
+  for (let i = used; i < layerPool.length; i++) {
+    layerPool[i].canvas.style.display = 'none';
+    if (!layerPool[i].video.paused) layerPool[i].video.pause();
+  }
+}
+
+/**
+ * The single entry point: decide bin vs. composited vs. fallback vs. empty,
+ * and draw whichever it is. Called from renderAll (so undo, edits and
+ * selection all reach it), from every place that moves state.playhead, and
+ * once a tick from the preview loop while that loop is running.
+ */
+function syncTimelinePreview() {
+  if (binPreviewPath !== null) {
+    stopPreviewLoop();
+    compositedActive = false;
+    lastLayerSignature = null;
     return;
   }
 
-  if (previewPath !== path) {
-    previewPath = path;
-    v.src = fileUrl(path);
-  }
-  v.style.display = 'block';
-  empty.style.display = 'none';
+  const t = state.playhead;
+  const layers = TimelinePreview.layersAt(state.project.tracks, t, TimelinePreview.minOverlapFor(state.project));
 
-  // An audio-only clip has no frames to key, so it stays on the plain element.
-  previewClipId = clip && clip.hasVideo !== false ? clip.id : null;
-  applyPreviewMode();
-}
-
-/**
- * Choose between the canvas and the <video>, and start or stop the draw loop
- * to match. Every path that changes the selection or the clip ends up here, so
- * the pane can never be left keying a clip you have moved on from.
- */
-function applyPreviewMode() {
-  const v = $('video');
-  const canvas = $('keyCanvas');
-  const scrub = $('scrub');
-  const clip = previewClipId ? findClip(previewClipId).clip : null;
-  const keyed = !!(previewPath && clip && getKeyer());
-
-  canvas.style.display = keyed ? 'block' : 'none';
-  scrub.style.display = keyed ? '' : 'none';
-  v.classList.toggle('texture-only', keyed);
-  // The canvas has no controls of its own, so the <video> keeps its when it is
-  // the thing on screen and gives them up when it is only a texture.
-  v.controls = !keyed;
-
-  if (keyed) {
-    requestPreviewFrame();
-    startPreviewLoop();
-  } else {
+  // Nothing at the playhead and nothing running — leave WebGL untouched.
+  // Building a context costs something, and a project that never keys never
+  // needs one; checked again below once there is actually a reason to ask.
+  if (!layers.length && !timelinePlaying) {
+    showEmptyPane();
     stopPreviewLoop();
+    compositedActive = false;
+    lastLayerSignature = null;
+    return;
   }
-}
 
-/** Follow the selection. Called from renderAll, so undo moves the preview too. */
-function syncPreviewToSelection() {
-  const clip = selectedClip();
-  if (clip && clip.src) {
-    loadPreview(clip.src, clip);
-  } else if (previewClipId) {
-    // Selection went away while a key was showing. Fall back rather than
-    // keying with settings nothing on the timeline has any more.
-    previewClipId = null;
-    applyPreviewMode();
+  const entry0 = poolEntry(0);
+  const keyer0 = keyerFor(entry0);
+
+  if (keyer0 && keyer0.isLost()) {
+    // The GPU took the context away — a driver reset, a laptop waking up.
+    // Give up on it for the session, same as the old single-canvas pane did.
+    entry0.keyer = null;
+    toast('Lost the graphics context — the preview is back to the plain player.', 'warn');
+    syncTimelinePreview();
+    return;
   }
+
+  if (!keyer0) {
+    compositedActive = false;
+    lastLayerSignature = null;
+    stopPreviewLoop();
+    if (layers.length) drawPlainFallback(layers); else showEmptyPane();
+    return;
+  }
+
+  compositedActive = true;
+
+  if (!layers.length) {
+    // A gap mid-playback: nothing to draw this instant, but the clock keeps
+    // running so the next clip picks the preview back up on its own.
+    showEmptyPane();
+    lastLayerSignature = null;
+    startPreviewLoop();
+    return;
+  }
+
+  // The playhead landing on a different clip, or crossing into or out of a
+  // crossfade, is not itself an "edit" — nothing called requestPreviewFrame()
+  // for it — but it still has to draw the first time, not wait for one.
+  const sig = layerSignature(layers);
+  if (sig !== lastLayerSignature) previewDirty = true;
+  lastLayerSignature = sig;
+
+  if (timelinePlaying || previewDirty) {
+    previewDirty = false;
+    drawComposited(layers, t);
+  }
+  startPreviewLoop();
 }
 
 /** Ask for one more frame. Cheap, and safe to call from anywhere. */
@@ -708,7 +950,7 @@ function startPreviewLoop() {
   if (previewRaf || typeof requestAnimationFrame !== 'function') return;
   const tick = () => {
     previewRaf = requestAnimationFrame(tick);
-    drawKeyedFrame();
+    tickTimeline();
   };
   previewRaf = requestAnimationFrame(tick);
 }
@@ -716,55 +958,50 @@ function startPreviewLoop() {
 function stopPreviewLoop() {
   if (previewRaf) cancelAnimationFrame(previewRaf);
   previewRaf = 0;
+  lastTickAt = null;
 }
 
-/**
- * Keep the <video> element looping the clip's own trim at the clip's own
- * speed, so the keyed preview shows what the export will show instead of the
- * whole source file at 1x. The decision is pure and lives in key-preview.js
- * (stepClipLoop) — this is just the DOM side of applying it, run every tick
- * so a clip whose trim or speed changes underneath it self-corrects.
- */
-function applyClipLoop(video, clip) {
-  const step = stepClipLoop(video.currentTime, clip);
-  if (video.playbackRate !== step.playbackRate) video.playbackRate = step.playbackRate;
-  if (step.seekTo !== null) video.currentTime = step.seekTo;
+function nowMs() {
+  return (typeof performance !== 'undefined' && typeof performance.now === 'function')
+    ? performance.now() : Date.now();
 }
 
-function drawKeyedFrame() {
-  const k = getKeyer();
-  const clip = previewClipId ? findClip(previewClipId).clip : null;
-  if (!k || !clip) return;
+/** One frame of the timeline clock, then a redraw. Pure decision, DOM side —
+ *  see stepTimelineClock in timeline-preview.js for the part that is tested
+ *  without a loop around it. */
+function tickTimeline() {
+  if (timelinePlaying) {
+    const now = nowMs();
+    const dt = lastTickAt === null ? 0 : Math.max(0, (now - lastTickAt) / 1000);
+    lastTickAt = now;
+    const result = TimelinePreview.stepTimelineClock({
+      playhead: state.playhead, playing: true, dt, duration: projectDuration()
+    });
+    state.playhead = result.playhead;
+    if (!result.playing) { timelinePlaying = false; $('btnPlay').textContent = 'Play'; }
+    updatePlayheadUI();
+  }
+  syncTimelinePreview();
+}
 
-  if (k.isLost()) {
-    // The GPU took the context away — a driver reset, a laptop waking up.
-    // Give up on it for the session rather than drawing a frozen frame.
-    keyer = null;
-    applyPreviewMode();
-    toast('Lost the graphics context — the preview is back to the plain player.', 'warn');
+/** Start or stop the timeline clock, or fall back to the old plain toggle
+ *  when there is nothing for a clock to drive. */
+function togglePlay() {
+  const v = $('video');
+  if (binPreviewPath !== null || !compositedActive) {
+    if (v.paused) safePlay(v); else v.pause();
+    $('btnPlay').textContent = v.paused ? 'Play' : 'Pause';
     return;
   }
-
-  const v = $('video');
-  applyClipLoop(v, clip);
-  syncScrub();
-
-  // Redraw every frame while playing, and exactly once after an edit. A slider
-  // dragged with the video paused still has to show its result immediately,
-  // and that is the only reason to redraw a still frame.
-  if (v.paused && !previewDirty) return;
-  previewDirty = false;
-  k.draw(v, clip, state.project);
-}
-
-function syncScrub() {
-  const v = $('video');
-  const scrub = $('scrub');
-  // Leave it alone while it is being dragged, or it fights the pointer.
-  if (document.activeElement === scrub) return;
-  const dur = v.duration;
-  if (!dur || !isFinite(dur)) return;
-  scrub.value = String(Math.round((v.currentTime / dur) * 1000));
+  if (timelinePlaying) {
+    timelinePlaying = false;
+    pauseAllLayers();
+  } else {
+    timelinePlaying = true;
+    lastTickAt = null; // first tick supplies dt=0, so playback does not jump
+    startPreviewLoop();
+  }
+  $('btnPlay').textContent = timelinePlaying ? 'Pause' : 'Play';
 }
 
 // ==========================================================================
@@ -914,12 +1151,28 @@ function renderTimeline() {
   $('tlInner').style.width = width + 'px';
   renderRuler(width);
   renderLanes(width);
-  $('playhead').style.left = (state.playhead * state.pxPerSec) + 'px';
   $('zoomLabel').textContent = Math.round(state.pxPerSec) + ' px/s';
+  updatePlayheadUI();
+}
+
+/**
+ * Just the playhead marker, timecode and scrub — split out of renderTimeline
+ * so the preview clock's per-frame tick (tickTimeline, above) can keep those
+ * in sync during playback without re-laying out the whole lane list sixty
+ * times a second.
+ */
+function updatePlayheadUI() {
+  $('playhead').style.left = (state.playhead * state.pxPerSec) + 'px';
 
   const f = fmtTime(state.playhead);
   $('timecode').innerHTML = `${f.main}<span class="frac">.${f.frac}</span>`;
   $('timecodeTotal').textContent = '/ ' + fmtTime(projectDuration()).main;
+
+  const scrub = $('scrub');
+  // Leave it alone while it is being dragged, or it fights the pointer.
+  if (document.activeElement === scrub) return;
+  const dur = projectDuration();
+  scrub.value = dur > 0 ? String(Math.round((state.playhead / dur) * 1000)) : '0';
 }
 
 // ==========================================================================
@@ -935,17 +1188,26 @@ $('tlScroll').addEventListener('pointerdown', (e) => {
 
   const clipEl = e.target.closest('.clip');
 
-  // Clicking the ruler or empty lane space moves the playhead.
+  // Clicking the ruler or empty lane space moves the playhead, which is what
+  // now drives the preview — and hands the pane back from a bin item, if one
+  // was showing, to the timeline.
   if (!clipEl) {
     state.playhead = Math.max(0, snap(x / state.pxPerSec));
+    binPreviewPath = null;
+    requestPreviewFrame();
     renderTimeline();
+    syncTimelinePreview();
     return;
   }
 
   const id = clipEl.dataset.clipId;
   state.selectedClipId = id;
   const { clip, track } = findClip(id);
-  loadPreview(clip.src, clip);
+  // Selecting a clip no longer points the preview at it directly — the
+  // playhead does that. It still has to give up a bin item that was showing,
+  // the same way clicking empty timeline space above does.
+  binPreviewPath = null;
+  syncTimelinePreview();
 
   const handle = e.target.dataset.handle;
   // Opened whether or not the pointer ends up moving. A click that only
@@ -1692,7 +1954,7 @@ function renderAll() {
   renderHeads();
   renderTimeline();
   renderInspector();
-  syncPreviewToSelection();
+  syncTimelinePreview();
   scheduleCommandPreview();
 }
 
@@ -1719,28 +1981,24 @@ $('btnSendV1').onclick = () => sendToTrack('v1');
 $('btnSendV2').onclick = () => sendToTrack('v2');
 $('btnSendA1').onclick = () => sendToTrack('a1');
 
-// Transport
-function togglePlay() {
-  const v = $('video');
-  if (v.paused) v.play(); else v.pause();
-}
+// Transport — togglePlay itself lives in the Preview section, above, next to
+// the timeline clock it drives.
 $('btnPlay').onclick = togglePlay;
-// The keyed canvas covers the video's own controls, so it takes over the
-// click-to-play everyone expects of a video.
-$('keyCanvas').onclick = togglePlay;
+// The composited stage covers the video's own controls, so it takes over the
+// click-to-play everyone expects of a video. One listener on the stage
+// covers every layer canvas stacked inside it, however many there are.
+$('previewStage').onclick = togglePlay;
 
 $('scrub').oninput = () => {
-  const v = $('video');
-  if (!v.duration || !isFinite(v.duration)) return;
-  v.currentTime = (Number($('scrub').value) / 1000) * v.duration;
+  const dur = projectDuration();
+  if (!dur) return;
+  binPreviewPath = null;
+  state.playhead = (Number($('scrub').value) / 1000) * dur;
   requestPreviewFrame();
+  updatePlayheadUI();
+  syncTimelinePreview();
 };
 
-// A seek, a first frame or a resumed play all need one more draw — while
-// paused nothing else would ask for it.
-for (const ev of ['seeked', 'loadeddata', 'loadedmetadata', 'play', 'ended']) {
-  $('video').addEventListener(ev, requestPreviewFrame);
-}
 $('btnSplit').onclick = splitAtPlayhead;
 $('btnSetIn').onclick = setInAtPlayhead;
 $('btnSetOut').onclick = setOutAtPlayhead;
@@ -1893,8 +2151,14 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'i') setInAtPlayhead();
   if (e.key === 'o') setOutAtPlayhead();
   if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); deleteSelected(); }
-  if (e.key === 'ArrowLeft') { state.playhead = Math.max(0, state.playhead - (e.shiftKey ? 1 : 1 / state.project.fps)); renderTimeline(); }
-  if (e.key === 'ArrowRight') { state.playhead += (e.shiftKey ? 1 : 1 / state.project.fps); renderTimeline(); }
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+    const step = (e.shiftKey ? 1 : 1 / state.project.fps) * (e.key === 'ArrowLeft' ? -1 : 1);
+    state.playhead = Math.max(0, state.playhead + step);
+    binPreviewPath = null;
+    requestPreviewFrame();
+    renderTimeline();
+    syncTimelinePreview();
+  }
 });
 
 window.addEventListener('resize', () => renderTimeline());

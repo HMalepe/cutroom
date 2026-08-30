@@ -55,7 +55,9 @@ module.exports = [
         TEMPLATES: 'readonly',
         applyTemplate: 'readonly',
         createKeyPreview: 'readonly',
-        stepClipLoop: 'readonly'
+        stepClipLoop: 'readonly',
+        clampPlaybackRate: 'readonly',
+        TimelinePreview: 'readonly'
       }
     },
     rules: {

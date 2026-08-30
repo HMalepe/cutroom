@@ -466,6 +466,10 @@ void main() {
   // outside the app.
   root.KEY_PREVIEW_SHADERS = { VERT, FRAG };
   root.stepClipLoop = stepClipLoop;
+  // The composited preview drives several <video> elements at once (see
+  // timeline-preview.js) and needs the same clamp for every one of them,
+  // rather than re-deriving MIN/MAX_PLAYBACK_RATE a second time.
+  root.clampPlaybackRate = clampPlaybackRate;
 
   if (typeof module !== 'undefined') {
     module.exports = {

@@ -353,6 +353,16 @@ test('selecting a clip points the preview at its source file', opts, async () =>
   assert.match(doc.getElementById('video').src, /green\.mp4$/);
 });
 
+test('an empty timeline shows the empty pane, not a leftover fallback frame', opts, () => {
+  // No clip has ever been added, so there is nothing for the no-WebGL
+  // fallback to show — this pins that it says so rather than drawing
+  // whatever the fallback's own stale state happens to default to.
+  const { doc } = boot();
+  assert.equal(doc.getElementById('viewerEmpty').style.display, 'block');
+  assert.equal(doc.getElementById('previewStage').style.display, 'none');
+  assert.equal(doc.getElementById('video').style.display, 'none');
+});
+
 test('the canvas exists in the markup even where it can never be used', opts, () => {
   // app.js asks for it by id at boot. If it is dropped from index.html the
   // failure is a null dereference on first selection, not a missing preview.
@@ -372,14 +382,17 @@ test('booting the app touches no graphics context at all', opts, () => {
   assert.equal(asked, 0, 'nothing asked for a context');
 });
 
-test('deleting the selected clip drops the preview back rather than keying a ghost', opts, async () => {
+test('deleting the clip under the playhead drops the preview to the empty pane, not a ghost of it', opts, async () => {
+  // The pane is playhead-driven now, not selection-driven — so what proves
+  // this is deleting the clip the playhead is actually sitting over, not
+  // deleting whatever happens to be selected.
   const { win, doc } = boot();
   await selectAClip(win, doc);
   doc.getElementById('btnDeleteClip').click();
 
-  const video = doc.getElementById('video');
   assert.equal(doc.getElementById('keyCanvas').style.display, 'none');
-  assert.equal(video.controls, true, 'the plain player is back');
+  assert.equal(doc.getElementById('video').style.display, 'none', 'not the old file either');
+  assert.equal(doc.getElementById('viewerEmpty').style.display, 'block', 'the empty pane is what is left');
 });
 
 test('a bin selection previews plain, because a bin item has no key to show', opts, async () => {
@@ -400,16 +413,17 @@ test('a bin selection previews plain, because a bin item has no key to show', op
 // ==========================================================================
 
 /*
- * jsdom has no WebGL, so without help getKeyer() falls back to the plain
- * <video> before app.js ever reaches the loop logic — which is what every
- * test above this point relies on. These tests instead hand app.js a fake
- * keyer with the real one's shape (draw/resize/destroy/isLost), the same way
- * a browser with a working driver would, so the "keyed" branch — the one
- * that drives currentTime and playbackRate — runs for real. What is under
- * test is app.js's wiring: does selecting a clip and changing its speed or
- * trim reach the <video>. The draw call itself, and the shader it feeds,
- * are covered elsewhere (chroma-math.test.js, and by hand against real
- * ffmpeg output per the header comments) — nothing here asserts a pixel.
+ * jsdom has no WebGL, so without help keyerFor() falls back to the plain
+ * <video> before app.js ever reaches the compositing logic — which is what
+ * every test above this point relies on. These tests instead hand app.js a
+ * fake keyer with the real one's shape (draw/resize/destroy/isLost), the same
+ * way a browser with a working driver would, so the composited branch — the
+ * one that drives a layer's own <video> — runs for real. What is under test
+ * is app.js's wiring: does the playhead sitting over a clip reach that
+ * clip's <video>, and does play advance the timeline clock the way it is
+ * meant to. The draw call itself, and the shader it feeds, are covered
+ * elsewhere (chroma-math.test.js, and by hand against real ffmpeg output per
+ * the header comments) — nothing here asserts a pixel.
  */
 function stubKeyer() {
   return {
@@ -441,18 +455,31 @@ function setTrim(win, doc, inSec, outSec) {
   outInput.dispatchEvent(new win.Event('change', { bubbles: true }));
 }
 
+// The composited pane no longer drives #video — each layer gets its own
+// hidden <video>, appended into #viewer with the same texture-only class
+// #video used to borrow while it was a texture source. #video itself never
+// carries that class in composited mode (see loadPreviewFromBin/
+// drawPlainFallback), so this selector is unambiguous. With one clip on one
+// track there is exactly one.
+function poolVideo(doc) {
+  return doc.querySelector('#viewer video.texture-only');
+}
+
 // The stub keyer above makes app.js actually start its requestAnimationFrame
 // redraw loop, which real WebGL-less tests never trigger. That loop reschedules
 // itself on a real timer with nothing to stop it once the test's assertions
 // are done, which is enough to keep `node --test` from ever exiting — so every
 // test below deletes the clip in a `finally`, which is the app's own way of
-// tearing the loop down (see "deleting the selected clip drops the preview
-// back", above), win or lose on the assertions.
+// tearing the loop down (see "deleting the clip under the playhead...",
+// above), win or lose on the assertions. A test that started the timeline
+// clock pauses it first, since a playing clock outlives the clip it was
+// playing.
 function stopLoop(doc) {
+  if (doc.getElementById('btnPlay').textContent === 'Pause') doc.getElementById('btnPlay').click();
   doc.getElementById('btnDeleteClip').click();
 }
 
-test('selecting a clip loops the video to its inSec and sets playbackRate to its speed', opts, async () => {
+test('a clip at the playhead loops its layer video to its inSec and sets playbackRate to its speed', opts, async () => {
   const { win, doc } = boot();
   win.createKeyPreview = stubKeyer;
   try {
@@ -461,42 +488,40 @@ test('selecting a clip loops the video to its inSec and sets playbackRate to its
     setSpeed(doc, 2);
     await rafTick();
 
-    const video = doc.getElementById('video');
+    const video = poolVideo(doc);
     assert.equal(video.playbackRate, 2, 'playbackRate follows the clip speed');
-    assert.equal(video.currentTime, 2, 'the loop puts a fresh clip at its own inSec, not the start of the source');
+    // Playhead is still 0 (selecting a clip does not move it), which after a
+    // trim to [2, 6) is clamped to the clip's own inSec.
+    assert.equal(video.currentTime, 2, 'the playhead maps to the clip\'s inSec at its own start');
   } finally {
     stopLoop(doc);
   }
 });
 
-test('playback reaching outSec loops back to inSec', opts, async () => {
+test('scrubbing the playhead across the clip moves the layer video with it', opts, async () => {
   const { win, doc } = boot();
   win.createKeyPreview = stubKeyer;
   try {
     await selectAClip(win, doc);
     setTrim(win, doc, 2, 6);
     await rafTick();
+    assert.equal(poolVideo(doc).currentTime, 2, 'settled at inSec before the next step');
 
-    const video = doc.getElementById('video');
-    assert.equal(video.currentTime, 2, 'settled at inSec before the next step');
-
-    // Nothing in jsdom actually decodes video, so playback reaching outSec is
-    // simulated the way the scrub bar itself sets currentTime — the only path
-    // in this app that writes it other than the loop under test.
-    Object.defineProperty(video, 'duration', { value: 8, configurable: true });
+    // Move the playhead with the scrub bar the way dragging it would —
+    // #scrub now represents state.playhead, not a single video's own
+    // currentTime, so its range is the project duration.
+    const dur = win.projectDuration();
     const scrub = doc.getElementById('scrub');
-    scrub.value = String((6 / 8) * 1000);
+    scrub.value = String((3 / dur) * 1000);
     scrub.dispatchEvent(new win.Event('input', { bubbles: true }));
-    assert.equal(video.currentTime, 6, 'scrubbing landed exactly on outSec');
 
-    await rafTick();
-    assert.equal(video.currentTime, 2, 'the loop caught it on the next tick and jumped back to inSec');
+    assert.equal(poolVideo(doc).currentTime, 5, 'timeline second 3 lands on source second inSec(2)+3');
   } finally {
     stopLoop(doc);
   }
 });
 
-test('changing speed alone updates playbackRate without moving the loop window', opts, async () => {
+test('changing speed alone updates playbackRate without moving the layer video', opts, async () => {
   const { win, doc } = boot();
   win.createKeyPreview = stubKeyer;
   try {
@@ -506,9 +531,70 @@ test('changing speed alone updates playbackRate without moving the loop window',
     setSpeed(doc, 4);
     await rafTick();
 
-    const video = doc.getElementById('video');
+    const video = poolVideo(doc);
     assert.equal(video.playbackRate, 4);
     assert.equal(video.currentTime, 0, 'the default trim starts at 0, untouched by a speed-only change');
+  } finally {
+    stopLoop(doc);
+  }
+});
+
+/*
+ * jsdom's own HTMLMediaElement.play()/pause() are stubs that log a "not
+ * implemented" error and never touch .paused — real enough for every test
+ * above this point, which never calls either, but not for these two, which
+ * are exactly about whether app.js calls them. This fakes just enough of a
+ * real element's play/pause state machine (an internal flag .paused reads
+ * back) for that to be observable, without pretending jsdom can decode.
+ */
+function fakeMediaPlayback(win) {
+  const paused = new WeakMap();
+  Object.defineProperty(win.HTMLMediaElement.prototype, 'paused', {
+    configurable: true,
+    get() { return paused.get(this) !== false; }
+  });
+  win.HTMLMediaElement.prototype.play = function () { paused.set(this, false); return Promise.resolve(); };
+  win.HTMLMediaElement.prototype.pause = function () { paused.set(this, true); };
+}
+
+test('pressing play advances the timeline clock and a layer video plays', opts, async () => {
+  const { win, doc } = boot();
+  win.createKeyPreview = stubKeyer;
+  fakeMediaPlayback(win);
+  try {
+    await selectAClip(win, doc);
+    await rafTick();
+
+    doc.getElementById('btnPlay').click();
+    await rafTick();
+
+    assert.equal(poolVideo(doc).paused, false, 'the layer is told to play');
+    assert.equal(doc.getElementById('btnPlay').textContent, 'Pause');
+    // state.playhead is private, but the timecode text is the same number
+    // formatted — a non-zero one is the timeline clock having actually
+    // ticked, not just play() having been called once and left there.
+    const secs = Number(doc.getElementById('timecode').textContent.split(':').pop());
+    assert.ok(secs > 0, 'the playhead advanced past 0 while playing');
+  } finally {
+    stopLoop(doc);
+  }
+});
+
+test('pausing stops the layer video and leaves the playhead where it was', opts, async () => {
+  const { win, doc } = boot();
+  win.createKeyPreview = stubKeyer;
+  fakeMediaPlayback(win);
+  try {
+    await selectAClip(win, doc);
+    doc.getElementById('btnPlay').click();
+    await rafTick();
+    doc.getElementById('btnPlay').click(); // pause
+
+    const parkedAt = poolVideo(doc).currentTime;
+    await rafTick();
+    assert.equal(poolVideo(doc).paused, true, 'the layer is paused, not still being driven');
+    assert.equal(doc.getElementById('btnPlay').textContent, 'Play');
+    assert.equal(poolVideo(doc).currentTime, parkedAt, 'nothing kept seeking it after pause');
   } finally {
     stopLoop(doc);
   }
@@ -543,5 +629,279 @@ test('a probed colour tag survives the whole probe -> bin -> clip -> draw() pipe
       'every draw() call should carry the probed tag through to the clip');
   } finally {
     stopLoop(doc);
+  }
+});
+
+test('leaving a bin item to select a clip already sitting at the playhead shows it immediately', opts, async () => {
+  // Nothing about this path runs through renderAll() (see the pointerdown
+  // handler), so it is the one case requestPreviewFrame() is not already
+  // called for it by something else — the composited pane has to notice the
+  // active layer set changed (bin -> this clip) on its own, or it stays
+  // showing the empty/hidden stage left over from bin mode.
+  const { win, doc } = boot();
+  win.createKeyPreview = stubKeyer;
+  try {
+    await selectAClip(win, doc); // adds and selects a clip at playhead 0
+    await rafTick();
+    assert.equal(doc.getElementById('previewStage').style.display, 'inline-block', 'composited to start with');
+
+    doc.querySelector('#binList .bin-item').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+    assert.equal(doc.getElementById('previewStage').style.display, 'none', 'bin mode hides it');
+
+    // Re-select the same clip — still at playhead 0, nothing about the
+    // timeline changed, only which pane is showing.
+    doc.querySelector('#lanes .clip').dispatchEvent(
+      new win.MouseEvent('pointerdown', { bubbles: true, clientX: 10, clientY: 10 })
+    );
+    await rafTick();
+
+    assert.equal(doc.getElementById('previewStage').style.display, 'inline-block', 'composited again, without needing an edit first');
+    assert.equal(doc.getElementById('keyCanvas').style.display, 'block');
+  } finally {
+    stopLoop(doc);
+  }
+});
+
+// ==========================================================================
+// Multi-track compositing and crossfades
+// ==========================================================================
+
+/*
+ * Which clip is active on which track at a given time, and where a crossfade
+ * window sits, is trackStateAt's job and is covered — with mutation-tested
+ * unit coverage — in test/timeline-preview.test.js. What is only provable
+ * here, through the real app.js in a real DOM, is the wiring on top of that:
+ * does a second active track actually get a second canvas+<video> pair, does
+ * it land above the first in the stage, does a crossfade get two pool
+ * entries with the dissolve split across their opacity, and does leaving a
+ * layer's clip in the DOM's stopLoop-style teardown release it rather than
+ * leaving a hidden <video> stuck playing.
+ */
+
+/** One clip on v1, a second on v2, both starting at 0 (fakeMedia is 10s). */
+async function twoTrackClips(win, doc) {
+  seedBin(win, doc, ['a.mp4', 'b.mp4']);
+  await flush();
+  const items = doc.querySelectorAll('#binList .bin-item');
+  items[0].dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  doc.getElementById('btnSendV1').click();
+  items[1].dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  doc.getElementById('btnSendV2').click();
+}
+
+/**
+ * Two clips end to end on v1, then the second dragged left until it overlaps
+ * the first by `overlapSec` — a real pointerdown/pointermove/pointerup drag,
+ * the same gesture a user makes, at the app's default 40px/s zoom.
+ */
+async function crossfadeOnV1(win, doc, overlapSec) {
+  seedBin(win, doc, ['a.mp4', 'b.mp4']);
+  await flush();
+  const items = doc.querySelectorAll('#binList .bin-item');
+  items[0].dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  doc.getElementById('btnSendV1').click();
+  items[1].dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  doc.getElementById('btnSendV1').click();
+
+  const second = doc.querySelectorAll('#lanes .clip')[1]; // starts at 10 (a.mp4 is 10s)
+  const pxPerSec = 40;
+  const dx = -overlapSec * pxPerSec;
+  const tl = doc.getElementById('tlScroll');
+  second.dispatchEvent(new win.MouseEvent('pointerdown', { bubbles: true, clientX: 300, clientY: 5 }));
+  tl.dispatchEvent(new win.MouseEvent('pointermove', { bubbles: true, clientX: 300 + dx, clientY: 5 }));
+  tl.dispatchEvent(new win.MouseEvent('pointerup', { bubbles: true, clientX: 300 + dx, clientY: 5 }));
+}
+
+/** Move the playhead the way clicking the ruler does, at 40px/s. */
+function setPlayhead(doc, sec) {
+  doc.getElementById('tlScroll').dispatchEvent(
+    new doc.defaultView.MouseEvent('pointerdown', { bubbles: true, clientX: sec * 40, clientY: 5 })
+  );
+}
+
+function stopLoopViaBin(doc) {
+  const item = doc.querySelector('#binList .bin-item');
+  if (item) item.click();
+}
+
+test('two clips on two video tracks each get their own layer canvas, v2 stacked over v1', opts, async () => {
+  const { win, doc } = boot();
+  win.createKeyPreview = stubKeyer;
+  try {
+    await twoTrackClips(win, doc);
+    await rafTick();
+
+    const canvases = [...doc.getElementById('previewStage').querySelectorAll('canvas')];
+    assert.equal(canvases.length, 2, 'one canvas per active video track');
+    assert.equal(canvases[0].id, 'keyCanvas', 'v1 is the bottom, pre-existing canvas');
+    assert.equal(canvases[0].style.opacity, '1', 'no crossfade here, fully opaque');
+    assert.equal(canvases[1].style.opacity, '1');
+    assert.ok(
+      canvases[0].compareDocumentPosition(canvases[1]) & win.Node.DOCUMENT_POSITION_FOLLOWING,
+      'v2\'s canvas comes after v1\'s in the stage, which is what puts it on top'
+    );
+
+    const videos = doc.querySelectorAll('#viewer video.texture-only');
+    assert.equal(videos.length, 2, 'one hidden decoding <video> per layer');
+    assert.match(videos[0].src, /a\.mp4$/);
+    assert.match(videos[1].src, /b\.mp4$/);
+  } finally {
+    stopLoopViaBin(doc);
+  }
+});
+
+test('a track with nothing at the playhead is not given a layer at all', opts, async () => {
+  const { win, doc } = boot();
+  win.createKeyPreview = stubKeyer;
+  try {
+    // Only v1 gets a clip this time — v2 stays empty.
+    seedBin(win, doc, ['a.mp4']);
+    await flush();
+    doc.querySelector('#binList .bin-item').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+    doc.getElementById('btnSendV1').click();
+    await rafTick();
+
+    const canvases = doc.getElementById('previewStage').querySelectorAll('canvas');
+    assert.equal(canvases.length, 1, 'v2 contributes nothing to composite');
+  } finally {
+    stopLoopViaBin(doc);
+  }
+});
+
+test('a same-track overlap past the crossfade threshold draws both clips, split by dissolve progress', opts, async () => {
+  const { win, doc } = boot();
+  win.createKeyPreview = stubKeyer;
+  try {
+    // a.mp4 is 10s at startSec 0; dragged left 6s puts b.mp4 at startSec 4 —
+    // an overlap of [4, 10), a 6-second crossfade. t=5 is 1/6 of the way
+    // through it, deliberately not the midpoint — a bug that swapped which
+    // clip gets which opacity would be invisible at a symmetric 0.5/0.5.
+    await crossfadeOnV1(win, doc, 6);
+    setPlayhead(doc, 5);
+    await rafTick();
+
+    const canvases = [...doc.getElementById('previewStage').querySelectorAll('canvas')];
+    const videos = [...doc.querySelectorAll('#viewer video.texture-only')];
+    assert.equal(canvases.length, 2, 'outgoing and incoming both draw during the overlap');
+
+    // Pool entry i's canvas and its <video> are created together (see
+    // makePoolEntry), so the two lists line up index for index; matching by
+    // source file rather than assuming array order is what actually pins
+    // "a.mp4 fades out" against "b.mp4 fades in".
+    const outgoingIdx = videos.findIndex(v => /a\.mp4$/.test(v.src));
+    const incomingIdx = videos.findIndex(v => /b\.mp4$/.test(v.src));
+    assert.ok(outgoingIdx >= 0 && incomingIdx >= 0 && outgoingIdx !== incomingIdx);
+
+    const progress = (5 - 4) / 6; // 1/6
+    assert.ok(
+      Math.abs(Number(canvases[outgoingIdx].style.opacity) - (1 - progress)) < 1e-6,
+      'the outgoing clip (a.mp4) fades out as progress rises'
+    );
+    assert.ok(
+      Math.abs(Number(canvases[incomingIdx].style.opacity) - progress) < 1e-6,
+      'the incoming clip (b.mp4) fades in'
+    );
+
+    const badge = doc.getElementById('xfadeBadge');
+    assert.equal(badge.style.display, 'block', 'the preview names its own approximation');
+    assert.match(badge.textContent, /dissolve/i);
+  } finally {
+    stopLoopViaBin(doc);
+  }
+});
+
+test('outside the overlap the same two clips are back to one solo layer, fully opaque', opts, async () => {
+  const { win, doc } = boot();
+  win.createKeyPreview = stubKeyer;
+  try {
+    await crossfadeOnV1(win, doc, 6); // overlap is [4, 10)
+    setPlayhead(doc, 1); // inside the first clip, well before the overlap
+    await rafTick();
+
+    const canvases = doc.getElementById('previewStage').querySelectorAll('canvas');
+    assert.equal(canvases.length, 1, 'no crossfade here');
+    assert.equal(canvases[0].style.opacity, '1');
+    assert.equal(doc.getElementById('xfadeBadge').style.display, 'none');
+  } finally {
+    stopLoopViaBin(doc);
+  }
+});
+
+test('a clip too short to reach the crossfade threshold is not treated as one', opts, async () => {
+  const { win, doc } = boot();
+  win.createKeyPreview = stubKeyer;
+  try {
+    // Same drag, but only a hair over zero — below one frame at the
+    // project's default 30fps, so groupTrackRuns' own rule (mirrored in
+    // trackStateAt) says this is not a transition.
+    await crossfadeOnV1(win, doc, 0.01);
+    setPlayhead(doc, 9.995);
+    await rafTick();
+
+    const canvases = doc.getElementById('previewStage').querySelectorAll('canvas');
+    assert.equal(canvases.length, 1, 'too thin an overlap to be a crossfade');
+  } finally {
+    stopLoopViaBin(doc);
+  }
+});
+
+test('scrubbing across a track boundary swaps which clip the layer video plays', opts, async () => {
+  const { win, doc } = boot();
+  win.createKeyPreview = stubKeyer;
+  try {
+    // Two abutting clips on v1: a.mp4 [0,10), b.mp4 [10,20).
+    seedBin(win, doc, ['a.mp4', 'b.mp4']);
+    await flush();
+    const items = doc.querySelectorAll('#binList .bin-item');
+    items[0].dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+    doc.getElementById('btnSendV1').click();
+    items[1].dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+    doc.getElementById('btnSendV1').click();
+
+    setPlayhead(doc, 2);
+    await rafTick();
+    assert.match(poolVideo(doc).src, /a\.mp4$/, 'inside the first clip');
+
+    setPlayhead(doc, 12);
+    await rafTick();
+    assert.match(poolVideo(doc).src, /b\.mp4$/, 'crossed into the second clip');
+    assert.equal(poolVideo(doc).currentTime, 2, 'seeked to 2s into b.mp4\'s own source');
+  } finally {
+    stopLoopViaBin(doc);
+  }
+});
+
+test('a track that drops out of the composite pauses and hides its layer, rather than leaking it', opts, async () => {
+  const { win, doc } = boot();
+  win.createKeyPreview = stubKeyer;
+  fakeMediaPlayback(win);
+  try {
+    await crossfadeOnV1(win, doc, 6); // overlap [4, 10) needs two layers
+    setPlayhead(doc, 7);
+    doc.getElementById('btnPlay').click();
+    await rafTick();
+
+    let videos = [...doc.querySelectorAll('#viewer video.texture-only')];
+    assert.equal(videos.length, 2);
+    assert.equal(videos[1].paused, false, 'the second layer is actually playing, not just present');
+
+    doc.getElementById('btnPlay').click(); // pause the transport
+    setPlayhead(doc, 1); // and scrub back to before the overlap: one layer again
+    await rafTick();
+
+    // The pool itself is never shrunk (see layerPool's header comment), so
+    // the second entry's <canvas> and <video> still exist in the DOM — what
+    // has to change is that the canvas stops showing and the video stops
+    // playing, not that either is removed.
+    const canvases = [...doc.getElementById('previewStage').querySelectorAll('canvas')];
+    assert.equal(canvases.length, 2, 'the pool entry itself is kept, not torn down');
+    const visible = canvases.filter(c => c.style.display !== 'none');
+    assert.equal(visible.length, 1, 'but only one layer is actually shown now');
+
+    videos = [...doc.querySelectorAll('#viewer video.texture-only')];
+    assert.equal(videos.length, 2, 'the video pool entry is kept too');
+    assert.equal(videos[1].paused, true, 'but nothing is still playing on it');
+  } finally {
+    stopLoopViaBin(doc);
   }
 });
