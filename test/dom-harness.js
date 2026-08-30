@@ -23,7 +23,7 @@ const opts = JSDOM ? {} : { skip: 'jsdom not installed' };
 const SRC = path.join(__dirname, '..', 'src');
 
 /** A media item shaped like what main.js's ffprobe handler returns. */
-function fakeMedia(name, duration = 10) {
+function fakeMedia(name, duration = 10, colorMatrix = 'bt601') {
   return {
     path: `/tmp/${name}`,
     name,
@@ -32,7 +32,10 @@ function fakeMedia(name, duration = 10) {
     height: 1080,
     fps: 30,
     hasVideo: true,
-    hasAudio: true
+    hasAudio: true,
+    // main.js always resolves a name — 'bt601' here stands for the untagged
+    // case as much as a real BT.601 tag, matching matrixNameFromTags' default.
+    colorMatrix
   };
 }
 

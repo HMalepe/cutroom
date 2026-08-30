@@ -13,6 +13,7 @@ const fs = require('fs');
 const os = require('os');
 
 const builder = require('./shared/ffmpeg-builder');
+const { matrixNameFromTags } = require('./src/chroma-math');
 
 let win = null;
 let currentExport = null;
@@ -118,13 +119,20 @@ ipcMain.handle('media:pick', async (_e, kind) => {
  * ffprobe tells us duration, dimensions, and crucially whether an audio
  * stream exists. Guessing that from the extension is how you end up with a
  * silent export and no idea why.
+ *
+ * It also tells us the video stream's colour tags, which key-preview.js needs
+ * to reconstruct the same YUV ffmpeg would key against — see the "Frame RGB
+ * <-> YUV" section of chroma-math.js for why. `color_space` is ffprobe's name
+ * for matrix coefficients (the thing that actually matters here); primaries
+ * and transfer describe gamut and gamma, which chroma-math.js does not model,
+ * so they are not requested.
  */
 ipcMain.handle('media:probe', async (_e, filePath) => {
   if (!FFPROBE) throw new Error('ffprobe not found. Install ffmpeg first.');
   const args = [
     '-v', 'error',
     '-show_entries', 'format=duration',
-    '-show_entries', 'stream=codec_type,width,height,r_frame_rate',
+    '-show_entries', 'stream=codec_type,width,height,r_frame_rate,color_space,color_primaries,color_range',
     '-of', 'json',
     filePath
   ];
@@ -153,7 +161,12 @@ ipcMain.handle('media:probe', async (_e, filePath) => {
     height: v?.height || 0,
     fps,
     hasVideo: Boolean(v),
-    hasAudio: Boolean(a)
+    hasAudio: Boolean(a),
+    colorMatrix: matrixNameFromTags({
+      colorSpace: v?.color_space,
+      colorPrimaries: v?.color_primaries,
+      colorRange: v?.color_range
+    })
   };
 });
 
