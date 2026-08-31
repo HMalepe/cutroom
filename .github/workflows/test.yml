@@ -102,6 +102,19 @@ jobs:
         env:
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
 
+      # `npm ci` alone does NOT fetch the ~100MB Electron binary: the
+      # `electron` package ships no postinstall script, so nothing downloads
+      # it until something actually requires the package (which is what
+      # `npm start` does in normal use). test/electron/smoke.test.js
+      # deliberately does not trigger that itself — it reads path.txt/dist/
+      # directly rather than through require('electron'), specifically so a
+      # local `npm run test:electron` with no binary present skips cleanly
+      # instead of surprising a developer with a big download. Which means
+      # CI has to be the one to trigger it, explicitly, or every test here
+      # skips forever and this job passes green without ever running.
+      - name: Download Electron
+        run: node node_modules/electron/install.js
+
       # ubuntu-latest has no display server by default. xvfb-run over a
       # maintained action: it is one apt package and one command this repo
       # can read and reason about directly, rather than another third-party
