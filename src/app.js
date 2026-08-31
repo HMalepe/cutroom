@@ -696,6 +696,15 @@ function makePoolEntry(idx) {
   video.muted = true;
   video.playsInline = true;
   video.className = 'texture-only';
+  // A fresh src has no decoded frame yet, so the very first draw() attempt
+  // for a clip the pane has never shown before can land before the browser
+  // has metadata (see draw()'s own vw/vh guard). Nothing else asks for a
+  // redraw purely because time passed while paused -- scrubbing within the
+  // SAME clip never changes layerSignature, so previewDirty stays false and
+  // drawComposited() is never called again on its own. Left alone, the pane
+  // can come up blank and stay blank. loadeddata is the fix: once the video
+  // actually has a frame to hand the shader, ask for one more draw.
+  video.addEventListener('loadeddata', requestPreviewFrame);
   $('viewer').appendChild(video);
   return { canvas, video, keyer: null, keyerTried: false, currentSrc: null };
 }

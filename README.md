@@ -589,6 +589,42 @@ way `DRIFT_THRESHOLD` assumes, or that four concurrent WebGL contexts behave
 inside a real browser's limits — those are the claims this PR states rather
 than demonstrates.
 
+Since none of that ran in a real browser here, it was run in one separately:
+Electron itself under Xvfb, with `--use-angle=swiftshader` for a software
+WebGL context, driven by Playwright. That caught a real bug jsdom cannot see.
+`draw()` bails when a `<video>`'s `videoWidth`/`videoHeight` are still 0 —
+correct, a frame with no dimensions has nothing to upload — but a fresh
+layer's video does not always have them yet at the instant its first draw is
+attempted, and nothing asked for a second one. Scrubbing *within* the same
+clip never changes `layerSignature`, so the RAF loop's own redraw gate
+(`previewDirty`) has no reason to open again on its own: the layer's canvas
+was left at the browser's default 300×150 backing store, blank, until the
+playhead happened to cross into a genuinely different clip or crossfade. A
+project could open with its own first frame never drawn. The fix is one
+listener in `makePoolEntry` — `video.addEventListener('loadeddata',
+requestPreviewFrame)` — so the moment a layer's video actually has a frame to
+give the shader, the pane asks for one more. Confirmed by hand in the same
+real-Electron harness afterward: a fresh two-clip project (a full-frame base
+layer plus a scaled, repositioned second layer, deliberately picked to prove
+compositing and not just single-clip drawing) now paints correctly on the
+first attempt, and a same-track crossfade's dissolve blends the right two
+colours in the right proportion. `test/key-preview.test.js` pins the fix
+itself — a stub keyer that fails until told otherwise, proving the pane asks
+again once `loadeddata` fires rather than staying stuck — since that much
+does not need a real decoder to prove, only a `<video>` that can dispatch the
+event.
+
+One thing surfaced by the same harness and deliberately **not** treated as a
+bug: the very first successful `draw()` on a brand-new WebGL context
+occasionally painted solid black under `swiftshader` specifically — correct
+canvas size, correct video dimensions, `gl.getError()` clean, and an
+immediate second call with byte-identical inputs painted correctly. Nothing
+in this codebase's control flow distinguishes a first draw from a second one,
+so a bug here would have to live in application logic that does not exist;
+this reads as a software-rasteriser warm-up artefact of the test environment,
+not the app, and is noted rather than "fixed" because there is nothing in
+`key-preview.js` to change that would not be pure superstition.
+
 ### Filter order matters
 
 Inside `buildVideoClipChain` every step runs in **clip-local time** — zero is

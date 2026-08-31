@@ -539,6 +539,39 @@ test('changing speed alone updates playbackRate without moving the layer video',
   }
 });
 
+test('a layer whose video was not ready for the first draw gets a second one once it loads', opts, async () => {
+  // draw() bails when videoWidth/videoHeight are still 0 — real code, not the
+  // stub, does this (see key-preview.js's draw()) — and jsdom's own <video>
+  // never gains real dimensions on its own, so this is the one place the stub
+  // has to mimic a real not-ready decoder rather than always succeeding.
+  // Scrubbing within the SAME clip never changes layerSignature, so nothing
+  // else in app.js re-asks for a frame purely because the video finished
+  // loading — makePoolEntry's own 'loadeddata' listener is what has to.
+  const { win, doc } = boot();
+  let ready = false;
+  let drawCount = 0;
+  win.createKeyPreview = () => ({
+    draw: () => { drawCount++; return ready; },
+    resize: () => ({ width: 1920, height: 1080 }),
+    destroy: () => {},
+    isLost: () => false
+  });
+  try {
+    await selectAClip(win, doc);
+    await rafTick();
+    const before = drawCount;
+    assert.ok(before > 0, 'drew at least once already, unsuccessfully');
+
+    ready = true;
+    poolVideo(doc).dispatchEvent(new win.Event('loadeddata'));
+    await rafTick();
+
+    assert.ok(drawCount > before, 'loadeddata asked for another frame instead of leaving the pane stuck');
+  } finally {
+    stopLoop(doc);
+  }
+});
+
 /*
  * jsdom's own HTMLMediaElement.play()/pause() are stubs that log a "not
  * implemented" error and never touch .paused — real enough for every test
