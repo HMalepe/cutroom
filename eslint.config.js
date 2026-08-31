@@ -57,7 +57,8 @@ module.exports = [
         createKeyPreview: 'readonly',
         stepClipLoop: 'readonly',
         clampPlaybackRate: 'readonly',
-        TimelinePreview: 'readonly'
+        TimelinePreview: 'readonly',
+        TimelineSnapping: 'readonly'
       }
     },
     rules: {

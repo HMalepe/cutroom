@@ -114,6 +114,44 @@ function snap(sec) {
   return Math.round(sec / b) * b;
 }
 
+// Edge snapping — always on, unlike beat-snap, because "line these two clips
+// up exactly" is not an optional editing style the way a BPM grid is. The
+// threshold lives in screen pixels and is converted at call time rather than
+// stored in seconds, because pxPerSec changes with zoom: a fixed-seconds
+// threshold would reach clear across the visible timeline when zoomed out
+// and never fire at all zoomed in.
+const SNAP_PX = 8;
+const snapThresholdSec = () => SNAP_PX / state.pxPerSec;
+
+/**
+ * Every position worth lining a dragged edge up with, other than the clip
+ * being dragged itself: 0, the playhead, and every other clip's start and
+ * end on every track — not just the one the dragged clip lives on, since
+ * snapping a keyed clip on Video 2 to a cut on Video 1 is ordinary.
+ */
+function snapCandidates(excludeClipId) {
+  const candidates = TimelineSnapping.edgeCandidates(state.project.tracks, excludeClipId);
+  candidates.push(0, state.playhead);
+  return candidates;
+}
+
+/** Single-edge snap — the left/right trim case, where only one point on the clip moves. */
+function snapEdge(pos, excludeClipId) {
+  const candidates = snapCandidates(excludeClipId);
+  if (state.snapBeats) candidates.push(Math.round(pos / beatSec()) * beatSec());
+  return TimelineSnapping.snapTarget(candidates, pos, snapThresholdSec());
+}
+
+/** Whole-clip move — both edges are candidates for snapping; see snapMoveStart's own comment. */
+function snapMove(rawStart, durationSec, excludeClipId) {
+  const candidates = snapCandidates(excludeClipId);
+  if (state.snapBeats) {
+    const b = beatSec();
+    candidates.push(Math.round(rawStart / b) * b, Math.round((rawStart + durationSec) / b) * b);
+  }
+  return TimelineSnapping.snapMoveStart(rawStart, durationSec, candidates, snapThresholdSec());
+}
+
 // ==========================================================================
 // Data model
 // ==========================================================================
@@ -1201,7 +1239,10 @@ $('tlScroll').addEventListener('pointerdown', (e) => {
   // now drives the preview — and hands the pane back from a bin item, if one
   // was showing, to the timeline.
   if (!clipEl) {
-    state.playhead = Math.max(0, snap(x / state.pxPerSec));
+    // Clamped above as well as below: clicking past the last clip used to
+    // leave the playhead wherever the ruler was clicked, arbitrarily far
+    // past anything actually on the timeline.
+    state.playhead = clamp(snap(x / state.pxPerSec), 0, projectDuration());
     binPreviewPath = null;
     requestPreviewFrame();
     renderTimeline();
@@ -1246,20 +1287,34 @@ $('tlScroll').addEventListener('pointermove', (e) => {
   if (!clip) return;
 
   if (drag.mode === 'move') {
-    clip.startSec = Math.max(0, snap(drag.origStart + dSec));
+    const rawStart = Math.max(0, drag.origStart + dSec);
+    clip.startSec = Math.max(0, snapMove(rawStart, clipDur(clip), clip.id));
   } else if (drag.mode === 'left') {
     // Dragging the left handle trims into the source AND moves the clip, so
     // the frame under the cursor stays put. Source time and timeline time
-    // move together here — this is the one place they are coupled.
+    // move together here — this is the one place they are coupled, which is
+    // why the snap runs on the timeline-space rawStart below rather than on
+    // newIn directly: newIn is source seconds, and the other clips' edges
+    // this is snapping against are timeline seconds. The two only agree when
+    // speed is 1.
     const speed = clip.speed || 1;
-    const newIn = clamp(drag.origIn + dSec * speed, 0, clip.outSec - 0.05);
-    const delta = (newIn - drag.origIn) / speed;
-    clip.inSec = newIn;
-    clip.startSec = Math.max(0, drag.origStart + delta);
+    const rawIn = clamp(drag.origIn + dSec * speed, 0, clip.outSec - 0.05);
+    const rawStart = Math.max(0, drag.origStart + (rawIn - drag.origIn) / speed);
+    const snappedStart = snapEdge(rawStart, clip.id);
+    const delta = snappedStart - drag.origStart;
+    clip.inSec = clamp(drag.origIn + delta * speed, 0, clip.outSec - 0.05);
+    clip.startSec = Math.max(0, snappedStart);
   } else if (drag.mode === 'right') {
+    // The right handle's visible edge is the clip's timeline END, not
+    // outSec itself — same speed-coupling reason as the left handle above,
+    // mirrored: convert to timeline space, snap, convert back.
     const speed = clip.speed || 1;
     const maxOut = clip.sourceDuration || drag.origOut;
-    clip.outSec = clamp(drag.origOut + dSec * speed, clip.inSec + 0.05, maxOut);
+    const rawOut = clamp(drag.origOut + dSec * speed, clip.inSec + 0.05, maxOut);
+    const rawEnd = clip.startSec + (rawOut - clip.inSec) / speed;
+    const snappedEnd = snapEdge(rawEnd, clip.id);
+    const newOut = clip.inSec + (snappedEnd - clip.startSec) * speed;
+    clip.outSec = clamp(newOut, clip.inSec + 0.05, maxOut);
   }
   renderTimeline();
 });
@@ -2162,7 +2217,9 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); deleteSelected(); }
   if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
     const step = (e.shiftKey ? 1 : 1 / state.project.fps) * (e.key === 'ArrowLeft' ? -1 : 1);
-    state.playhead = Math.max(0, state.playhead + step);
+    // Clamped above too — holding the key used to walk the playhead
+    // arbitrarily far past the end of everything on the timeline.
+    state.playhead = clamp(state.playhead + step, 0, projectDuration());
     binPreviewPath = null;
     requestPreviewFrame();
     renderTimeline();

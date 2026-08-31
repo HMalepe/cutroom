@@ -45,7 +45,7 @@ npm test
 
 `node --test`, no framework. Three kinds: unit tests over the pure modules
 (`ffmpeg-builder`, `history`, `templates`, `chroma-math`, `timeline-preview`,
-`save-state`, `dirty-state`), integration tests
+`timeline-snapping`, `save-state`, `dirty-state`), integration tests
 that load the real `index.html` and `app.js` into jsdom and drive actual
 buttons and pointer events, and render tests that put the built ffmpeg command
 through a real ffmpeg and inspect the pixels. The second kind is what stops
@@ -74,6 +74,21 @@ alongside the tests.
 
 **Timeline.** Three tracks: two video, one audio. Drag clips to move, drag the
 edges to trim, drag between lanes to reassign. Video 2 composites over Video 1.
+Moving or trimming a clip snaps the edge under the drag to nearby edges of
+*other* clips (any track — keying a clip on Video 2 to a cut on Video 1 is
+ordinary), the playhead, and zero. Unlike the timeline's own beat-snap
+checkbox (grid lines at the project's BPM, for the beat-based templates
+below), this is not optional — it is always on, the way every mainstream NLE
+does it, because lining two clips up exactly is not an editing style anyone
+would want to turn off. With beat-snap also on, both kinds of target are
+candidates and whichever is closer wins. The threshold is a fixed number of
+screen pixels rather than seconds, converted at the current zoom: a
+fixed-seconds threshold would reach across the whole visible timeline zoomed
+out and never fire zoomed in. This is also what makes the
+crossfade rule below trustworthy — missing a butt join by a couple of pixels
+used to read as an overlap, and silently became a transition nobody asked
+for; see `src/timeline-snapping.js` for the decision logic and its own
+header for why it is a separate, DOM-free module.
 
 **Split and trim.** Playhead + `S` splits. `I` and `O` set in and out points.
 Every clip carries source-time and timeline-time separately, so trimming never
@@ -175,7 +190,7 @@ feature people keep and one they turn off.
 | `Space` | play / pause preview |
 | `S` | split at playhead |
 | `I` / `O` | set in / set out |
-| `←` `→` | step one frame (hold Shift for one second) |
+| `←` `→` | step one frame (hold Shift for one second), clamped to the project's length |
 | `Delete` | remove selected clip |
 | `Ctrl/Cmd Z` | undo |
 | `Ctrl/Cmd Shift Z` | redo |
@@ -222,6 +237,11 @@ src/
                      track at a given timeline time, and how the timeline
                      clock advances. Pure, no DOM — app.js is the layer-pool
                      lifecycle and the <video>/<canvas> wiring on top of it.
+  timeline-snapping.js  Where a dragged clip edge lands: candidate positions
+                     (other clips' edges, the playhead, zero) and the
+                     closest-within-threshold pick. Pure, no DOM — app.js
+                     converts pixels to seconds and calls it from the
+                     pointermove handlers.
   templates.js       Edit rhythms. Pure data plus one function.
   index.html         Structure.
   styles.css         Tokens at the top.
