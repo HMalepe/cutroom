@@ -58,9 +58,41 @@ values are either derived by hand from the ffmpeg filter source or captured
 from a real ffmpeg run — never from what the code happened to return — because
 a preview that quietly disagrees with the export is worse than no preview.
 
-Nothing launches Electron. The render tests skip themselves when ffmpeg is not
-installed, so the suite still runs in a couple of seconds without it — which is
-how CI runs it, on Node 22.12, 22 and 24.
+`npm test` itself launches nothing but Node and jsdom. The render tests skip
+themselves when ffmpeg is not installed, so the suite still runs in a couple
+of seconds without it — which is how CI runs it, on Node 22.12, 22 and 24.
+
+```bash
+npm run test:electron
+```
+
+A fourth kind, kept out of `npm test` on purpose and living in `test/electron/`
+instead of alongside the rest: it launches the real Electron binary and drives
+it with Playwright's `_electron`. jsdom can load `index.html` and `app.js`
+well enough to click things, but it has no `Menu`, no `dialog`, no real
+`win.close()` semantics and no real filesystem writes from a real main
+process — and four separate PR reviews on this repo only turned up real bugs
+in exactly those places (a stripped Edit menu that would have killed
+clipboard support, close-guard ordering, an autosave race) by launching
+Electron under Xvfb by hand. This tier is that manual check made permanent.
+
+It is deliberately narrow — a smoke tier, not a repeat of full manual QA.
+Covered: the app boots without throwing, the application menu is installed
+with the standard Edit roles (`cut`/`copy`/`paste`/`selectAll`) rather than a
+silently-stripped one, the close guard actually blocks a dirty window and
+Cancel genuinely leaves it open, a clean project's close does not prompt, and
+autosave writes a real, valid project file to `userData`. Not covered, on
+purpose: real WebGL/compositing pixel output and real pointer-drag snapping —
+both need a lot more than this tier's flat assertions to verify honestly (see
+"How the composited preview works" above for how the WebGL side was last
+checked, by hand), and are natural next candidates for their own tier rather
+than something to fold in here.
+
+It skips itself, the same way the render tests skip without ffmpeg, whenever
+the Electron binary has not been downloaded (CI's fast job above sets
+`ELECTRON_SKIP_BINARY_DOWNLOAD` for exactly the reason this paragraph used to
+give) or there is no display to render into — never fails for either. CI runs
+it in its own job, under Xvfb, separately from and not blocking the fast job.
 
 ```bash
 npm run lint
@@ -247,6 +279,9 @@ src/
   styles.css         Tokens at the top.
 test/
   *.test.js          node --test, no framework. `npm test`.
+  electron/*.test.js  Drives a real Electron under Playwright's `_electron`.
+                     Separate from `npm test` on purpose — `npm run
+                     test:electron`, its own CI job. See "Tests" above.
 ```
 
 ### The data model
@@ -374,11 +409,15 @@ miss the second and the window can never be shut at all. `before-quit` records
 that a Cmd-Q is in flight, because otherwise the re-close would close the
 window and leave the app running on macOS: a quit that quietly became a close.
 
-Everything in that paragraph is Electron behaviour, and nothing in this repo
-launches Electron. So the *decisions* were pushed into `shared/save-state.js` —
-which button index means discard, whether Save needs a dialog, whether an
-autosave is worth offering — where they are pure and tested, the same split
-`project-schema.js` was extracted for. What is left in `main.js` is the calls.
+Everything in that paragraph is Electron behaviour, which `npm test` cannot
+exercise — jsdom has no `close` event or real `dialog`. So the *decisions*
+were pushed into `shared/save-state.js` — which button index means discard,
+whether Save needs a dialog, whether an autosave is worth offering — where
+they are pure and tested, the same split `project-schema.js` was extracted
+for. What is left in `main.js` is the calls. `test/electron/` now drives this
+guard end to end under a real Electron — dirty blocks and Cancel really
+cancels, clean does not prompt — but only that behaviour, not a substitute
+for `save-state.js`'s own pure tests of the decisions themselves.
 
 ### Autosave, and not being annoying
 

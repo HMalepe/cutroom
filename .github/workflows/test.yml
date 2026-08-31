@@ -52,3 +52,63 @@ jobs:
 
       - name: Test
         run: npm test
+
+  # Everything above is pure Node or jsdom, on purpose: it is what lets that
+  # job run in a couple of seconds with no real browser. But jsdom cannot
+  # fake Menu.setApplicationMenu, dialog.showMessageBox, real win.close()
+  # semantics or a real filesystem write from a real main process — the last
+  # four PRs on this repo only turned up real bugs in those by launching the
+  # actual Electron binary under Xvfb by hand. This job is that check made
+  # permanent, kept in its own job rather than folded into the matrix above
+  # so a flake here can never make the fast, deterministic suite read red.
+  electron-smoke:
+    runs-on: ubuntu-latest
+
+    # Xvfb plus a real downloaded Electron binary can be flaky in ways the
+    # pure/jsdom job above structurally cannot be, and the only place this
+    # job has actually been run end-to-end is a local container under Xvfb —
+    # not a real GitHub Actions runner, whose exact Electron/Xvfb interaction
+    # could not be verified before this landed. Non-blocking until it has
+    # proven itself reliable here; flip this once it has a track record.
+    continue-on-error: true
+
+    strategy:
+      matrix:
+        # Electron's own window/menu/dialog/filesystem behaviour is not
+        # Node-version sensitive the way the fast job's require(esm) floor
+        # test is, so this runs on one version rather than that job's
+        # three-way matrix — the floor from package.json's engines field,
+        # since that is the one version everyone running this app is
+        # promised to have.
+        node: ['22.12.0']
+
+    name: electron smoke (node ${{ matrix.node }})
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # The opposite of the fast job's Install step: this tier's whole point
+      # is a real Electron binary, so the download is not skipped here.
+      # Playwright's own bundled browsers are skipped regardless —
+      # _electron.launch drives this project's own Electron directly and
+      # never touches a Playwright-managed Chromium.
+      - name: Install
+        run: npm ci
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+
+      # ubuntu-latest has no display server by default. xvfb-run over a
+      # maintained action: it is one apt package and one command this repo
+      # can read and reason about directly, rather than another third-party
+      # action in the trust chain, and every step here already does the same
+      # kind of plain, inspectable thing.
+      - name: Install Xvfb
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
+      - name: Electron smoke tests
+        run: xvfb-run -a npm run test:electron
