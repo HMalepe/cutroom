@@ -271,12 +271,49 @@ button { cursor: pointer; }
   pointer-events: none;
 }
 
+/* The composited stage. #keyCanvas (the bottom-most video-track layer) is
+   sized normally and its rendered box becomes the stage's own box; every
+   other layer canvas app.js adds is stretched to fill that box exactly, so
+   stacking order alone gives Video 2 over Video 1, and two canvases sharing
+   a track during a crossfade sit pixel-for-pixel on top of each other for
+   their opacities to dissolve between. */
+.preview-stage {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  max-height: 100%;
+}
 .key-canvas {
   max-width: 100%;
   max-height: 100%;
   /* No background: transparent has to read as transparent, not as black. */
   border: 1px solid var(--line);
   cursor: pointer;
+}
+.preview-stage .key-canvas.layer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  border: 0;
+}
+/* The incoming half of a same-track crossfade, and any transition this
+   preview cannot draw the real curve for. See timeline-preview.js and the
+   README's Preview section for why a plain dissolve stands in for it. */
+.xfade-badge {
+  position: absolute;
+  left: 6px;
+  bottom: 6px;
+  padding: 2px 6px;
+  font-size: 10px;
+  font-family: var(--mono);
+  color: var(--ink-dim);
+  background: rgba(10, 12, 16, 0.72);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  pointer-events: none;
 }
 
 .scrub {

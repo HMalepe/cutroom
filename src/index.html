@@ -71,15 +71,28 @@
     <div class="col-preview">
       <div class="viewer" id="viewer">
         <div class="viewer-empty" id="viewerEmpty">
-          The preview shows the selected clip keyed, colour-corrected, scaled,
-          positioned, trimmed and sped up. It does not show captions — use
-          <strong>Test 3s</strong> for those.
+          The preview shows the timeline itself: whatever is under the
+          playhead, keyed, colour-corrected, scaled, positioned, trimmed and
+          sped up, Video 2 composited over Video 1. It does not show
+          captions — use <strong>Test 3s</strong> for those.
         </div>
         <video id="video" controls style="display:none"></video>
-        <!-- The keyed view. Hidden until a clip is selected and WebGL turns
-             out to exist; without it the plain <video> above is what shows. -->
-        <canvas id="keyCanvas" class="key-canvas" style="display:none"
-                title="Live preview of the key, colour and framing"></canvas>
+        <!-- The composited view. #keyCanvas is the bottom-most layer and is
+             always present in the markup so app.js has something to ask for
+             a WebGL context on first use; every other layer (a second video
+             track, or the second half of a same-track crossfade) is a
+             canvas app.js creates and destroys inside #previewStage as the
+             playhead crosses clip boundaries. Hidden, and #previewStage left
+             empty, until a clip is at the playhead and WebGL turns out to
+             exist; without it the plain <video> above is what shows. -->
+        <div class="preview-stage" id="previewStage" style="display:none">
+          <canvas id="keyCanvas" class="key-canvas" style="display:none"
+                  title="Live preview of the key, colour and framing"></canvas>
+          <!-- Named because the dissolve above it is a stand-in for whatever
+               xfade transition the export actually uses — see the Preview
+               section of the README. -->
+          <div class="xfade-badge" id="xfadeBadge" style="display:none"></div>
+        </div>
       </div>
       <div class="transport">
         <button class="btn btn-sm" id="btnPlay">Play</button>
@@ -228,6 +241,7 @@
 
 <script src="chroma-math.js"></script>
 <script src="key-preview.js"></script>
+<script src="timeline-preview.js"></script>
 <script src="history.js"></script>
 <script src="dirty-state.js"></script>
 <script src="templates.js"></script>
