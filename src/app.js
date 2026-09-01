@@ -682,21 +682,28 @@ function renderBin() {
 }
 
 /**
- * One "→ Video N" button per current video track, plus the fixed audio one.
- * The video half of this used to be two static buttons in index.html
- * (`btnSendV1`/`btnSendV2`) wired to fixed ids — that stopped being possible
- * the moment the track list could grow or shrink, so it is rebuilt here on
- * every renderAll() instead, the same way renderHeads() already rebuilds the
- * per-track mute/hide row. Ids follow the same `btnSend` + capitalised track
- * id shape the old static markup used (`v1` -> `btnSendV1`), so a default
- * two-video-track project hands back exactly the ids it always did and
- * nothing that already looks a button up by id has to change.
+ * One "→ Video N" / "→ Audio N" button per current track. This used to be
+ * two static video buttons in index.html (`btnSendV1`/`btnSendV2`) plus one
+ * fixed audio button — that stopped being possible the moment either track
+ * list could grow or shrink, so it is rebuilt here on every renderAll()
+ * instead, the same way renderHeads() already rebuilds the per-track
+ * mute/hide row. Ids follow the same `btnSend` + capitalised track id shape
+ * the old static markup used (`v1` -> `btnSendV1`), so a default project
+ * hands back exactly the ids it always did and nothing that already looks a
+ * button up by id has to change.
+ *
+ * A single loop over `state.project.tracks`, with no per-kind branching,
+ * covers both track kinds and their ordering for free: the array already
+ * holds every video track ahead of every audio track (new video tracks are
+ * spliced in before the first audio track; new audio tracks are appended
+ * after everything, see addAudioTrack()), so walking it in order reproduces
+ * "video buttons, then audio buttons" without this function having to know
+ * that grouping exists.
  */
 function renderSendButtons() {
   const box = $('sendButtons');
   box.innerHTML = '';
   for (const track of state.project.tracks) {
-    if (track.kind !== 'video') continue;
     const btn = document.createElement('button');
     btn.className = 'btn btn-sm';
     btn.id = 'btnSend' + track.id.charAt(0).toUpperCase() + track.id.slice(1);
@@ -704,12 +711,6 @@ function renderSendButtons() {
     btn.onclick = () => sendToTrack(track.id);
     box.appendChild(btn);
   }
-  const audio = document.createElement('button');
-  audio.className = 'btn btn-sm';
-  audio.id = 'btnSendA1';
-  audio.textContent = '→ Audio 1';
-  audio.onclick = () => sendToTrack('a1');
-  box.appendChild(audio);
 }
 
 function sendToTrack(trackId) {
@@ -1373,22 +1374,28 @@ function togglePlay() {
 // ==========================================================================
 
 /**
- * The number to give a new video track's id (`v`N) and name (`Video `N).
- * Scanning every existing video track's id and name for the highest N
+ * The number to give a new track's id (id prefix + N) and name (label + N),
+ * e.g. `nextTrackNumber(tracks, 'video')` -> the N for `v`N / `Video `N.
+ * Scanning every existing track of that kind's id and name for the highest N
  * already in use, rather than counting tracks, means a number already
  * removed from the project this session is never handed out again while a
  * higher one is still on screen — counting would let a freshly-added track
  * collide with one still visible if an earlier, higher-numbered track had
- * been removed in between, and two tracks both reading "Video 3" in the
- * head list is a worse bug than a gap in the numbering.
+ * been removed in between, and two tracks both reading "Video 3" (or "Audio
+ * 2") in the head list is a worse bug than a gap in the numbering. Shared
+ * between addVideoTrack and addAudioTrack rather than copied, since the two
+ * only ever differed in the id prefix (`v`/`a`) and the capitalised label
+ * (`Video`/`Audio`) — both derivable from `kind` itself.
  */
-function nextVideoTrackNumber(tracks) {
+function nextTrackNumber(tracks, kind) {
+  const prefix = kind.charAt(0);
+  const label = kind.charAt(0).toUpperCase() + kind.slice(1);
   let max = 0;
   for (const t of tracks) {
-    if (t.kind !== 'video') continue;
-    const idMatch = typeof t.id === 'string' && t.id.match(/^v(\d+)$/);
+    if (t.kind !== kind) continue;
+    const idMatch = typeof t.id === 'string' && t.id.match(new RegExp(`^${prefix}(\\d+)$`));
     if (idMatch) max = Math.max(max, Number(idMatch[1]));
-    const nameMatch = typeof t.name === 'string' && t.name.match(/^Video (\d+)$/);
+    const nameMatch = typeof t.name === 'string' && t.name.match(new RegExp(`^${label} (\\d+)$`));
     if (nameMatch) max = Math.max(max, Number(nameMatch[1]));
   }
   return max + 1;
@@ -1400,13 +1407,13 @@ function nextVideoTrackNumber(tracks) {
  * further decision, because it composites over everything already there the
  * same way Video 2 already composited over Video 1. Inserted right after the
  * last video track rather than at the very end of the array, so it lands
- * above the other video tracks without jumping past the audio track in the
- * head list.
+ * above the other video tracks without jumping past the audio track(s) in
+ * the head list.
  */
 function addVideoTrack() {
   edit('add video track', () => {
     const tracks = state.project.tracks;
-    const n = nextVideoTrackNumber(tracks);
+    const n = nextTrackNumber(tracks, 'video');
     let insertAt = tracks.length;
     for (let i = tracks.length - 1; i >= 0; i--) {
       if (tracks[i].kind === 'video') { insertAt = i + 1; break; }
@@ -1446,6 +1453,51 @@ function removeVideoTrack(trackId) {
   renderAll();
 }
 
+/**
+ * Add an audio track, appended at the very end of the track list. Video
+ * tracks need a placement decision because their order IS z-order — a new
+ * one has to land above everything else to composite correctly. Audio
+ * tracks have no such stakes: `amix` sums its inputs, so two audio tracks
+ * mixing into the export sound identical whichever order they sit in. The
+ * end of the array is simply the placement that needs no decision either,
+ * and it also keeps every audio track grouped together, below every video
+ * track, in the head list and the send-button row.
+ */
+function addAudioTrack() {
+  edit('add audio track', () => {
+    const tracks = state.project.tracks;
+    const n = nextTrackNumber(tracks, 'audio');
+    tracks.push({ id: `a${n}`, kind: 'audio', name: `Audio ${n}`, clips: [] });
+  });
+  renderAll();
+}
+
+/**
+ * Remove an audio track. Refused, with a toast, while it still has clips —
+ * the same reasoning removeVideoTrack gives. Unlike video, there is no floor
+ * at one remaining audio track: a video clip's own synced sound rides on
+ * `clip.hasAudio` on its *video* track regardless of whether any audio-kind
+ * track exists, and buildExportCommand's audio mix walks every track in the
+ * project rather than requiring one of kind `audio` to be present — so a
+ * project with zero audio tracks is not silent, and is not missing anything
+ * the preview or export needs the way a project with zero video tracks
+ * would be. It just has nowhere (yet) to put a standalone music bed or
+ * voiceover that isn't attached to a clip's own video — and "+ Audio track"
+ * is always there to add one back.
+ */
+function removeAudioTrack(trackId) {
+  const track = state.project.tracks.find(t => t.id === trackId && t.kind === 'audio');
+  if (!track) return;
+  if (track.clips.length) {
+    toast(`${track.name} has clips on it — remove them first.`, 'warn');
+    return;
+  }
+  edit('remove audio track', () => {
+    state.project.tracks = state.project.tracks.filter(t => t.id !== trackId);
+  });
+  renderAll();
+}
+
 function renderHeads() {
   const heads = $('tlHeads');
   heads.innerHTML = '<div class="tl-heads-pad"></div>';
@@ -1473,15 +1525,20 @@ function renderHeads() {
     hide.onclick = () => { edit('hide track', () => { track.hidden = !track.hidden; }); renderAll(); };
 
     btns.append(mute);
-    if (track.kind === 'video') {
-      btns.append(hide);
-      const remove = document.createElement('button');
-      remove.className = 'chip';
-      remove.textContent = '✕';
-      remove.title = 'Remove this video track (only while it has no clips)';
-      remove.onclick = () => removeVideoTrack(track.id);
-      btns.append(remove);
-    }
+    if (track.kind === 'video') btns.append(hide);
+
+    // Both track kinds get a remove chip now that both can be plural; only
+    // the refusal rule underneath differs (removeAudioTrack has no
+    // last-track floor — see its own comment).
+    const remove = document.createElement('button');
+    remove.className = 'chip';
+    remove.textContent = '✕';
+    remove.title = track.kind === 'video'
+      ? 'Remove this video track (only while it has no clips)'
+      : 'Remove this audio track (only while it has no clips)';
+    remove.onclick = () => (track.kind === 'video' ? removeVideoTrack(track.id) : removeAudioTrack(track.id));
+    btns.append(remove);
+
     el.append(name, btns);
     heads.appendChild(el);
   }
@@ -2824,6 +2881,7 @@ $('btnDeleteClip').onclick = () => deleteSelected();
 $('btnDuplicateClip').onclick = duplicateSelected;
 $('btnCloseGaps').onclick = closeGaps;
 $('btnAddVideoTrack').onclick = addVideoTrack;
+$('btnAddAudioTrack').onclick = addAudioTrack;
 
 // Zoom
 $('btnZoomIn').onclick = () => { state.pxPerSec = clamp(state.pxPerSec * 1.4, 4, 600); renderTimeline(); };

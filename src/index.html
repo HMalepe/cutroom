@@ -59,10 +59,9 @@
           Select clips in the bin, then send them to a track. Order of selection
           is the order they land.
         </div>
-        <!-- One "-> Video N" button per current video track, plus the fixed
-             audio one, is data-driven (app.js's renderSendButtons) rather
-             than static markup here, since the video track list can grow
-             and shrink. -->
+        <!-- One "-> Video N" / "-> Audio N" button per current track is
+             data-driven (app.js's renderSendButtons) rather than static
+             markup here, since either track list can grow and shrink. -->
         <div style="margin-top:8px; display:flex; gap:5px; flex-wrap:wrap;" id="sendButtons"></div>
       </div>
     </div>
@@ -202,6 +201,7 @@
       <span style="width:1px; height:16px; background:var(--line);"></span>
 
       <button class="btn btn-sm btn-ghost" id="btnAddVideoTrack" title="Add another video track, composited above the ones already there">+ Video track</button>
+      <button class="btn btn-sm btn-ghost" id="btnAddAudioTrack" title="Add another audio track for a standalone music bed or voiceover">+ Audio track</button>
       <button class="btn btn-sm btn-ghost" id="btnCloseGaps" title="Push every clip on the selected track flush against the one before it">Close gaps</button>
       <button class="btn btn-sm btn-ghost" id="btnDuplicateClip" title="Duplicate the selected clip(s) right after themselves (Ctrl/Cmd+D)">Duplicate</button>
       <button class="btn btn-sm btn-ghost btn-danger" id="btnDeleteClip" title="Remove the selected clip(s), leaving a gap. Shift+Delete closes it.">Delete clip</button>
