@@ -106,16 +106,22 @@ alongside the tests.
 ## What it does
 
 **Timeline.** Two video tracks and one audio track to start. **+ Video
-track**, in the timeline's own header, adds more: a new track always lands
-directly above the ones already there, so it composites over everything
-below it the same way Video 2 already composited over Video 1. Each video
-track head carries a **✕** to remove it again — refused, with a toast,
-while the track still has clips on it, and refused once more for a
-project's last remaining video track, since a project with none has
+track** / **+ Audio track**, in the timeline's own header, add more of
+either: a new video track always lands directly above the ones already
+there, so it composites over everything below it the same way Video 2
+already composited over Video 1; a new audio track is simply appended,
+since audio tracks have no compositing order to preserve. Each track head
+carries a **✕** to remove it again — refused, with a toast, while the
+track still has clips on it, and — for video only — refused once more for
+a project's last remaining video track, since a project with none has
 nothing for the preview or the export to composite. There is no floor at
-the two tracks a project boots with: trimming back down to one is allowed,
-and is if anything the cheaper project to export (`canStreamCopy`'s fast
-path is exactly one video track). Track numbers are never reused or
+the two video tracks a project boots with, though: trimming back down to
+one is allowed, and is if anything the cheaper project to export
+(`canStreamCopy`'s fast path is exactly one video track). Audio has no
+floor at all, not even one — a video clip's own synced sound plays
+regardless of whether any audio-kind track exists, so a project can
+legitimately drop to zero audio tracks; **+ Audio track** is always there
+to add one back. Track numbers, video or audio, are never reused or
 renumbered when one is removed — deleting Video 2 leaves Video 3 exactly
 "Video 3", the same way deleting a clip never renumbers the clips after it.
 Drag clips to move, drag the edges to trim, drag between lanes to reassign.
@@ -1008,55 +1014,73 @@ and comparing font size/position across the three `position` settings — is
 exactly the kind of check that tier is for, and exactly what this section's
 claims about visual correctness rest on rather than demonstrate here.
 
-### Video tracks are not fixed at two
+### Track counts are not fixed at their starting numbers
 
 `state.project.tracks` was always a plain array — the builder's `videoTracks`
-filters (`canStreamCopy`, `buildExportCommand`) and the preview's `layersAt`
-already iterated it rather than reading `tracks[0]`/`tracks[1]` by name — so
-nothing in the export or the composited preview needed to change to support
-a third video track; `test/ffmpeg-render.test.js` and `test/key-preview.test.js`
-now each carry a real three-video-track case rather than trusting that the
-existing two-track coverage generalises on its own. What needed building was
-the UI: the timeline header's **+ Video track** button, a remove chip per
-track head, and turning "Send to track" from two fixed buttons in
-`index.html` into `renderSendButtons()` — one button per current video
-track plus the fixed audio one, rebuilt alongside the rest of the timeline
-on every `renderAll()`, the same way `renderHeads()` already rebuilds the
-per-track mute/hide row.
+/ `audioTracks` filters (`canStreamCopy`, `buildExportCommand`) and the
+preview's `layersAt` already iterated it rather than reading
+`tracks[0]`/`tracks[1]` by name — so nothing in the export or the composited
+preview needed to change to support a third video track, or a second audio
+one; `test/ffmpeg-render.test.js`, `test/ffmpeg-builder.test.js` and
+`test/key-preview.test.js` each carry real multi-track cases (three video
+tracks; two audio tracks, including clips split across them) rather than
+trusting that the original coverage generalises on its own. What needed
+building, for both kinds, was the UI: the timeline header's **+ Video
+track** / **+ Audio track** buttons, a remove chip per track head, and
+turning "Send to track" from static buttons in `index.html` into
+`renderSendButtons()` — one button per current track of either kind,
+rebuilt alongside the rest of the timeline on every `renderAll()`, the same
+way `renderHeads()` already rebuilds the per-track mute/hide/remove row.
 
-A new track is always appended directly above the last existing video
+A new video track is always appended directly above the last existing video
 track — never in the middle, never below — because that is the one
 placement that needs no further decision: it composites over everything
 already there the same way Video 2 already composited over Video 1, so
 "the newest track wins where it overlaps" stays true without a special
-case. Its id and number are picked by scanning every existing video
-track's id (`v`*N*) and name (`Video `*N*) for the highest *N* already in
-use and adding one, rather than by counting tracks — counting would hand
-out a number still visible on screen if an earlier track with a higher
-number had since been removed, and two tracks both reading "Video 3" in
-the head list is a worse bug than a gap in the numbering.
+case. A new audio track has no such stakes — `amix` sums its inputs, so two
+audio tracks sound identical whichever order they mix in — and is simply
+appended at the end of the track list, which both needs no decision either
+and keeps every audio track grouped together, below every video track, in
+the head list and the send-button row. Either kind's id and number are
+picked by scanning every existing track of that kind's id (`v`*N* / `a`*N*)
+and name (`Video `*N* / `Audio `*N*) for the highest *N* already in use and
+adding one, rather than by counting tracks — counting would hand out a
+number still visible on screen if an earlier track with a higher number had
+since been removed, and two tracks both reading "Video 3" (or "Audio 2") in
+the head list is a worse bug than a gap in the numbering. One function,
+`nextTrackNumber(tracks, kind)`, does this scan for both kinds — the two
+only ever differed in the id prefix and the capitalised label, both
+derivable from `kind` itself, so a shared function stayed simpler than two
+copies that would drift apart the next time either changed.
 
-Removing a track is refused, with a toast, while it still has clips on it
-— silently discarding footage because someone clicked the wrong chip is a
-worse failure than a click that does nothing — and refused again for a
-project's last remaining video track, since a project with none has
-nothing for the preview or the export to composite. Above that floor of
-one, removing is unconditional: nothing pins the count at the two the
-project boots with, and there is no technical reason to — `canStreamCopy`
-already treats a single video track as the fast path, so a project trimmed
-back down to one is, if anything, the cheaper case to export. Track
-numbers are never renumbered when one is removed: deleting Video 1 leaves
-Video 2 exactly "Video 2", the same way deleting a clip never renumbers
-the clips after it — a user's name for a track is not the app's to change
-out from under them.
+Removing a track is refused, with a toast, while it still has clips on it,
+for both kinds — silently discarding footage because someone clicked the
+wrong chip is a worse failure than a click that does nothing. Beyond that,
+the two kinds diverge. Video is refused again for a project's last
+remaining video track, since a project with none has nothing for the
+preview or the export to composite; above that floor of one, removing is
+unconditional — nothing pins the count at the two the project boots with,
+and `canStreamCopy` already treats a single video track as the fast path,
+so a project trimmed back down to one is, if anything, the cheaper case to
+export. Audio has no floor at all, not even one: a video clip's own synced
+sound rides on `clip.hasAudio` on its *video* track regardless of whether
+any audio-kind track exists, and `buildExportCommand`'s audio mix walks
+every track in the project directly rather than requiring one of kind
+`audio` to be present — so a project with zero audio tracks is not silent,
+and is not missing anything the preview or export needs the way a project
+with zero video tracks would be. It just has nowhere left to put a
+standalone music bed or voiceover that isn't attached to a clip's own
+video, and **+ Audio track** is always there to add one back. Track
+numbers, video or audio, are never renumbered when one is removed:
+deleting Video 1 leaves Video 2 exactly "Video 2", the same way deleting a
+clip never renumbers the clips after it — a user's name for a track is not
+the app's to change out from under them.
 
 The layer pool's own generalisation — `POOL_SIZE = 4` becoming
 `videoTrackCount * 2` — is covered above, in "How the composited preview
-works".
-
-Audio is still fixed at one track. Adding a second is the smaller,
-still-open half of what the "More tracks" idea used to describe before
-this — see "Extending it" below.
+works". It is sized off video tracks only; audio tracks never touch the
+composited canvas or the layer pool at all, so a project's audio track
+count has no effect on it.
 
 ### Filter order matters
 
@@ -1188,11 +1212,6 @@ screen and not just in the string the builder produced.
 ## Extending it
 
 Reasonable next moves, roughly by effort:
-
-- **A second audio track.** Video tracks are no longer fixed at two — see
-  "Video tracks are not fixed at two", above. Audio still is: adding a
-  second is the one-line-change-plus-a-UI-button this bullet used to
-  describe for video, and is still open.
 
 - **Real proportional scaling for the caption overlay, verified in a real
   browser.** The overlay's font size, margins and outline width already

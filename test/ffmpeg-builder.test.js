@@ -122,6 +122,28 @@ test('canStreamCopy rejects a second video track, a second clip, speed change, o
   assert.equal(canStreamCopy(keyed), false);
 });
 
+test('canStreamCopy rejects a clip on any audio track, not just the first, under three audio tracks', () => {
+  // audioTracks.some(...) reads as track-count-agnostic by inspection, but
+  // "some" over an array of one is indistinguishable from checking a single
+  // fixed track by name — this re-checks it under three, and specifically
+  // with the clip on the *last* one, the case a check that secretly only
+  // looked at tracks[0] would get wrong.
+  const threeAudioTracks = () => singleVideoTrackProject({
+    tracks: [
+      { id: 'v1', kind: 'video', name: 'Video 1', clips: [makeClip()] },
+      { id: 'a1', kind: 'audio', name: 'Audio 1', clips: [] },
+      { id: 'a2', kind: 'audio', name: 'Audio 2', clips: [] },
+      { id: 'a3', kind: 'audio', name: 'Audio 3', clips: [] }
+    ]
+  });
+
+  assert.equal(canStreamCopy(threeAudioTracks()), true, 'all three empty is still the boring case');
+
+  const clipOnLast = threeAudioTracks();
+  clipOnLast.tracks[3].clips.push(makeClip({ src: '/tmp/a.mp3', hasVideo: false }));
+  assert.equal(canStreamCopy(clipOnLast), false);
+});
+
 test('buildExportCommand takes the copy fast path for a boring project', () => {
   const project = singleVideoTrackProject();
   project.tracks[0].clips.push(makeClip({ inSec: 1, outSec: 6 }));
@@ -160,6 +182,45 @@ test('buildExportCommand mixes multiple audio clips, single clip skips amix', ()
   const { args: multiArgs } = buildExportCommand(multi, 'out.mp4');
   const multiFilters = multiArgs[multiArgs.indexOf('-filter_complex') + 1];
   assert.ok(multiFilters.includes('amix=inputs=2'));
+});
+
+test('buildExportCommand mixes clips split across two audio tracks the same as two clips on one', () => {
+  // The loop that builds audioLabels (buildExportCommand's "Audio" section)
+  // walks project.tracks directly rather than a single audioTracks[0], so it
+  // should not care whether two audio clips share a track or sit on two —
+  // this is the two-track case the test above (both clips on tracks[2])
+  // never exercises.
+  const twoTracks = baseProject({
+    tracks: [
+      { id: 'v1', kind: 'video', name: 'Video 1', clips: [makeClip({ speed: 2, hasAudio: false })] },
+      { id: 'a1', kind: 'audio', name: 'Audio 1', clips: [makeClip({ src: '/tmp/a.mp3', hasVideo: false })] },
+      { id: 'a2', kind: 'audio', name: 'Audio 2', clips: [makeClip({ src: '/tmp/b.mp3', hasVideo: false, startSec: 5 })] }
+    ]
+  });
+  const { args } = buildExportCommand(twoTracks, 'out.mp4');
+  const filters = args[args.indexOf('-filter_complex') + 1];
+  assert.ok(filters.includes('amix=inputs=2'), 'both audio-track clips reach the same mix as two clips on one track');
+
+  // A muted audio track drops out of the mix the same way a muted video
+  // track's own audio already does — re-checked here because the mixing
+  // loop's `if (track.muted) continue` is a per-track check, and a second
+  // audio track is the first place two tracks with different muted states
+  // can be told apart at all.
+  const oneMuted = baseProject({
+    tracks: [
+      { id: 'v1', kind: 'video', name: 'Video 1', clips: [makeClip({ speed: 2, hasAudio: false })] },
+      { id: 'a1', kind: 'audio', name: 'Audio 1', clips: [makeClip({ src: '/tmp/a.mp3', hasVideo: false })], muted: true },
+      { id: 'a2', kind: 'audio', name: 'Audio 2', clips: [makeClip({ src: '/tmp/b.mp3', hasVideo: false })] }
+    ]
+  });
+  const { args: mutedArgs } = buildExportCommand(oneMuted, 'out.mp4');
+  const mutedFilters = mutedArgs[mutedArgs.indexOf('-filter_complex') + 1];
+  assert.ok(!mutedFilters.includes('amix'), 'only one unmuted audio clip remains, so this is the single-clip path');
+  // Each audio clip's chain starts with its own `atrim=start=` step, so
+  // counting them is a direct check that the muted track's clip dropped out
+  // of the graph entirely rather than merely being silenced within it.
+  const atrims = mutedFilters.match(/atrim=start=/g) || [];
+  assert.equal(atrims.length, 1, 'only Audio 2\'s clip chain should have been built');
 });
 
 test('parseSubtitles reads SRT timestamps and text', () => {
