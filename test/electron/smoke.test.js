@@ -202,6 +202,44 @@ test('the application menu carries the standard Edit roles', opts, async () => {
 });
 
 // --------------------------------------------------------------------------
+// Clip clipboard shortcuts
+// --------------------------------------------------------------------------
+
+/*
+ * What this tier can and cannot prove about copy/paste. The Edit menu above
+ * owns Cmd/Ctrl+C/V on every platform (its `copy`/`paste` roles have a real
+ * accelerator) — the same situation that made Undo/Redo need their own
+ * delivery path (see historyItem's comment in main.js) — and
+ * wireClipboardShortcuts answers it for copy/paste with `before-input-event`
+ * instead, which fires ahead of any menu accelerator.
+ *
+ * Driving that with Playwright was tried and abandoned: `_electron`'s
+ * `page.keyboard.press()` dispatches through Chrome DevTools Protocol, and a
+ * real Electron window under Xvfb, instrumented by hand, showed
+ * before-input-event never fires at all for a CDP-dispatched key — not even
+ * a plain, unmodified one — while the same window driven by a genuine
+ * X11-level keystroke (`xdotool key ctrl+c` against the real window) fires
+ * it correctly, `{ type: 'keyDown', control: true, key: 'c' }`, exactly what
+ * shared/clipboard-shortcuts.js's `commandForInput` (unit-tested in
+ * test/clipboard-shortcuts.test.js) expects. So this tier checks the one
+ * thing it safely can: that a real BrowserWindow's webContents actually has
+ * a before-input-event listener attached, which is what would go quietly
+ * missing if createWindow ever stopped calling wireClipboardShortcuts.
+ * Whether the event fires for a real keystroke is the one claim in this
+ * feature resting on that by-hand check rather than an automated one.
+ */
+test('the window has a before-input-event listener wired up for clip copy/paste', opts, async () => {
+  const { app } = await launchApp();
+  try {
+    const count = await app.evaluate(({ BrowserWindow }) =>
+      BrowserWindow.getAllWindows()[0].webContents.listenerCount('before-input-event'));
+    assert.ok(count > 0, 'wireClipboardShortcuts should have attached a before-input-event listener');
+  } finally {
+    await closeApp(app);
+  }
+});
+
+// --------------------------------------------------------------------------
 // The close guard
 // --------------------------------------------------------------------------
 

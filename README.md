@@ -122,9 +122,49 @@ used to read as an overlap, and silently became a transition nobody asked
 for; see `src/timeline-snapping.js` for the decision logic and its own
 header for why it is a separate, DOM-free module.
 
+Click a clip to select it, replacing whatever was selected before. Shift-click
+or Ctrl/Cmd-click instead toggles a clip into or out of the selection — the
+same modifier the media bin above already uses for its own multi-select, kept
+for one convention rather than two. A Shift-click *range* (click one clip,
+Shift-click another, get everything between) is not implemented: a timeline
+has two axes, time and track, and there is no single obviously-right reading
+of "everything between" two clips on different tracks, so toggling one clip
+at a time is what's here instead. Delete, Duplicate, Copy and Paste act on
+the whole selection; the inspector, Split, Set In/Out and Transcribe still
+act on one clip — whichever the selection last touched — because none of
+those four has an obvious multi-clip meaning (see "Split, Set In, Set Out and
+Transcribe" in `src/app.js`), and an inspector showing several clips' settings
+at once, possibly disagreeing, is a bigger feature than this one. A
+modifier-click only ever changes the selection; it never starts a drag, and
+multi-selected clips do not drag as a group — only single-clip drag exists
+today.
+
 **Split and trim.** Playhead + `S` splits. `I` and `O` set in and out points.
 Every clip carries source-time and timeline-time separately, so trimming never
 shifts anything downstream by accident.
+
+**Copy, paste, duplicate.** `Ctrl/Cmd C` copies the selected clip(s) — their
+full settings, deep-cloned rather than referenced, so pasting twice or editing
+the original afterward can never alias what's on the clipboard.
+`Ctrl/Cmd V` pastes at the playhead, keeping whatever spacing the copied
+clips had relative to each other, back onto the tracks they came from (or the
+first track of the same kind, video or audio, if that exact track is somehow
+gone — defensive rather than reachable, since nothing in the UI can delete a
+track today). `Ctrl/Cmd D` duplicates the selection in place: copy and paste
+in one step, offset to land right after the originals rather than exactly on
+top of them — an exact overlap on the same track is what turns two clips into
+a crossfade (see Crossfades, below), so "in place" means adjacent, not
+identical. A caption text field's own copy/paste is unaffected; these three
+shortcuts only reach the timeline clipboard when a text field is not focused.
+
+**Delete and ripple delete.** `Delete`/`Backspace` removes the selected
+clip(s) and leaves a gap, same as it always has. `Shift Delete` removes them
+and closes the gap behind them — Avid's convention for the same distinction
+(Extract vs. Lift) — shifting only the later clips on the SAME track, per
+track, the way Close gaps (below) already scopes itself; a gap that was
+already there before the delete is left exactly where it was, since ripple
+delete closes only the gap this delete itself made, not every gap on the
+track the way Close gaps does by hand.
 
 **Crossfades.** Overlap two clips on the same track and the overlap becomes a
 real transition — drag one further over its neighbour to make the dissolve
@@ -223,7 +263,11 @@ feature people keep and one they turn off.
 | `S` | split at playhead |
 | `I` / `O` | set in / set out |
 | `←` `→` | step one frame (hold Shift for one second), clamped to the project's length |
-| `Delete` | remove selected clip |
+| `Ctrl/Cmd C` | copy selected clip(s) |
+| `Ctrl/Cmd V` | paste at the playhead |
+| `Ctrl/Cmd D` | duplicate selected clip(s) in place |
+| `Delete` | remove selected clip(s), leaving a gap |
+| `Shift Delete` | remove selected clip(s) and close the gap |
 | `Ctrl/Cmd Z` | undo |
 | `Ctrl/Cmd Shift Z` | redo |
 | `Ctrl/Cmd N` | new project |
@@ -236,6 +280,14 @@ Edit roles — cut, copy, paste, select all. That is not decoration: setting an
 application menu at all replaces Electron's default one, and the default is
 where clipboard support in text fields comes from. Drop those roles and typing
 in the caption editor quietly loses cut and paste on macOS.
+
+`Ctrl/Cmd C`/`V` for clips ride alongside those same roles rather than
+replacing them: the Edit menu's own `copy`/`paste` already own that key combo
+everywhere a text field needs it, on every platform, so main.js listens for
+the keystroke a second way — `before-input-event`, which sees it regardless
+of who else claims it — and tells the renderer, which runs the clip-clipboard
+logic only when a text field is not what has focus. See
+`wireClipboardShortcuts` in `main.js` and `doCopy`/`doPaste` in `src/app.js`.
 
 ## How it fits together
 
@@ -255,6 +307,9 @@ shared/
                      button indices, Save vs Save As, and whether an autosave
                      is worth offering. Pure, no Electron — main.js is left
                      holding only the calls, not the decisions.
+  clipboard-shortcuts.js  Which clip-clipboard command, if any, a
+                     before-input-event keystroke maps to. Pure, no
+                     Electron, same reason as save-state.js.
 src/
   app.js             State, timeline rendering, pointer handling, inspector.
   history.js         Undo/redo stacks. Pure, no DOM, so it is testable.

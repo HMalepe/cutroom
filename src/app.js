@@ -62,6 +62,7 @@ const state = {
   bin: [],
   binSelection: [],
   selectedClipId: null,
+  selectedClipIds: [],
   playhead: 0,
   pxPerSec: 40,
   snapBeats: false,
@@ -202,6 +203,38 @@ function findClip(id) {
 
 function selectedClip() { return findClip(state.selectedClipId).clip; }
 
+/**
+ * The full multi-selection, resolved against the current project so a clip
+ * removed by some other path (undo landing on an older project, say) can
+ * never leave a stale id sitting in state.selectedClipIds.
+ */
+function selectedClips() {
+  return state.selectedClipIds.map(id => findClip(id)).filter(x => x.clip);
+}
+
+/**
+ * Replace the selection outright. `primary` is who the inspector, Split, Set
+ * In/Out and Transcribe act on — see the pointerdown handler's own comment
+ * for why those stay single-clip even after multi-select landed. Defaults to
+ * the last id in the new set, which is "whatever was just clicked" for every
+ * caller here.
+ */
+function setSelection(ids, primary) {
+  state.selectedClipIds = [...ids];
+  state.selectedClipId = primary !== undefined ? primary
+    : (ids.length ? ids[ids.length - 1] : null);
+}
+
+function clearSelection() { setSelection([]); }
+
+/** Shift/Ctrl/Cmd-click on a clip: add it if absent, drop it if present. */
+function toggleClipSelection(id) {
+  const ids = [...state.selectedClipIds];
+  const i = ids.indexOf(id);
+  if (i >= 0) ids.splice(i, 1); else ids.push(id);
+  setSelection(ids);
+}
+
 /** Next free position on a track, so new clips land after existing ones. */
 function trackTail(track) {
   return track.clips.reduce((m, c) => Math.max(m, clipEnd(c)), 0);
@@ -225,11 +258,15 @@ function trackTail(track) {
 const history = createHistory({
   read: () => ({
     project: state.project,
-    selectedClipId: state.selectedClipId
+    selectedClipId: state.selectedClipId,
+    selectedClipIds: state.selectedClipIds
   }),
   write: (snap) => {
     state.project = snap.project;
     state.selectedClipId = snap.selectedClipId;
+    // Falls back to the single id if a snapshot somehow lacks the array, so
+    // a subtly different history shape can never crash the write path.
+    state.selectedClipIds = snap.selectedClipIds || (snap.selectedClipId ? [snap.selectedClipId] : []);
     // A restored project can be shorter than where the playhead was left.
     state.playhead = Math.min(state.playhead, Math.max(projectDuration(), 0));
     syncProjectInputs();
@@ -315,6 +352,27 @@ function doRedo(source = 'ui') {
   const label = history.redo();
   updateHistoryButtons();
   historyToast(label ? `Redid ${label}.` : 'Nothing to redo.', label ? 'ok' : 'warn');
+}
+
+/*
+ * Copy and paste can each arrive from two sources on a given platform, the
+ * same way undo/redo above can: the Edit menu's own `copy`/`paste` roles
+ * already own Cmd/Ctrl+C/V everywhere a real text field needs them (see
+ * wireClipboardShortcuts in main.js for how that keystroke also reaches the
+ * renderer here), and this file's own keydown listener is the other path.
+ * Whichever one actually delivers the keystroke is a platform question this
+ * code does not have to be right about, because commandGuard drops
+ * whichever arrives second within the window — same guard, same reasoning,
+ * just extended to two more commands.
+ */
+function doCopy(source = 'ui') {
+  if (!commandGuard.allow('copy', source, Date.now())) return;
+  copySelected();
+}
+
+function doPaste(source = 'ui') {
+  if (!commandGuard.allow('paste', source, Date.now())) return;
+  pasteClipboard();
 }
 
 /**
@@ -469,6 +527,7 @@ async function confirmDiscard() {
 function adoptProject(project) {
   state.project = project;
   state.selectedClipId = null;
+  state.selectedClipIds = [];
   state.playhead = 0;
   history.clear();
   updateHistoryButtons();
@@ -1128,7 +1187,7 @@ function renderClipEl(clip, track) {
   const el = document.createElement('div');
   el.className = 'clip'
     + (track.kind === 'audio' ? ' audio' : '')
-    + (clip.id === state.selectedClipId ? ' selected' : '');
+    + (state.selectedClipIds.includes(clip.id) ? ' selected' : '');
   el.style.left = (clip.startSec * state.pxPerSec) + 'px';
   el.style.width = Math.max(14, clipDur(clip) * state.pxPerSec) + 'px';
   el.dataset.clipId = clip.id;
@@ -1251,7 +1310,24 @@ $('tlScroll').addEventListener('pointerdown', (e) => {
   }
 
   const id = clipEl.dataset.clipId;
-  state.selectedClipId = id;
+
+  // Shift or Ctrl/Cmd toggles a clip in and out of the selection rather than
+  // replacing it — the same convention the bin list above already uses for
+  // its own multi-select, so there is one rule to learn rather than two.
+  // A Shift-click range instead would need a defined order across BOTH axes
+  // a timeline has, time and track, and there is no single obviously-right
+  // reading of "everything between" two clips on different tracks, so it is
+  // left out rather than guessed at. A modifier-click only ever changes the
+  // selection — it never starts a drag, so multi-selecting cannot also move
+  // the clip you were trying to add.
+  if (e.metaKey || e.ctrlKey || e.shiftKey) {
+    toggleClipSelection(id);
+    renderTimeline();
+    renderInspector();
+    return;
+  }
+
+  setSelection([id]);
   const { clip, track } = findClip(id);
   // Selecting a clip no longer points the preview at it directly — the
   // playhead does that. It still has to give up a bin item that was showing,
@@ -1354,6 +1430,18 @@ $('tlScroll').addEventListener('pointercancel', () => endDrag(null));
 // Editing operations
 // ==========================================================================
 
+/*
+ * Split, Set In, Set Out and Transcribe (below) all still act on exactly one
+ * clip — state.selectedClipId, the last clip the selection touched — even
+ * with a multi-select on the timeline now. None of the four has an obvious
+ * multi-clip meaning: splitting several clips at once would put the cut at a
+ * different source position in each, and Set In/Out would have to decide
+ * whether "the playhead" means the same timeline instant for every clip or
+ * something per-clip. Delete, Duplicate, Copy and Paste don't have that
+ * problem — removing or copying a clip means the same thing regardless of
+ * how many others go with it — which is the actual line this file draws
+ * between "acts on the selection" and "acts on the primary clip".
+ */
 function splitAtPlayhead() {
   const { clip, track } = findClip(state.selectedClipId);
   if (!clip) { toast('Select a clip first.', 'warn'); return; }
@@ -1376,7 +1464,7 @@ function splitAtPlayhead() {
     clip.fadeOut = 0;
 
     track.clips.push(right);
-    state.selectedClipId = right.id;
+    setSelection([right.id]);
   });
   renderAll();
 }
@@ -1405,16 +1493,54 @@ function setOutAtPlayhead() {
   renderAll();
 }
 
-function deleteSelected() {
-  const { clip, track } = findClip(state.selectedClipId);
-  if (!clip) return;
-  edit('delete', () => {
-    track.clips = track.clips.filter(c => c.id !== clip.id);
-    state.selectedClipId = null;
+/**
+ * Delete every selected clip as one undo step, not one per clip — a
+ * multi-select delete that took N undos to reverse would be worse than no
+ * multi-select at all.
+ *
+ * `ripple` closes the gap each deletion leaves behind, per track: every
+ * remaining clip on the SAME track that started at or after a deleted
+ * clip's own start slides left by that clip's duration. That is deliberately
+ * narrower than closeGaps() below, which repacks every clip on a track from
+ * zero — this only closes the gap(s) this delete itself made, so a gap that
+ * was already there before the delete is left exactly where it was. A track
+ * nothing here was deleted from is never touched, the same per-track scope
+ * closeGaps() already has.
+ */
+function deleteSelected(ripple = false) {
+  const ids = new Set(state.selectedClipIds);
+  if (!ids.size) return;
+
+  edit(ripple ? 'ripple delete' : 'delete', () => {
+    for (const track of state.project.tracks) {
+      const removed = track.clips.filter(c => ids.has(c.id));
+      if (!removed.length) continue;
+      const remaining = track.clips.filter(c => !ids.has(c.id));
+      if (ripple) {
+        // Each remaining clip's shift is computed from the ORIGINAL
+        // positions of every removed clip that started at or before it, not
+        // applied removed-clip-by-removed-clip — the latter would compare a
+        // clip already shifted by an earlier removal against a later
+        // removed clip's untouched startSec, under-shifting anything sitting
+        // between two deleted clips.
+        for (const c of remaining) {
+          let shift = 0;
+          for (const r of removed) if (r.startSec <= c.startSec) shift += clipDur(r);
+          c.startSec = Math.max(0, c.startSec - shift);
+        }
+      }
+      track.clips = remaining;
+    }
+    clearSelection();
   });
   renderAll();
 }
 
+// Manual and whole-track, unlike deleteSelected's ripple option above: this
+// still packs every gap on the target track from zero, not just whichever
+// gap a delete just made. Still keyed off the single primary clip — closing
+// gaps for a multi-select spanning several tracks at once is not something
+// this command has ever done, and nothing here asks it to start.
 function closeGaps() {
   const { track } = findClip(state.selectedClipId);
   const target = track || state.project.tracks[0];
@@ -1422,6 +1548,101 @@ function closeGaps() {
     const sorted = [...target.clips].sort((a, b) => a.startSec - b.startSec);
     let cursor = 0;
     for (const c of sorted) { c.startSec = cursor; cursor = clipEnd(c); }
+  });
+  renderAll();
+}
+
+// ==========================================================================
+// Clipboard — copy, paste, duplicate
+// ==========================================================================
+
+/*
+ * A deep-cloned snapshot of whatever was selected when Copy last ran: one
+ * entry per clip, each remembering which track it came from and its own
+ * startSec, so Paste can rebuild the same relative spacing between several
+ * copied clips wherever the playhead lands. Cloned rather than referenced —
+ * pasting twice, or editing the clips still on the timeline afterward, must
+ * not alias the objects the clipboard is holding onto, the same reasoning
+ * history.js's own clone() is built on.
+ *
+ * Lives outside `state` on purpose: unlike selection, undoing past a copy
+ * should not empty the clipboard — that would make "undo one step" destroy
+ * something Ctrl+Z has never in this app been able to touch.
+ */
+let clipboard = null;
+
+const cloneClip = (c) => (
+  typeof structuredClone === 'function' ? structuredClone(c) : JSON.parse(JSON.stringify(c))
+);
+
+function copySelected() {
+  const items = selectedClips();
+  if (!items.length) return;
+  clipboard = items.map(({ clip, track }) => (
+    { trackId: track.id, trackKind: track.kind, clip: cloneClip(clip) }
+  ));
+}
+
+/**
+ * Lay cloned clips onto the project at `anchorSec`, preserving their
+ * original relative offsets and each getting a fresh id — shared by Paste
+ * (anchor = playhead) and Duplicate (anchor = right after the originals).
+ * Returns the new clips' ids so the caller can select them.
+ */
+function placeClipboardClips(items, anchorSec) {
+  if (!items.length) return [];
+  const minStart = Math.min(...items.map(i => i.clip.startSec));
+  const newIds = [];
+  let skipped = false;
+  for (const item of items) {
+    // The track a clip was copied from is gone. Not reachable today — this
+    // app has no way to delete a track — but paste has to answer the
+    // question rather than assume it can't happen. Falls back to the first
+    // track of the same kind, video or audio, rather than the first track
+    // outright: landing a video clip on the audio track would silently drop
+    // its picture, the same distinction sendToTrack already enforces for a
+    // fresh drop from the bin.
+    const target = state.project.tracks.find(t => t.id === item.trackId)
+      || state.project.tracks.find(t => t.kind === item.trackKind);
+    if (!target) { skipped = true; continue; }
+    const clip = cloneClip(item.clip);
+    clip.id = uid('c');
+    clip.startSec = Math.max(0, anchorSec + (item.clip.startSec - minStart));
+    target.clips.push(clip);
+    newIds.push(clip.id);
+  }
+  if (skipped) toast('Nowhere to paste one or more clips — their track is gone.', 'warn');
+  return newIds;
+}
+
+function pasteClipboard() {
+  if (!clipboard || !clipboard.length) { toast('Nothing to paste.', 'warn'); return; }
+  let newIds = [];
+  edit('paste', () => {
+    newIds = placeClipboardClips(clipboard, state.playhead);
+    setSelection(newIds);
+  });
+  renderAll();
+}
+
+function duplicateSelected() {
+  const items = selectedClips();
+  if (!items.length) return;
+  // Right after the originals, not exactly on top of them: an exact overlap
+  // on the same track is groupTrackRuns' own definition of a crossfade
+  // (shared/ffmpeg-builder.js), so "duplicate in place" would quietly become
+  // a transition nobody asked for rather than a plain copy. The whole
+  // selection moves by the same amount — the gap after whichever original
+  // ends last — so a multi-clip duplicate keeps the group's own layout
+  // instead of each clip landing right after only itself.
+  const anchor = Math.max(...items.map(({ clip }) => clipEnd(clip)));
+  let newIds = [];
+  edit('duplicate', () => {
+    newIds = placeClipboardClips(
+      items.map(({ clip, track }) => ({ trackId: track.id, trackKind: track.kind, clip })),
+      anchor
+    );
+    setSelection(newIds);
   });
   renderAll();
 }
@@ -1474,6 +1695,22 @@ function slider(labelText, value, min, max, step, format, onInput) {
 function renderInspector() {
   const box = $('inspector');
   box.innerHTML = '';
+
+  // Multiple clips selected: showing one clip's settings would be wrong (it
+  // is only one of several), and showing every selected clip's settings at
+  // once — different lengths, different speeds, fields that may or may not
+  // agree — is a bigger feature than a single-clip inspector panel. Delete,
+  // Duplicate, Copy and Paste still work on the whole selection; only the
+  // panel itself narrows back to one clip.
+  if (state.selectedClipIds.length > 1) {
+    $('clipName').textContent = `${state.selectedClipIds.length} clips selected`;
+    const note = document.createElement('div');
+    note.className = 'empty-note';
+    note.textContent = 'Multiple clips selected. Select just one to edit its settings — Delete, Duplicate, Copy and Paste still act on all of them.';
+    box.appendChild(note);
+    return;
+  }
+
   const clip = selectedClip();
   $('clipName').textContent = clip ? clip.name : 'nothing selected';
 
@@ -2066,7 +2303,11 @@ $('scrub').oninput = () => {
 $('btnSplit').onclick = splitAtPlayhead;
 $('btnSetIn').onclick = setInAtPlayhead;
 $('btnSetOut').onclick = setOutAtPlayhead;
-$('btnDeleteClip').onclick = deleteSelected;
+// Wrapped rather than assigned directly: onclick hands the handler a
+// MouseEvent, which deleteSelected would otherwise read as a truthy
+// `ripple` argument and ripple-delete on every plain click.
+$('btnDeleteClip').onclick = () => deleteSelected();
+$('btnDuplicateClip').onclick = duplicateSelected;
 $('btnCloseGaps').onclick = closeGaps;
 
 // Zoom
@@ -2174,6 +2415,12 @@ api.onMenuCommand(async ({ command, reply } = {}) => {
     }
     case 'undo': doUndo('menu'); break;
     case 'redo': doRedo('menu'); break;
+    // Sent alongside the Edit menu's own native copy/paste (see
+    // wireClipboardShortcuts in main.js) rather than instead of it — a text
+    // field's Cmd/Ctrl+C or +V should still just copy or paste text, so this
+    // only runs the clip-clipboard logic when focus is somewhere else.
+    case 'copy-clips': if (!isTypingTarget()) doCopy('menu'); break;
+    case 'paste-clips': if (!isTypingTarget()) doPaste('menu'); break;
   }
 });
 
@@ -2192,6 +2439,13 @@ api.onRestoreProject(({ project } = {}) => {
   toast('Recovered unsaved work from the last session. Save it somewhere.', 'warn');
 });
 
+// Shared by the keydown listener below and the 'copy-clips'/'paste-clips'
+// menu commands above: a text field's own Cmd/Ctrl+C or +V should behave
+// like any other browser text field, not reach into the timeline clipboard.
+function isTypingTarget() {
+  return /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
+}
+
 // Keyboard
 document.addEventListener('keydown', (e) => {
   // Undo is checked before the typing guard: inside a caption box it should
@@ -2207,14 +2461,31 @@ document.addEventListener('keydown', (e) => {
     return;
   }
 
-  const typing = /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
-  if (typing) return;
+  if (isTypingTarget()) return;
 
   if (e.code === 'Space') { e.preventDefault(); $('btnPlay').click(); }
   if (e.key === 's' || e.key === 'S') splitAtPlayhead();
   if (e.key === 'i') setInAtPlayhead();
   if (e.key === 'o') setOutAtPlayhead();
-  if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); deleteSelected(); }
+  // These also arrive from the Edit menu's own copy/paste accelerator (see
+  // wireClipboardShortcuts in main.js and doCopy/doPaste's own comment) —
+  // this is the other half of that same belt-and-braces pair, same as
+  // undo/redo above; commandGuard, inside doCopy/doPaste, drops whichever of
+  // the two arrives second.
+  if ((e.metaKey || e.ctrlKey) && (e.key === 'c' || e.key === 'C')) { e.preventDefault(); doCopy('key'); }
+  if ((e.metaKey || e.ctrlKey) && (e.key === 'v' || e.key === 'V')) { e.preventDefault(); doPaste('key'); }
+  // Nothing else in this app claims Cmd/Ctrl+D, so unlike copy/paste this
+  // needs no menu-side counterpart — the keydown listener is the only path.
+  if ((e.metaKey || e.ctrlKey) && (e.key === 'd' || e.key === 'D')) { e.preventDefault(); duplicateSelected(); }
+  if (e.key === 'Delete' || e.key === 'Backspace') {
+    e.preventDefault();
+    // Shift is the Avid convention for "delete, but also close the gap" —
+    // Extract vs. plain Delete's Lift — picked because the bare key already
+    // has tested, relied-on behaviour (leave a gap) that nothing here should
+    // change, the same reason Shift modifies the arrow-key step below
+    // instead of replacing it.
+    deleteSelected(e.shiftKey);
+  }
   if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
     const step = (e.shiftKey ? 1 : 1 / state.project.fps) * (e.key === 'ArrowLeft' ? -1 : 1);
     // Clamped above too — holding the key used to walk the playhead
