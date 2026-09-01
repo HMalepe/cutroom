@@ -237,12 +237,33 @@
 
 </div>
 
+<!-- ------------------------------------------------------------------ -->
+<!-- Missing media. Hidden by default (relink-panel with nothing in
+     #relinkList); app.js shows it the moment a project or bin path stops
+     resolving on disk, and keeps it up until every entry is relinked —
+     collapsible, the same as #cmdPanel below, but never auto-dismissing the
+     way a toast would. See "Missing media" in the README. -->
+<div class="relink-panel" id="relinkPanel" style="display:none">
+  <div class="relink-head" id="relinkHead">
+    <span class="relink-title">⚠ Missing media</span>
+    <span class="relink-count" id="relinkCount">0</span>
+    <span class="topbar-spacer"></span>
+    <button class="btn btn-sm btn-ghost" id="btnRelinkFolder">Locate folder…</button>
+    <span class="tpl-tag" id="relinkToggle">hide</span>
+  </div>
+  <div class="relink-body" id="relinkBody">
+    <div class="relink-auto" id="relinkAuto" style="display:none"></div>
+    <div id="relinkList"></div>
+  </div>
+</div>
+
 <div class="toast-stack" id="toasts"></div>
 
 <script src="chroma-math.js"></script>
 <script src="key-preview.js"></script>
 <script src="timeline-preview.js"></script>
 <script src="timeline-snapping.js"></script>
+<script src="media-relink.js"></script>
 <script src="history.js"></script>
 <script src="dirty-state.js"></script>
 <script src="templates.js"></script>

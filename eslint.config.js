@@ -58,7 +58,8 @@ module.exports = [
         stepClipLoop: 'readonly',
         clampPlaybackRate: 'readonly',
         TimelinePreview: 'readonly',
-        TimelineSnapping: 'readonly'
+        TimelineSnapping: 'readonly',
+        MediaRelink: 'readonly'
       }
     },
     rules: {
