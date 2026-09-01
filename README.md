@@ -45,7 +45,8 @@ npm test
 
 `node --test`, no framework. Three kinds: unit tests over the pure modules
 (`ffmpeg-builder`, `history`, `templates`, `chroma-math`, `timeline-preview`,
-`timeline-snapping`, `save-state`, `dirty-state`, `media-relink`), integration tests
+`caption-preview`, `timeline-snapping`, `save-state`, `dirty-state`,
+`media-relink`), integration tests
 that load the real `index.html` and `app.js` into jsdom and drive actual
 buttons and pointer events, and render tests that put the built ffmpeg command
 through a real ffmpeg and inspect the pixels. The second kind is what stops
@@ -233,13 +234,18 @@ of a clip looping on its own. A crossfade shows both clips cross-dissolving
 by opacity for the overlap, with a small label naming the export's real
 `xfade` transition underneath — the dissolve is a stand-in for whichever of
 the ten curated effects is actually picked, not a reproduction of its curve,
-and the label exists so nobody mistakes one for the other. Captions still do
-not show here — for those, Test 3s. On a machine with no WebGL it quietly
-falls back to whichever clip is topmost at the playhead, plain, at 1x, start
-to end, same as it always did; it does not attempt the clock or the trim
-loop in that state, on the theory that a feature this dependent on a real
-GPU is better served by keeping its one un-provable fallback exactly as
-small as it already was. See "How the composited preview works" below.
+and the label exists so nobody mistakes one for the other. Captions show as
+an approximate HTML/CSS overlay — font, size, colour, background and
+position from the caption style panel, plus a rough stand-in for the entry
+animations — while the composited view itself is showing; it is not a real
+libass render, and Test 3s remains the way to check the actual burned-in
+result. On a machine with no WebGL it quietly falls back to whichever clip
+is topmost at the playhead, plain, at 1x, start to end, same as it always
+did; it does not attempt the clock, the trim loop, or captions in that
+state, on the theory that a feature this dependent on a real GPU is better
+served by keeping its one un-provable fallback exactly as small as it
+already was. See "How the composited preview works" and "Captions in the
+preview" below.
 
 **Test 3s.** Renders the first three seconds only. Use it to check speed or a
 caption instead of waiting for a full export. It clamps on both export paths.
@@ -358,6 +364,13 @@ src/
                      track at a given timeline time, and how the timeline
                      clock advances. Pure, no DOM — app.js is the layer-pool
                      lifecycle and the <video>/<canvas> wiring on top of it.
+  caption-preview.js  Which caption row is active at a timeline time, the
+                     fade/pop/slide entry-animation state, per-word karaoke
+                     spoken/unspoken state, and the ASS-space-to-CSS-pixel
+                     scaling the overlay's sizing rides on. Pure, no DOM —
+                     app.js's syncCaptionOverlay/applyCaptionOverlay are the
+                     <div> wiring on top of it. See "Captions in the
+                     preview".
   timeline-snapping.js  Where a dragged clip edge lands: candidate positions
                      (other clips' edges, the playhead, zero) and the
                      closest-within-threshold pick. Pure, no DOM — app.js
@@ -774,15 +787,10 @@ real thing. The badge is what stops that: it names the actual effect so a
 `wipeleft` reads as "will wipe" even though what's on screen right now is
 fading.
 
-**Captions are not drawn in the preview at all**, the same gap the old
-single-clip pane had — Test 3s remains the way to check them. Rendering the
-caption style panel's font, colour, position and background as a positioned
-HTML overlay was considered for this PR and cut: everything above it already
-needed proving out in a real browser this repository's test harness cannot
-launch, and stacking a second unverified approximation — an HTML
-approximation of an ASS/libass render, on top of a canvas approximation of
-an `xfade` curve — was worse than shipping the video layers honestly and
-leaving captions exactly where they already were.
+**Captions** draw as a positioned HTML/CSS overlay on top of this stage —
+see "Captions in the preview", below, for what that overlay does and does
+not attempt, and why it was left out of the PR that built everything above
+it.
 
 **Audio is muted on every layer.** Mixing several simultaneously-active
 clips' audio live was ruled out of scope from the start — a browser has no
@@ -868,6 +876,143 @@ so a bug here would have to live in application logic that does not exist;
 this reads as a software-rasteriser warm-up artefact of the test environment,
 not the app, and is noted rather than "fixed" because there is nothing in
 `key-preview.js` to change that would not be pure superstition.
+
+### Captions in the preview
+
+Captions were left out of the composited preview when it first landed — see
+"How the composited preview works", above, for exactly why: everything else
+in that PR already needed proving out in a real browser this repository's
+test harness cannot launch, and stacking a second unverified approximation
+on top of the first (an HTML approximation of an ASS/libass render, on top
+of a canvas approximation of an `xfade` curve) was worse than shipping the
+video layers honestly. That PR's own "Extending it" section named the shape
+this would take in advance: "a positioned HTML/CSS overlay reading the
+caption style panel's font, size, colour, position and background". This is
+that overlay.
+
+`src/caption-preview.js`'s `activeCaptionAt` answers one question, pure and
+DOM-free, the same split `timeline-preview.js`'s `trackStateAt` makes for
+video layers: given a timeline time `t`, which caption row (if any) is on
+screen. `end` is exclusive, the same convention `trackStateAt` uses for a
+clip's own window. Caption rows are a flat, independently-timed list —
+nothing in the caption editor stops two from overlapping — so more than one
+can be active at once; this does not stack them the way a real libass
+render would, it picks the later-starting one, the same tie-break
+`trackStateAt`'s own `'solo'` case uses for overlapping clips. That is a
+stated approximation, not an attempt at real collision layout.
+
+`app.js`'s `syncCaptionOverlay`/`applyCaptionOverlay` turn that answer into
+a styled `<div>` (`#captionOverlay`, `#captionOverlayText`), absolutely
+positioned inside `#previewStage` the same way `#xfadeBadge` already is —
+font, weight and colour straight from `captionStyle`; position (top/middle/
+bottom) as a flex alignment class, mirroring the `{bottom:2, middle:5,
+top:8}` Alignment map `buildAssFile` uses, with middle ignoring `marginV`
+the same way libass's own Alignment 5 does; the background box as a real
+`background-color` with its own opacity, or — when the box is off — a
+cheap eight-direction `text-shadow` standing in for ASS's outline
+(`BorderStyle 1`), since CSS has no built-in glyph-stroke renderer to reach
+for instead. Font size, margin and outline width are all ASS-space numbers
+(relative to the project's own height, the way `PlayResY`/`fontsize`/
+`MarginV` all are) run through `caption-preview.js`'s `scaledPx`, which
+turns them into real CSS pixels scaled by `#previewStage`'s own measured
+height — 0, which is what an unmeasured or not-yet-laid-out box reports,
+falls back to treating an ASS unit as one CSS pixel, which is also what
+jsdom's own layout-free DOM always reports (see "What is and is not
+verified", below, for what that fallback means for this suite's own test
+coverage).
+
+It is driven from `drawComposited`, on the same `t` and the same redraw
+triggers (`requestPreviewFrame`, the RAF loop `startPreviewLoop` drives) the
+video layers already use — not a second render path of its own, since a
+caption overlay updating on a different schedule than the video it sits
+over would drift out of sync with it the way two independent clocks always
+do. Every caption-style control and every caption row edit that did not
+already call `requestPreviewFrame`/`scheduleCommandPreview` before this
+feature existed now does — reusing that one hook rather than inventing a
+parallel one — so a style change reaches the overlay the same way any other
+live-preview-affecting field already does: no scrub, no extra trigger
+written specifically for captions.
+
+**Animations.** `fade`, `pop` and `slide` are cheap CSS equivalents of
+`buildAssFile`'s `\fad`/`\t`/`\move` tags, computed the same way those tags
+themselves work: as pure functions of local time within the caption's own
+active window (`caption-preview.js`'s `animationState`), not a "just
+appeared" trigger replaying a CSS animation. That is what makes a scrub
+landing mid-caption give the right instantaneous answer immediately, the
+same as a real ASS renderer computing the correct frame for whatever
+timestamp it is asked for rather than replaying from a start event. The
+three tags' literal millisecond values (120/120, 140, 160) are duplicated as
+`FADE_SEC`/`POP_SEC`/`SLIDE_SEC` — `shared/` is main-process-only and never
+reaches the renderer, the same reason `timeline-preview.js`'s
+`TRANSITION_TYPES` is a duplicate rather than an import — and
+`test/caption-preview.test.js` pins them against `buildAssFile`'s own output
+so the two cannot quietly drift apart, the same role the `TRANSITION_TYPES`
+test already plays for the crossfade list. `slide`'s upward lift is a fixed,
+modest distance in `em`, not one derived from `marginV` the way the real
+`\move` coordinates are: the real tag always targets a y just above the
+bottom edge regardless of which position is actually chosen, which
+Alignment then reinterprets around that point, and reproducing that
+position-dependent quirk exactly would need testing against a real libass
+render this repository's harness cannot run (no ffmpeg here) — so this
+approximates "slides up into wherever it already sits" instead.
+
+**Typewriter/karaoke** is attempted only for a caption that carries real
+per-word timing (`cap.words`, from a transcription — see "Word-level
+captions and karaoke", below). `karaokeWordStates` marks a word "spoken"
+from `t >= word.start` onward, matching the real `\k` tag's own trigger
+instant (a hard, non-reverting switch from `SecondaryColour` to
+`PrimaryColour`, not a gradual sweep) rather than the later point its own
+`\k` duration ends — the overlay renders one `<span>` per word, coloured
+accordingly. A caption with no `words` — hand-typed, imported, or a
+transcribed row whose text or timing was hand-edited afterward (`app.js`'s
+`renderCaptions` drops `words` the moment a row is touched) — shows plain,
+static text instead. `buildAssFile` still animates that case for real, with
+an old even-split-by-character `\k` estimate; reproducing that formula's own
+timing here was judged not worth it for what this overlay is for, and cut
+loudly rather than silently, the same discipline the crossfade dissolve's
+own scope cut already modeled: a stated, documented gap rather than an
+attempt at a second approximation of an approximation.
+
+**The no-WebGL fallback does not show captions either**, and for a
+different reason than the clock/trim-loop gap it already declines to close:
+the caption overlay itself needs zero WebGL, but it is sized against
+`#previewStage`'s own rendered box (`.caption-overlay` in `styles.css`),
+and the fallback's plain `<video>` has no equivalent stage wrapper to size
+against. Building one just for this fallback — restructuring markup and
+CSS that exists only to serve a rare degraded path — would be the same
+scope creep "How the composited preview works" already declined for the
+timeline clock, for the same underlying reason: keeping a rarely-exercised
+path exactly as small and already-understood as it was before this feature
+existed.
+
+**What is and is not verified.** `test/caption-preview.test.js` covers
+`activeCaptionAt`, `animationState`, `karaokeWordStates` and `scaledPx` as
+pure functions, mutation-tested by hand against the code they cover, plus a
+pin against `buildAssFile`'s real output for the three animation timings.
+`test/caption-overlay.test.js` drives the real `app.js` in jsdom — through
+the UI exactly the way a person would use it (the ruler, the caption row's
+own inputs, the style panel's own fields), never reaching into app.js's
+private `state` — to prove the *wiring*: the right caption shows across
+start/end boundaries and a gap between two rows, `captionsEnabled` and an
+empty caption list both show nothing, style-panel and caption-row edits
+reach the overlay without an extra trigger, the background box toggles a
+real `background-color`, and typewriter renders spoken/unspoken spans (or
+plain text without word timing). jsdom's DOM does support real CSS text
+properties — `color`, `background-color`, class names, inline style
+strings — unlike its faked `<canvas>`, so those assertions mean what they
+say. What they do not prove: jsdom has no layout engine at all, so
+`#previewStage.clientHeight` is always 0 in every test here, which is
+exactly `scaledPx`'s 1:1 fallback path — the size/margin/outline assertions
+in `test/caption-overlay.test.js` are checking that fallback arithmetic, not
+real proportional scaling against a real rendered stage, and a caption
+actually landing at the correct position, size and legibility on screen is
+a claim only a real browser can confirm. This repository's owner re-verifies
+PRs by launching real Electron under Xvfb with Playwright (see `npm run
+test:electron`'s own section, above); a screenshot there comparing "caption
+visible at a t inside its window" against "not visible at a t outside it" —
+and comparing font size/position across the three `position` settings — is
+exactly the kind of check that tier is for, and exactly what this section's
+claims about visual correctness rest on rather than demonstrate here.
 
 ### Track counts are not fixed at their starting numbers
 
@@ -1068,11 +1213,22 @@ screen and not just in the string the builder produced.
 
 Reasonable next moves, roughly by effort:
 
-- **Captions in the preview.** Left out of this PR on purpose — see "How the
-  composited preview works". Whenever this is picked up, a positioned
-  HTML/CSS overlay reading the caption style panel's font, size, colour,
-  position and background is the reasonable next approximation, clearly
-  short of real libass rendering.
+- **Real proportional scaling for the caption overlay, verified in a real
+  browser.** The overlay's font size, margins and outline width already
+  scale against `#previewStage`'s own measured height (`scaledPx` in
+  `caption-preview.js`) — but jsdom never lays anything out, so every test
+  in `test/caption-overlay.test.js` only ever exercises that function's 1:1
+  fallback path. Confirming the real scaling, and the overlay's actual
+  on-screen position/legibility across all three `position` settings, needs
+  the real-Electron-under-Xvfb screenshot check "Captions in the preview"
+  names but does not itself run.
+
+- **The no-word-timing typewriter fallback.** `buildAssFile` still animates
+  a caption with no per-word timestamps, with an old even-split-by-character
+  `\k` estimate; the preview overlay shows that case as plain static text
+  instead of attempting to reproduce that formula's own sweep — a stated,
+  deliberate gap (see "Captions in the preview"), and a candidate to close
+  if it turns out to matter in practice.
 
 ## Licence
 
