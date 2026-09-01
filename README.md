@@ -45,7 +45,7 @@ npm test
 
 `node --test`, no framework. Three kinds: unit tests over the pure modules
 (`ffmpeg-builder`, `history`, `templates`, `chroma-math`, `timeline-preview`,
-`timeline-snapping`, `save-state`, `dirty-state`), integration tests
+`timeline-snapping`, `save-state`, `dirty-state`, `media-relink`), integration tests
 that load the real `index.html` and `app.js` into jsdom and drive actual
 buttons and pointer events, and render tests that put the built ffmpeg command
 through a real ffmpeg and inspect the pixels. The second kind is what stops
@@ -104,8 +104,20 @@ alongside the tests.
 
 ## What it does
 
-**Timeline.** Three tracks: two video, one audio. Drag clips to move, drag the
-edges to trim, drag between lanes to reassign. Video 2 composites over Video 1.
+**Timeline.** Two video tracks and one audio track to start. **+ Video
+track**, in the timeline's own header, adds more: a new track always lands
+directly above the ones already there, so it composites over everything
+below it the same way Video 2 already composited over Video 1. Each video
+track head carries a **✕** to remove it again — refused, with a toast,
+while the track still has clips on it, and refused once more for a
+project's last remaining video track, since a project with none has
+nothing for the preview or the export to composite. There is no floor at
+the two tracks a project boots with: trimming back down to one is allowed,
+and is if anything the cheaper project to export (`canStreamCopy`'s fast
+path is exactly one video track). Track numbers are never reused or
+renumbered when one is removed — deleting Video 2 leaves Video 3 exactly
+"Video 3", the same way deleting a clip never renumbers the clips after it.
+Drag clips to move, drag the edges to trim, drag between lanes to reassign.
 Moving or trimming a clip snaps the edge under the drag to nearby edges of
 *other* clips (any track — keying a clip on Video 2 to a cut on Video 1 is
 ordinary), the playhead, and zero. Unlike the timeline's own beat-snap
@@ -205,7 +217,8 @@ Bauhaus Grid is beat-based: set your BPM first.
 **Preview.** Shows the timeline itself, not a clip you happened to select:
 whatever is under the playhead, keyed, colour-corrected, scaled and
 positioned — the same maths the export runs, per frame, on the GPU — with
-Video 2 composited over Video 1, exactly the order the export uses. Drag the
+every video track composited over the ones below it, exactly the order the
+export uses. Drag the
 playhead and the composite updates live; press Play and a timeline clock
 advances it, seeking every active clip's own hidden `<video>` to keep pace
 rather than the old design, where a single `<video>`'s own playback *was*
@@ -254,6 +267,21 @@ file in the app's own data folder. If Cutroom or the machine dies, the next
 launch offers it back. A normal quit deletes it, so a launch after an
 ordinary session never asks — that is the whole difference between a recovery
 feature people keep and one they turn off.
+
+**Missing media.** `clip.src` and a bin item's path are absolute filesystem
+paths with no indirection, so moving a source file, renaming it, or opening
+the project with a drive unmounted breaks the link. Opening a project checks
+every path it and the current media bin reference; anything gone shows up in
+a panel — bottom right, and it stays up rather than fading like a toast,
+because losing track of which of several clips is affected is worse than the
+panel being in the way. **Locate…** relinks one file by hand and fixes every
+clip and bin item that shared it, not just the first one found. **Locate
+folder…**, and an automatic check of the project file's own folder, offer
+the same fix by filename for everything at once — see "Missing media" below
+for exactly what that heuristic does and does not catch. Nothing else about
+the project is blocked while a file is missing; only using that particular
+clip is, with an error in place of a raw ffmpeg failure or a silently broken
+preview.
 
 ## Keyboard
 
@@ -329,6 +357,13 @@ src/
                      closest-within-threshold pick. Pure, no DOM — app.js
                      converts pixels to seconds and calls it from the
                      pointermove handlers.
+  media-relink.js    Which paths a project and bin currently reference,
+                     rewriting every clip/bin item that shares one path, and
+                     the filename-only auto-match heuristic. Pure, no I/O —
+                     used by both main.js (`require`, to build the
+                     existence check and the folder match) and app.js
+                     (script tag, to decide what a relink rewrites), the
+                     same two-user split chroma-math.js already has.
   templates.js       Edit rhythms. Pure data plus one function.
   index.html         Structure.
   styles.css         Tokens at the top.
@@ -387,6 +422,86 @@ can satisfy every rule above and still be missing something the UI reads
 without checking — `captionStyle`, for one, which `renderCaptionStyle`
 dereferences directly. Widening the check to a full schema is a bigger change
 than this one.
+
+### Missing media
+
+A validated project can still be unusable in one specific way `validateProject`
+was never meant to catch: every `clip.src` and bin `media.path` is an absolute
+filesystem path with no indirection, so a source file that got moved, renamed,
+or lives on a drive that is not mounted right now breaks the moment anything
+tries to read it. Before this, that moment was buried inside an export or a
+preview, surfacing as a raw ffmpeg failure or, on the preview's no-WebGL
+fallback path, nothing at all — a `<video>` handed a dead `src` just sits
+there blank. Contrast with the gate above: a malformed project is unusable
+regardless of what a user does next, but a valid project with one moved file
+is usable for everything except that file, and refusing the whole project
+over it would be a worse failure than the one being fixed.
+
+`src/media-relink.js` is the pure half: which paths a project and bin
+currently reference (`collectSourcePaths`), how many clips and whether the
+bin share a given one (`countReferences`), rewriting every clip and bin item
+pointing at one path (`relinkProject` / `relinkBin`), and the one heuristic
+offered for finding a moved file automatically (`matchByFilename`). No I/O,
+same as `shared/project-schema.js` — but it lives in `src/`, not `shared/`,
+because it has two users on two sides of the process boundary: main.js
+`require`s it to build the existence check and the folder match, and app.js
+loads it as a plain `<script>` to decide what a relink actually rewrites.
+`chroma-math.js` is the existing example of a `src/` module used both ways;
+`shared/` stays main-only, per its own section above.
+
+Detection runs before a project is put on screen, not after — `app.js`'s
+`detectMissingMedia` is called ahead of `adoptProject`, on Open, New (in case
+a bin item carried over from the last project is what's missing) and restoring
+an autosave. Ahead, specifically, of the render that follows: the composited
+and no-WebGL fallback preview paths both only reload a clip's video element
+when the active clip *changes* (by id in the fallback, by path in the
+composited view — see "How the composited preview works" below for why the two
+differ), so a check that landed after that first draw would find an unguarded
+load already attempted, with nothing to give the guard a second chance at it.
+
+The panel this feeds is deliberately not a toast: several clips can share one
+missing file, a toast fades on its own schedule regardless of whether anything
+was done about it, and losing track of which clips are still broken is worse
+than a small panel staying in view. **Locate…** opens a single-file picker and
+relinks every clip and bin item that shared the old path in one action — a
+source file backing more than one clip is ordinary, and fixing it once has to
+fix all of them, wired through the same `edit()`/history path any other change
+to a clip uses, so a bad relink is undoable like anything else. The bin half
+is not wired to undo, for the same reason `addPaths` never is — the bin sits
+outside the edit history entirely (see "How undo works" below).
+
+**Locate folder…**, and an automatic check of the project file's own folder
+that runs silently right after detection and only surfaces if it finds
+anything, both go through the same `matchByFilename` — filename equality,
+nothing else. That is a deliberate ceiling, not a first pass at something
+smarter: a folder containing a same-named-but-different file matches with the
+same confidence as the real one, and content-hash matching would close that
+gap at the cost of reading every candidate file up front, for a feature that
+is otherwise about paths and never touches file contents. Neither this nor
+the plain existence check catches a file that exists but is no longer right
+— wrong codec, swapped content under the same name — a known, stated blind
+spot rather than a caught case, the same honesty the "Two export paths"
+section below states for stream copy's own inability to see a clip's
+resolution.
+
+The bin's own gap is worth being explicit about, because it shapes what
+detection can promise: `state.bin` is renderer-only session state that never
+round-trips through a saved project file (nothing in `project-schema.js`'s
+shape describes it), so main.js's `project:open` handler cannot check it —
+only the renderer knows what's currently in the bin. `media:checkMissing` is
+therefore a general-purpose "which of these paths exist" primitive rather
+than something folded into `project:open` itself; app.js calls it with every
+path the newly-opened project *and* the bin already hold, in one round trip,
+right before that project goes on screen.
+
+The cached result, `state.missingSources`, is what the preview guards check —
+cheap, because a preview redraws every frame and cannot afford a round trip
+to main on each one — but it can go stale: undoing a relink puts a clip back
+on a path this session already crossed off as fixed, and the cache has no way
+to hear about that on its own. Export does not trust it: `runExport` re-asks
+main for a fresh answer against every path actually on the timeline
+immediately before running ffmpeg, which is the one moment a stale "looks
+fine" would cost the most to act on.
 
 ### How undo works
 
@@ -609,27 +724,36 @@ later clip outlasting the earlier one — rather than an import of it, because
 `test/timeline-preview.test.js` pins the two files' `TRANSITION_TYPES` lists
 against each other so they cannot quietly drift apart. `layersAt` runs that
 per video track, bottom to top — `project.tracks[0]` first, same order
-`buildExportCommand` composites in — so Video 2 landing over Video 1 in the
-preview is a property of iteration order, not a separate compositing step
-that could disagree with the export's.
+`buildExportCommand` composites in — so a later video track landing over an
+earlier one in the preview is a property of iteration order, not a separate
+compositing step that could disagree with the export's. Nothing about that
+order assumes exactly two video tracks; a third landing over the first two
+is the same iteration doing what it already did.
 
-app.js turns those answers into pixels through a small, fixed **layer
-pool** (`layerPool`, capped at `POOL_SIZE = 4`): each entry owns one
-`<canvas>` and one hidden `<video>`, reused for the life of the session
-rather than created and torn down at every clip or crossfade boundary.
-Recreating a WebGL context is real work and browsers cap how many can be
-live at once, so a fixed pool of four hidden, paused elements — enough for
-both video tracks to be mid-crossfade at the same instant, which is the
-most `layersAt` can ever ask for — is the more defensible choice than
-churning contexts every time the playhead crosses a cut. `#keyCanvas` is
+app.js turns those answers into pixels through a small **layer pool**
+(`layerPool`): each entry owns one `<canvas>` and one hidden `<video>`,
+reused for the life of the session rather than created and torn down at
+every clip or crossfade boundary. Recreating a WebGL context is real work
+and browsers cap how many can be live at once, so reusing a bounded set of
+hidden, paused elements is the more defensible choice than churning
+contexts every time the playhead crosses a cut. The bound itself
+(`poolSize()`) used to be the fixed `POOL_SIZE = 4` — enough for exactly
+two video tracks to be mid-crossfade at the same instant, which was the
+most `layersAt` could ever ask for while the project shape was fixed at
+two. Now that video tracks are not fixed, it is `videoTrackCount * 2`,
+recomputed on every call rather than cached, since a track can be added
+mid-session — but the pool below it still only grows: `poolEntry()` creates
+entries lazily and `layerPool` itself is never shrunk, so adding a track
+never tears down or recreates a context that already exists, it only asks
+for a couple more the next time one is actually needed. `#keyCanvas` is
 pool entry 0 and is the only one that exists in `index.html`; the rest are
 created lazily and stacked into `#previewStage` with plain CSS (each
-non-base layer positioned to fill the base layer's box exactly), so Video 2
-drawing over Video 1 — and the two halves of a crossfade dissolving into
-each other — is ordinary DOM paint order, not anything the shader itself
-had to learn. **The shader in `key-preview.js` is untouched**: every layer
-reuses the exact single-clip `createKeyPreview`/`draw` this preview already
-had, once per canvas.
+non-base layer positioned to fill the base layer's box exactly), so a video
+track drawing over the ones below it — and the two halves of a crossfade
+dissolving into each other — is ordinary DOM paint order, not anything the
+shader itself had to learn. **The shader in `key-preview.js` is
+untouched**: every layer reuses the exact single-clip
+`createKeyPreview`/`draw` this preview already had, once per canvas.
 
 A **crossfade** draws both clips and cross-dissolves them by canvas
 `opacity` for the overlap's duration, with a small label
@@ -738,6 +862,56 @@ so a bug here would have to live in application logic that does not exist;
 this reads as a software-rasteriser warm-up artefact of the test environment,
 not the app, and is noted rather than "fixed" because there is nothing in
 `key-preview.js` to change that would not be pure superstition.
+
+### Video tracks are not fixed at two
+
+`state.project.tracks` was always a plain array — the builder's `videoTracks`
+filters (`canStreamCopy`, `buildExportCommand`) and the preview's `layersAt`
+already iterated it rather than reading `tracks[0]`/`tracks[1]` by name — so
+nothing in the export or the composited preview needed to change to support
+a third video track; `test/ffmpeg-render.test.js` and `test/key-preview.test.js`
+now each carry a real three-video-track case rather than trusting that the
+existing two-track coverage generalises on its own. What needed building was
+the UI: the timeline header's **+ Video track** button, a remove chip per
+track head, and turning "Send to track" from two fixed buttons in
+`index.html` into `renderSendButtons()` — one button per current video
+track plus the fixed audio one, rebuilt alongside the rest of the timeline
+on every `renderAll()`, the same way `renderHeads()` already rebuilds the
+per-track mute/hide row.
+
+A new track is always appended directly above the last existing video
+track — never in the middle, never below — because that is the one
+placement that needs no further decision: it composites over everything
+already there the same way Video 2 already composited over Video 1, so
+"the newest track wins where it overlaps" stays true without a special
+case. Its id and number are picked by scanning every existing video
+track's id (`v`*N*) and name (`Video `*N*) for the highest *N* already in
+use and adding one, rather than by counting tracks — counting would hand
+out a number still visible on screen if an earlier track with a higher
+number had since been removed, and two tracks both reading "Video 3" in
+the head list is a worse bug than a gap in the numbering.
+
+Removing a track is refused, with a toast, while it still has clips on it
+— silently discarding footage because someone clicked the wrong chip is a
+worse failure than a click that does nothing — and refused again for a
+project's last remaining video track, since a project with none has
+nothing for the preview or the export to composite. Above that floor of
+one, removing is unconditional: nothing pins the count at the two the
+project boots with, and there is no technical reason to — `canStreamCopy`
+already treats a single video track as the fast path, so a project trimmed
+back down to one is, if anything, the cheaper case to export. Track
+numbers are never renumbered when one is removed: deleting Video 1 leaves
+Video 2 exactly "Video 2", the same way deleting a clip never renumbers
+the clips after it — a user's name for a track is not the app's to change
+out from under them.
+
+The layer pool's own generalisation — `POOL_SIZE = 4` becoming
+`videoTrackCount * 2` — is covered above, in "How the composited preview
+works".
+
+Audio is still fixed at one track. Adding a second is the smaller,
+still-open half of what the "More tracks" idea used to describe before
+this — see "Extending it" below.
 
 ### Filter order matters
 
@@ -870,13 +1044,10 @@ screen and not just in the string the builder produced.
 
 Reasonable next moves, roughly by effort:
 
-- **More tracks.** `state.project.tracks` is an array; the builder already
-  loops it, and so does `layersAt`. Adding a second audio track is a one-line
-  change plus a UI button. A third *video* track needs one more thing: the
-  preview's layer pool (`POOL_SIZE` in app.js) is sized for two video tracks
-  each possibly mid-crossfade at once — a third would need a bigger pool, or
-  an explicit decision about what happens when a fourth-and-up simultaneous
-  layer is asked for.
+- **A second audio track.** Video tracks are no longer fixed at two — see
+  "Video tracks are not fixed at two", above. Audio still is: adding a
+  second is the one-line-change-plus-a-UI-button this bullet used to
+  describe for video, and is still open.
 
 - **Captions in the preview.** Left out of this PR on purpose — see "How the
   composited preview works". Whenever this is picked up, a positioned

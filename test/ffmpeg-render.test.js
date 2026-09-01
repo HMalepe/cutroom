@@ -65,6 +65,8 @@ const solidBlue = () => source('solid-blue', ['-f', 'lavfi', '-i', 'color=c=blue
 const odd = () => source('odd', ['-f', 'lavfi', '-i', 'testsrc=duration=6:size=640x360:rate=25', '-pix_fmt', 'yuv420p']);
 /** Short and wide, so scaling into a 4:3 canvas leaves transparent bars. */
 const band = () => source('band', ['-f', 'lavfi', '-i', 'color=c=blue:s=640x160:r=30:d=6', '-pix_fmt', 'yuv420p']);
+/** Same shape as band(), a different colour — for stacking two bands to prove which one is on top. */
+const bandWhite = () => source('band-white', ['-f', 'lavfi', '-i', 'color=c=white:s=640x160:r=30:d=6', '-pix_fmt', 'yuv420p']);
 /** Left half green (keyable), right half blue. */
 const keyable = () => source('keyable', [
   '-f', 'lavfi', '-i', 'color=c=0x00FF00:s=160x240:r=30:d=6',
@@ -133,6 +135,23 @@ function project(clips, extra = {}) {
 
 function clip(src, o = {}) {
   return { src, inSec: 0, outSec: 3, startSec: 0, speed: 1, hasVideo: true, hasAudio: false, ...o };
+}
+
+/** Same shape as project(), with a third video track — for proving three video
+ *  tracks (not just the fixed two every other test in this file uses) really
+ *  do all reach a real ffmpeg command and composite in the right order. */
+function project3(v1clips, v2clips, v3clips, extra = {}) {
+  return {
+    name: 'render3', width: 320, height: 240, fps: 30,
+    captionsEnabled: false, captions: [],
+    tracks: [
+      { id: 'v1', kind: 'video', name: 'Video 1', clips: v1clips },
+      { id: 'v2', kind: 'video', name: 'Video 2', clips: v2clips },
+      { id: 'v3', kind: 'video', name: 'Video 3', clips: v3clips },
+      { id: 'a1', kind: 'audio', name: 'Audio 1', clips: [] }
+    ],
+    ...extra
+  };
 }
 
 /** Build the command for a project and actually run it. Returns the output path. */
@@ -317,6 +336,31 @@ test('a run composites with layering, audio and burnt-in captions all at once', 
     ['-v', 'error', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', out],
     { encoding: 'utf8' }).stdout.trim().split('\n').sort();
   assert.deepEqual(streams, ['audio', 'video'], 'both streams should survive');
+});
+
+test('three video tracks all composite in one export, the newest on top', opts, () => {
+  // Not a run — three separate, non-crossfading video tracks, which is the
+  // shape "more than two video tracks" actually takes for most projects.
+  // v1 is a full-canvas base; v2 and v3 are band-shaped clips placed at the
+  // exact same spot, so if the newest track (v3) did not land above v2 the
+  // way Video 2 always composited over Video 1, the centre sample below
+  // would come back blue instead of white.
+  const proj = project3(
+    [clip(red(), { startSec: 0, outSec: 3 })],
+    [clip(band(), { startSec: 0, outSec: 3 })],       // blue band, dead centre
+    [clip(bandWhite(), { startSec: 0, outSec: 3 })]   // white band, same spot, on top
+  );
+  const out = render('three-video-tracks', proj);
+
+  // Dead centre: covered by both bands. The topmost track (v3, white) must win.
+  const centre = pixel(out, 1.5);
+  assert.ok(centre[0] > 220 && centre[1] > 220 && centre[2] > 220,
+    `centre should show v3's white on top of v2's blue, saw rgb(${centre})`);
+
+  // Above the bands: neither v2 nor v3 reaches here, so v1's red base shows through.
+  const above = pixel(out, 1.5, 156, 20);
+  assert.ok(above[0] > 180 && above[1] < 90 && above[2] < 90,
+    `uncovered area should fall through to v1's red base, saw rgb(${above})`);
 });
 
 test('real per-word karaoke timing sweeps through libass, not just through the builder', opts, () => {

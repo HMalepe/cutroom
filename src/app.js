@@ -67,7 +67,19 @@ const state = {
   pxPerSec: 40,
   snapBeats: false,
   env: null,
-  exporting: false
+  exporting: false,
+  // Where the currently open project's file lives, if it has one — needed
+  // only for the "check the project's own folder" relink convenience below.
+  // Main.js is the real owner of this (see its own currentPath); this is a
+  // copy for the one thing here that needs it without a round trip.
+  projectFilePath: null,
+  // Absolute paths that main.js could not find on disk the last time this
+  // was checked (project open, or a relink), across both clips and the bin.
+  // See "Missing media" below.
+  missingSources: new Set(),
+  // Missing paths matched by filename to something sitting in the project's
+  // own folder, offered but not applied until the user says so.
+  folderMatches: []
 };
 
 let clipSeq = 0;
@@ -93,6 +105,8 @@ function fmtTime(sec) {
 function fileUrl(p) {
   return 'file://' + p.split(/[\\/]/).map(encodeURIComponent).join('/');
 }
+
+const basename = (p) => String(p).split(/[\\/]/).pop();
 
 function toast(msg, kind = 'ok', detail = '') {
   const el = document.createElement('div');
@@ -546,22 +560,33 @@ async function doOpen() {
     toast('Could not open that project', 'err', res.detail ? `${res.error}\n${res.detail}` : res.error);
     return;
   }
+  const missing = await detectMissingMedia(res.project);
   adoptProject(res.project);
   // Opened means saved: what is on screen is exactly what is in the file.
   dirtyTracker.markSaved();
   notifyProjectChanged();
+  state.projectFilePath = res.filePath || null;
+  renderRelinkPanel();
   toast('Project opened.');
+  if (missing.length) await offerFolderAutoMatch(missing);
 }
 
 async function doNew() {
   if (!await confirmDiscard()) return;
   await api.newProject();
-  adoptProject(defaultProject());
+  const fresh = defaultProject();
+  // A fresh project has no clips of its own, but the surviving bin (New
+  // does not clear it — see below) could still hold a path that was already
+  // known missing, so this is a recheck rather than a reset.
+  await detectMissingMedia(fresh);
+  adoptProject(fresh);
   // The media bin survives, for the reason undo leaves it alone: importing a
   // file is not an edit, and making someone re-find their footage to start a
   // second cut of it would be a strange thing to call New.
   dirtyTracker.markSaved();
   notifyProjectChanged();
+  state.projectFilePath = null;
+  renderRelinkPanel();
   toast('New project.');
 }
 
@@ -651,6 +676,37 @@ function renderBin() {
     : 'Select clips in the bin, then send them to a track. Order of selection is the order they land.';
 }
 
+/**
+ * One "→ Video N" button per current video track, plus the fixed audio one.
+ * The video half of this used to be two static buttons in index.html
+ * (`btnSendV1`/`btnSendV2`) wired to fixed ids — that stopped being possible
+ * the moment the track list could grow or shrink, so it is rebuilt here on
+ * every renderAll() instead, the same way renderHeads() already rebuilds the
+ * per-track mute/hide row. Ids follow the same `btnSend` + capitalised track
+ * id shape the old static markup used (`v1` -> `btnSendV1`), so a default
+ * two-video-track project hands back exactly the ids it always did and
+ * nothing that already looks a button up by id has to change.
+ */
+function renderSendButtons() {
+  const box = $('sendButtons');
+  box.innerHTML = '';
+  for (const track of state.project.tracks) {
+    if (track.kind !== 'video') continue;
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-sm';
+    btn.id = 'btnSend' + track.id.charAt(0).toUpperCase() + track.id.slice(1);
+    btn.textContent = `→ ${track.name}`;
+    btn.onclick = () => sendToTrack(track.id);
+    box.appendChild(btn);
+  }
+  const audio = document.createElement('button');
+  audio.className = 'btn btn-sm';
+  audio.id = 'btnSendA1';
+  audio.textContent = '→ Audio 1';
+  audio.onclick = () => sendToTrack('a1');
+  box.appendChild(audio);
+}
+
 function sendToTrack(trackId) {
   const track = state.project.tracks.find(t => t.id === trackId);
   if (!track) return;
@@ -682,6 +738,161 @@ function sendToTrack(trackId) {
 }
 
 // ==========================================================================
+// Missing media
+// ==========================================================================
+
+/*
+ * `clip.src` and bin `media.path` are absolute paths with no indirection —
+ * move the file, rename it, or open the project with a drive unmounted, and
+ * the path just stops resolving. Detection asks main.js (the renderer has no
+ * filesystem access) right after a project is adopted — Open, and restoring
+ * an autosave — for every path the project and bin currently reference. A
+ * hit does not refuse the project the way a bad file shape does in
+ * project-schema.js: everything not touching the missing file(s) is still
+ * editable, and the panel below is how relinking happens without leaving it.
+ *
+ * What this does not catch: a file that exists but is no longer the right
+ * one — wrong codec, wrong content, silently swapped underneath the same
+ * name. Existence is all fs.existsSync can tell main.js, and existence is
+ * all this checks.
+ *
+ * Takes the project explicitly and runs before adoptProject rather than
+ * after, on purpose: adoptProject's own renderAll() draws the timeline at
+ * whatever state.missingSources already holds, and both preview paths below
+ * only reload a clip's source when it *changes* (by id in the no-WebGL
+ * fallback, by path in the composited one) — so a check that landed after
+ * that first draw would find an unguarded load already in flight, with no
+ * second draw coming to give the guard another chance at it.
+ */
+async function detectMissingMedia(project) {
+  const paths = MediaRelink.collectSourcePaths(project, state.bin);
+  const missing = paths.length ? await api.checkMissing(paths) : [];
+  state.missingSources = new Set(missing);
+  state.folderMatches = [];
+  return missing;
+}
+
+/**
+ * The no-dialog half of the folder convenience: if the project has a file of
+ * its own, check whether any missing file is sitting right beside it before
+ * asking the user to go looking. Silent when nothing matches — this runs on
+ * every open, and a project with no missing media should see nothing from it.
+ */
+async function offerFolderAutoMatch(missing) {
+  if (!state.projectFilePath) return;
+  const res = await api.relinkFolder({ missing, projectFilePath: state.projectFilePath });
+  if (res && res.matches && res.matches.length) {
+    state.folderMatches = res.matches;
+    renderRelinkPanel();
+  }
+}
+
+/** Every distinct source path a clip on the timeline currently points at. */
+function timelineSourcePaths() {
+  const found = new Set();
+  for (const track of state.project.tracks) {
+    for (const clip of track.clips) {
+      if (clip.src) found.add(clip.src);
+    }
+  }
+  return [...found];
+}
+
+/**
+ * Rewrite every clip and bin item pointing at `oldPath` to `newPath`. The
+ * clip half goes through edit() so a bad relink is undoable like any other
+ * change to the project; the bin half is not, for the same reason addPaths
+ * never wires undo either — the bin is not part of the edit history.
+ */
+function applyRelink(oldPath, newPath) {
+  edit('relink media', () => {
+    state.project = MediaRelink.relinkProject(state.project, oldPath, newPath).project;
+  });
+  state.bin = MediaRelink.relinkBin(state.bin, oldPath, newPath).bin;
+  state.missingSources.delete(oldPath);
+  state.folderMatches = state.folderMatches.filter(m => m.oldPath !== oldPath);
+  renderBin();
+  renderAll();
+  renderRelinkPanel();
+  toast(`Relinked ${basename(oldPath)} to ${basename(newPath)}.`);
+}
+
+async function locateMissing(oldPath) {
+  const dirGuess = oldPath.slice(0, oldPath.length - basename(oldPath).length);
+  const picked = await api.locateMedia(dirGuess);
+  if (picked) applyRelink(oldPath, picked);
+}
+
+async function locateMissingFolder() {
+  const missing = [...state.missingSources];
+  const res = await api.relinkFolder({ missing });
+  if (!res) return; // dialog cancelled
+  if (!res.matches.length) { toast('No matching filenames in that folder.', 'warn'); return; }
+  for (const { oldPath, newPath } of res.matches) applyRelink(oldPath, newPath);
+}
+
+function useFolderMatches() {
+  for (const { oldPath, newPath } of state.folderMatches) applyRelink(oldPath, newPath);
+}
+
+function renderRelinkPanel() {
+  const panel = $('relinkPanel');
+  const count = state.missingSources.size;
+  panel.style.display = count ? 'block' : 'none';
+  if (!count) return;
+
+  $('relinkCount').textContent = String(count);
+
+  const auto = $('relinkAuto');
+  if (state.folderMatches.length) {
+    auto.style.display = 'flex';
+    auto.innerHTML = '';
+    const label = document.createElement('span');
+    label.style.flex = '1';
+    const n = state.folderMatches.length;
+    label.textContent = `Found ${n} matching filename${n === 1 ? '' : 's'} in the project's folder.`;
+    const use = document.createElement('button');
+    use.className = 'btn btn-sm';
+    use.textContent = 'Relink';
+    use.onclick = useFolderMatches;
+    auto.append(label, use);
+  } else {
+    auto.style.display = 'none';
+  }
+
+  const list = $('relinkList');
+  list.innerHTML = '';
+  for (const p of state.missingSources) {
+    const { clips, inBin } = MediaRelink.countReferences(state.project, state.bin, p);
+    const uses = [];
+    if (clips) uses.push(`${clips} clip${clips === 1 ? '' : 's'}`);
+    if (inBin) uses.push('media bin');
+
+    const row = document.createElement('div');
+    row.className = 'relink-item';
+
+    const meta = document.createElement('div');
+    meta.className = 'relink-item-meta';
+    const name = document.createElement('div');
+    name.className = 'relink-item-name';
+    name.textContent = basename(p);
+    name.title = p;
+    const sub = document.createElement('div');
+    sub.className = 'relink-item-sub';
+    sub.textContent = uses.length ? `used by ${uses.join(', ')}` : 'not currently used';
+    meta.append(name, sub);
+
+    const locate = document.createElement('button');
+    locate.className = 'btn btn-sm';
+    locate.textContent = 'Locate…';
+    locate.onclick = () => locateMissing(p);
+
+    row.append(meta, locate);
+    list.appendChild(row);
+  }
+}
+
+// ==========================================================================
 // Preview
 // ==========================================================================
 
@@ -700,8 +911,9 @@ function sendToTrack(trackId) {
  * changes what the inspector edits, and those edits show up here the moment
  * the playhead is sitting over that clip, same as it always could. A layer
  * pool of canvas+<video> pairs (layerPool, below) supplies one pair per
- * active layer: normally one per video track, up to POOL_SIZE at once if
- * both tracks happen to be mid-crossfade together. Pressing play now
+ * active layer: normally one per video track, up to twice that many at once
+ * if every track happens to be mid-crossfade together (see poolSize()).
+ * Pressing play now
  * advances a timeline clock (stepTimelineClock, in timeline-preview.js) that
  * seeks every active layer's <video> to keep pace with it, rather than the
  * old design where a single <video>'s own playback WAS the clock.
@@ -743,14 +955,34 @@ function sendToTrack(trackId) {
 // One canvas+<video> pair per concurrent layer. #keyCanvas (pool[0]) always
 // exists in the markup; the rest are created lazily and kept for the life of
 // the session rather than torn down at every clip boundary — recreating a
-// WebGL context is real work, and a fixed pool of four hidden, paused
-// elements is not the kind of growth "leaking" means. Two video tracks each
-// mid-crossfade is the most layers layersAt can ever hand back at once; a
-// third clip overlapping *inside* an active crossfade on one track (a
-// same-track triple overlap) is not resolved by trackStateAt either, and is
-// not attempted here — see that function's own comment.
-const POOL_SIZE = 4;
+// WebGL context is real work, and a growing-but-never-shrinking pool of
+// hidden, paused elements is not the kind of growth "leaking" means. A clip
+// overlapping *inside* an active crossfade on one track (a same-track triple
+// overlap) is not resolved by trackStateAt either, and is not attempted here
+// — see that function's own comment.
 const layerPool = [];
+
+/**
+ * How many concurrent canvas+<video> pairs the pool needs to cover. Per
+ * video track, layersAt hands back at most two clips at once — outgoing and
+ * incoming, mid-crossfade — never three, because trackStateAt only ever
+ * resolves the two clips nearest the playhead (see its own comment on
+ * same-track triple overlaps). So the true worst case, every video track
+ * mid-crossfade at the same instant, is videoTrackCount * 2. This used to be
+ * the fixed POOL_SIZE = 4, sized for the two video tracks the project always
+ * had; recomputed here instead of cached, since a track can be added mid-
+ * session and the answer has to grow with it. Recomputing costs nothing the
+ * pool itself doesn't already pay for: poolEntry() only ever creates entries
+ * up to whatever index a draw actually asks for, and layerPool is never
+ * shrunk (session-long reuse, per the comment above) — so a bigger number
+ * here does not tear down or recreate a single WebGL context that already
+ * exists, it only allows asking for a couple more the next time the
+ * timeline actually needs them.
+ */
+function poolSize() {
+  const videoTracks = state.project.tracks.filter(t => t.kind === 'video').length;
+  return Math.max(2, videoTracks * 2);
+}
 
 // A decoder free-running at 1x still drifts a frame or two from wall-clock
 // time; correcting on every tick would fight the decoder instead of letting
@@ -759,6 +991,7 @@ const DRIFT_THRESHOLD = 0.15;
 
 let binPreviewPath = null;   // non-null while a bin item, not the timeline, is showing
 let fallbackClipId = null;   // which clip #video is playing in the no-WebGL fallback
+let fallbackSrc = null;      // and which src it was loaded from — see drawPlainFallback
 let compositedActive = false; // whether togglePlay should drive the timeline clock
 let timelinePlaying = false;
 let lastTickAt = null;
@@ -882,6 +1115,13 @@ function loadPreviewFromBin(path) {
     $('viewerEmpty').style.display = 'block';
     return;
   }
+  if (state.missingSources.has(path)) {
+    v.removeAttribute('src');
+    v.style.display = 'none';
+    $('viewerEmpty').style.display = 'block';
+    toast(`Missing source: ${basename(path)}`, 'err');
+    return;
+  }
   v.src = fileUrl(path);
   v.style.display = 'block';
   v.controls = true;
@@ -911,10 +1151,19 @@ function drawPlainFallback(layers) {
   v.controls = true;
   v.classList.remove('texture-only');
 
-  const changed = fallbackClipId !== clip.id;
+  // Keyed on src as well as id: relinking the clip that is currently the
+  // fallback's active clip changes src without changing id, and that has to
+  // reload the element rather than leave it parked on the dead path just
+  // because "the same clip" is still selected.
+  const changed = fallbackClipId !== clip.id || fallbackSrc !== clip.src;
   if (changed) {
     fallbackClipId = clip.id;
-    v.src = fileUrl(clip.src);
+    fallbackSrc = clip.src;
+    if (state.missingSources.has(clip.src)) {
+      toast(`Missing source: ${basename(clip.src)}`, 'err');
+    } else {
+      v.src = fileUrl(clip.src);
+    }
   }
   // Only force the frame while paused: fighting an already-playing native
   // element with a seek on every sync is exactly what this path is meant to
@@ -949,7 +1198,7 @@ function drawComposited(layers, t) {
     badge.style.display = 'none';
   }
 
-  const used = Math.min(slots.length, POOL_SIZE);
+  const used = Math.min(slots.length, poolSize());
   for (let i = 0; i < used; i++) {
     const entry = poolEntry(i);
     const slot = slots[i];
@@ -957,7 +1206,11 @@ function drawComposited(layers, t) {
 
     if (entry.currentSrc !== slot.clip.src) {
       entry.currentSrc = slot.clip.src;
-      entry.video.src = fileUrl(slot.clip.src);
+      if (state.missingSources.has(slot.clip.src)) {
+        toast(`Missing source: ${basename(slot.clip.src)}`, 'err');
+      } else {
+        entry.video.src = fileUrl(slot.clip.src);
+      }
     }
     syncVideoToTime(entry.video, slot.clip, srcTime, timelinePlaying);
 
@@ -1114,6 +1367,80 @@ function togglePlay() {
 // Timeline rendering
 // ==========================================================================
 
+/**
+ * The number to give a new video track's id (`v`N) and name (`Video `N).
+ * Scanning every existing video track's id and name for the highest N
+ * already in use, rather than counting tracks, means a number already
+ * removed from the project this session is never handed out again while a
+ * higher one is still on screen — counting would let a freshly-added track
+ * collide with one still visible if an earlier, higher-numbered track had
+ * been removed in between, and two tracks both reading "Video 3" in the
+ * head list is a worse bug than a gap in the numbering.
+ */
+function nextVideoTrackNumber(tracks) {
+  let max = 0;
+  for (const t of tracks) {
+    if (t.kind !== 'video') continue;
+    const idMatch = typeof t.id === 'string' && t.id.match(/^v(\d+)$/);
+    if (idMatch) max = Math.max(max, Number(idMatch[1]));
+    const nameMatch = typeof t.name === 'string' && t.name.match(/^Video (\d+)$/);
+    if (nameMatch) max = Math.max(max, Number(nameMatch[1]));
+  }
+  return max + 1;
+}
+
+/**
+ * Add a video track, always appended directly above the last existing video
+ * track (never in the middle, never below) — the one placement that needs no
+ * further decision, because it composites over everything already there the
+ * same way Video 2 already composited over Video 1. Inserted right after the
+ * last video track rather than at the very end of the array, so it lands
+ * above the other video tracks without jumping past the audio track in the
+ * head list.
+ */
+function addVideoTrack() {
+  edit('add video track', () => {
+    const tracks = state.project.tracks;
+    const n = nextVideoTrackNumber(tracks);
+    let insertAt = tracks.length;
+    for (let i = tracks.length - 1; i >= 0; i--) {
+      if (tracks[i].kind === 'video') { insertAt = i + 1; break; }
+    }
+    tracks.splice(insertAt, 0, { id: `v${n}`, kind: 'video', name: `Video ${n}`, clips: [] });
+  });
+  renderAll();
+}
+
+/**
+ * Remove a video track. Refused, with a toast, while it still has clips —
+ * silently discarding footage because someone clicked the wrong chip is a
+ * worse failure than a click that does nothing, so this never gets to choose
+ * between the two. Refused again for a project's last remaining video
+ * track: there is no floor at the two tracks a project boots with (one video
+ * track is `canStreamCopy`'s fast path, if anything the cheaper project to
+ * export), but a project with zero has nothing for the preview or the
+ * export to composite. Track numbers are never renumbered or shuffled down
+ * when one is removed — deleting Video 1 leaves Video 2 exactly "Video 2",
+ * the same way deleting a clip never renumbers the clips after it.
+ */
+function removeVideoTrack(trackId) {
+  const track = state.project.tracks.find(t => t.id === trackId && t.kind === 'video');
+  if (!track) return;
+  if (track.clips.length) {
+    toast(`${track.name} has clips on it — remove them first.`, 'warn');
+    return;
+  }
+  const videoCount = state.project.tracks.filter(t => t.kind === 'video').length;
+  if (videoCount <= 1) {
+    toast('A project needs at least one video track.', 'warn');
+    return;
+  }
+  edit('remove video track', () => {
+    state.project.tracks = state.project.tracks.filter(t => t.id !== trackId);
+  });
+  renderAll();
+}
+
 function renderHeads() {
   const heads = $('tlHeads');
   heads.innerHTML = '<div class="tl-heads-pad"></div>';
@@ -1141,7 +1468,15 @@ function renderHeads() {
     hide.onclick = () => { edit('hide track', () => { track.hidden = !track.hidden; }); renderAll(); };
 
     btns.append(mute);
-    if (track.kind === 'video') btns.append(hide);
+    if (track.kind === 'video') {
+      btns.append(hide);
+      const remove = document.createElement('button');
+      remove.className = 'chip';
+      remove.textContent = '✕';
+      remove.title = 'Remove this video track (only while it has no clips)';
+      remove.onclick = () => removeVideoTrack(track.id);
+      btns.append(remove);
+    }
     el.append(name, btns);
     heads.appendChild(el);
   }
@@ -2099,6 +2434,10 @@ async function transcribeSelected() {
   const clip = selectedClip();
   const source = clip ? clip.src : (state.binSelection[0] || state.bin[0]?.path);
   if (!source) { toast('Select a clip or a bin item to transcribe.', 'warn'); return; }
+  if (state.missingSources.has(source)) {
+    toast(`Missing source: ${basename(source)}`, 'err', 'Relink it from the Missing media panel first.');
+    return;
+  }
 
   toast('Transcribing. This runs locally and can take a while on long clips.');
   const res = await api.transcribe(source, 'auto');
@@ -2217,6 +2556,32 @@ async function runExport(previewSeconds) {
   if (state.exporting) return;
   if (!projectDuration()) { toast('Timeline is empty.', 'warn'); return; }
 
+  // Caught here rather than left to ffmpeg: a missing input fails deep
+  // inside the filter graph with a raw stderr dump that names a file path
+  // and nothing else, where this can say which clip and point at the panel.
+  //
+  // Checked fresh against disk rather than trusting state.missingSources: the
+  // preview guards below use that cache because a preview redraws every
+  // frame and cannot afford a round trip to main on each one, but it can go
+  // stale — undoing a relink puts a clip back on a path this session already
+  // crossed off as fixed, and export is exactly the moment a stale "looks
+  // fine" is worst to act on. One check here costs nothing an export was not
+  // already about to spend far more time on.
+  const paths = timelineSourcePaths();
+  const missing = paths.length ? await api.checkMissing(paths) : [];
+  if (missing.length) {
+    // Bring the cache back in line with what was just found, so the panel
+    // (and the cheaper preview guards) reflect it without a second check.
+    state.missingSources = new Set([...state.missingSources, ...missing]);
+    renderRelinkPanel();
+    toast(
+      missing.length === 1 ? "A clip's source file is missing." : `${missing.length} clips' source files are missing.`,
+      'err',
+      `${missing.map(basename).join('\n')}\n\nRelink from the Missing media panel before exporting.`
+    );
+    return;
+  }
+
   state.exporting = true;
   $('progress').style.display = 'block';
   $('btnCancelExport').style.display = 'inline-block';
@@ -2253,6 +2618,7 @@ async function runExport(previewSeconds) {
 
 function renderAll() {
   renderHeads();
+  renderSendButtons();
   renderTimeline();
   renderInspector();
   syncTimelinePreview();
@@ -2277,10 +2643,6 @@ document.addEventListener('drop', async (e) => {
   const paths = [...e.dataTransfer.files].map(f => api.pathForFile(f)).filter(Boolean);
   if (paths.length) addPaths(paths);
 });
-
-$('btnSendV1').onclick = () => sendToTrack('v1');
-$('btnSendV2').onclick = () => sendToTrack('v2');
-$('btnSendA1').onclick = () => sendToTrack('a1');
 
 // Transport — togglePlay itself lives in the Preview section, above, next to
 // the timeline clock it drives.
@@ -2309,6 +2671,7 @@ $('btnSetOut').onclick = setOutAtPlayhead;
 $('btnDeleteClip').onclick = () => deleteSelected();
 $('btnDuplicateClip').onclick = duplicateSelected;
 $('btnCloseGaps').onclick = closeGaps;
+$('btnAddVideoTrack').onclick = addVideoTrack;
 
 // Zoom
 $('btnZoomIn').onclick = () => { state.pxPerSec = clamp(state.pxPerSec * 1.4, 4, 600); renderTimeline(); };
@@ -2381,6 +2744,15 @@ $('btnCopyCmd').onclick = () => {
   toast('Command copied. Paste it in a terminal to run it yourself.');
 };
 
+// Missing media panel
+$('relinkHead').onclick = (e) => {
+  if (e.target.id === 'btnRelinkFolder') return;
+  const panel = $('relinkPanel');
+  panel.classList.toggle('collapsed');
+  $('relinkToggle').textContent = panel.classList.contains('collapsed') ? 'show' : 'hide';
+};
+$('btnRelinkFolder').onclick = () => locateMissingFolder();
+
 // Save / open. The toolbar buttons and the File menu run the same functions,
 // so there is one behaviour to get right rather than two to keep in step.
 $('btnSave').onclick = () => doSave(false);
@@ -2431,12 +2803,16 @@ api.onMenuCommand(async ({ command, reply } = {}) => {
  * user puts it somewhere. Marking it saved here would be a lie that costs the
  * work the second time.
  */
-api.onRestoreProject(({ project } = {}) => {
+api.onRestoreProject(async ({ project, filePath } = {}) => {
   if (!project) return;
+  const missing = await detectMissingMedia(project);
   adoptProject(project);
   dirtyTracker.markUnsaved();
   notifyProjectChanged();
+  state.projectFilePath = filePath || null;
+  renderRelinkPanel();
   toast('Recovered unsaved work from the last session. Save it somewhere.', 'warn');
+  if (missing.length) await offerFolderAutoMatch(missing);
 });
 
 // Shared by the keydown listener below and the 'copy-clips'/'paste-clips'

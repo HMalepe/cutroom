@@ -669,6 +669,85 @@ input[type="number"].input { font-family: var(--mono); font-variant-numeric: tab
 }
 .cmd.collapsed .cmd-body { display: none; }
 
+/* --- Missing media -------------------------------------------------------
+   A toast is too easy to dismiss and lose track of when several clips share
+   one moved file, so this stays on screen — collapsible like the command
+   strip, but not timed out like a toast, until every entry is relinked.
+   ------------------------------------------------------------------------ */
+
+.relink-panel {
+  position: fixed;
+  right: 14px;
+  bottom: 14px;
+  width: 360px;
+  max-width: calc(100vw - 28px);
+  background: var(--panel-high);
+  border: 1px solid var(--rose);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.45);
+  z-index: 90; /* under toasts (100), which still land on top when both show */
+}
+.relink-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+.relink-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--rose);
+}
+.relink-count {
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 100px;
+  border: 1px solid var(--rose);
+  color: var(--rose);
+}
+.relink-panel.collapsed .relink-body { display: none; }
+
+.relink-body {
+  max-height: 320px;
+  overflow: auto;
+  padding: 0 10px 10px;
+}
+
+.relink-auto {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  margin-bottom: 8px;
+  background: var(--ground);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font-size: 11.5px;
+  color: var(--ink-mid);
+}
+
+.relink-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 0;
+  border-top: 1px solid var(--line-soft);
+}
+.relink-item:first-child { border-top: none; }
+.relink-item-meta { min-width: 0; flex: 1; }
+.relink-item-name {
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.relink-item-sub {
+  font-size: 10.5px;
+  color: var(--ink-dim);
+}
+
 /* --- Toast -------------------------------------------------------------- */
 
 .toast-stack {
