@@ -608,6 +608,11 @@ async function checkEnv() {
     toast('ffmpeg not found. Nothing will export until it is installed.', 'err',
       'macOS:  brew install ffmpeg\nWindows: winget install ffmpeg\nLinux:  sudo apt install ffmpeg');
   }
+  // Waveform/thumbnail requests made before this resolved were skipped (see
+  // ensureWaveform/ensureThumbnails below) — now that ffmpeg's presence is
+  // actually known, give the timeline that was already drawn a chance to ask
+  // again rather than leaving it plain until the next unrelated re-render.
+  renderTimeline();
 }
 
 // ==========================================================================
@@ -1518,6 +1523,151 @@ function renderRuler(width) {
   }
 }
 
+// ==========================================================================
+// Media previews — waveforms and thumbnails
+// ==========================================================================
+
+/*
+ * Both caches are keyed by source path (clip.src), not clip id: several
+ * clips can point at the same source file — the same b-roll cut in twice,
+ * or a clip split by 'S' — and all of them should draw from one ffmpeg
+ * request rather than one each. *Requests* maps hold the in-flight promise
+ * for a source that has been asked for but not answered yet, so a burst of
+ * renderTimeline() calls — a clip drag fires one per pointermove — triggers
+ * the fetch once, not once per frame of the drag.
+ *
+ * A cached value of `null` means "asked, and it failed or ffmpeg was not
+ * available" — remembered rather than retried, so a file with no readable
+ * audio, or a machine with no ffmpeg, does not turn every re-render into
+ * another failed IPC round trip. checkEnv() re-renders the timeline once
+ * ffmpeg's presence is known, which is what gives a `null` written before
+ * that point a chance to be asked again.
+ */
+const waveformCache = new Map();
+const thumbnailCache = new Map();
+const waveformRequests = new Map();
+const thumbnailRequests = new Map();
+
+function ensureWaveform(src) {
+  if (!src || waveformCache.has(src) || waveformRequests.has(src)) return;
+  if (!state.env || !state.env.ffmpeg) return;
+  const req = api.getWaveform(src)
+    .then(record => { waveformCache.set(src, record); redrawClipsFor(src); })
+    .catch(() => { waveformCache.set(src, null); })
+    .finally(() => waveformRequests.delete(src));
+  waveformRequests.set(src, req);
+}
+
+function ensureThumbnails(src) {
+  if (!src || thumbnailCache.has(src) || thumbnailRequests.has(src)) return;
+  if (!state.env || !state.env.ffmpeg) return;
+  const req = api.getThumbnails(src)
+    .then(record => { thumbnailCache.set(src, record); redrawClipsFor(src); })
+    .catch(() => { thumbnailCache.set(src, null); })
+    .finally(() => thumbnailRequests.delete(src));
+  thumbnailRequests.set(src, req);
+}
+
+/**
+ * Repaints just the clips built from `src`, once a fetch it kicked off
+ * resolves — not a full renderTimeline(), which would rebuild every clip on
+ * the timeline for data that only changed for this one source file.
+ */
+function redrawClipsFor(src) {
+  for (const track of state.project.tracks) {
+    for (const clip of track.clips) {
+      if (clip.src !== src) continue;
+      const el = document.querySelector(`[data-clip-id="${clip.id}"]`);
+      if (el) paintClipMedia(el, clip);
+    }
+  }
+}
+
+// Audio-only clip: the waveform fills the clip. Video clip with audio: a
+// strip along the bottom, leaving the rest of the clip for its filmstrip.
+const WAVEFORM_FULL_HEIGHT = 44;
+const WAVEFORM_STRIP_HEIGHT = 16;
+const THUMBNAIL_FRAME_WIDTH = 48;
+
+/**
+ * Builds (the first time) or repaints (every time after) the waveform
+ * canvas and/or thumbnail strip inside one clip's element, and kicks off
+ * whichever fetch is still missing. Called once when the clip's DOM node is
+ * built (renderClipEl) and again, without touching the rest of the node,
+ * whenever that fetch resolves (redrawClipsFor) — so a slow ffmpeg request
+ * does not have to wait for the next unrelated re-render to show up.
+ */
+function paintClipMedia(el, clip) {
+  const width = Math.max(14, clipDur(clip) * state.pxPerSec);
+  const showThumbs = Boolean(clip.hasVideo);
+  const showWave = Boolean(clip.hasAudio);
+
+  let thumbs = el.querySelector('.clip-thumbs');
+  if (showThumbs && !thumbs) {
+    thumbs = document.createElement('div');
+    thumbs.className = 'clip-thumbs';
+    el.appendChild(thumbs);
+  }
+  if (thumbs) {
+    thumbs.style.bottom = (showWave ? WAVEFORM_STRIP_HEIGHT : 0) + 'px';
+    ensureThumbnails(clip.src);
+    drawThumbnails(thumbs, clip, width);
+  }
+
+  let canvas = el.querySelector('.clip-waveform');
+  if (showWave && !canvas) {
+    canvas = document.createElement('canvas');
+    canvas.className = 'clip-waveform';
+    el.appendChild(canvas);
+  }
+  if (canvas) {
+    const height = showThumbs ? WAVEFORM_STRIP_HEIGHT : WAVEFORM_FULL_HEIGHT;
+    canvas.style.height = height + 'px';
+    canvas.width = Math.round(width);
+    canvas.height = height;
+    ensureWaveform(clip.src);
+    drawWaveform(canvas, clip);
+  }
+}
+
+function drawWaveform(canvas, clip) {
+  const record = waveformCache.get(clip.src);
+  const ctx = canvas.getContext('2d');
+  // Not loaded yet, ffmpeg missing/failed, or (a machine with no 2D canvas
+  // support at all) no context — the clip is left its plain colour, the
+  // same degrade the WebGL preview falls back to when it has none either.
+  if (!record || !ctx) return;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = 'rgba(226, 232, 240, 0.55)';
+  const bars = WaveformRender.waveformBars(record.peaks, {
+    peaksPerSecond: record.peaksPerSecond,
+    fromSec: clip.inSec,
+    toSec: clip.outSec,
+    width: canvas.width,
+    height: canvas.height
+  });
+  for (const b of bars) ctx.fillRect(b.x, b.top, 1, b.height);
+}
+
+function drawThumbnails(container, clip, width) {
+  const record = thumbnailCache.get(clip.src);
+  container.innerHTML = '';
+  if (!record || !record.frames.length) return;
+  const frames = ThumbnailRender.filmstripFrames(record.frames, {
+    fromSec: clip.inSec,
+    toSec: clip.outSec,
+    width,
+    frameWidth: THUMBNAIL_FRAME_WIDTH
+  });
+  for (const f of frames) {
+    const img = document.createElement('img');
+    img.className = 'clip-thumb-frame';
+    img.src = f.dataUrl;
+    img.style.left = Math.round(f.x) + 'px';
+    container.appendChild(img);
+  }
+}
+
 function renderClipEl(clip, track) {
   const el = document.createElement('div');
   el.className = 'clip'
@@ -1567,6 +1717,8 @@ function renderClipEl(clip, track) {
   hr.className = 'clip-handle right';
   hr.dataset.handle = 'right';
   el.append(hl, hr);
+
+  paintClipMedia(el, clip);
 
   return el;
 }

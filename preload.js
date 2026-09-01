@@ -14,6 +14,12 @@ contextBridge.exposeInMainWorld('cutroom', {
   probe: (filePath) => ipcRenderer.invoke('media:probe', filePath),
   grabFrame: (filePath, atSec) => ipcRenderer.invoke('media:frame', { filePath, atSec }),
 
+  // Timeline waveforms and thumbnails. Both cover the whole source file, not
+  // one clip's trim, so the renderer only ever asks once per source — see
+  // main.js's "Waveforms and thumbnails" section.
+  getWaveform: (filePath) => ipcRenderer.invoke('media:waveform', filePath),
+  getThumbnails: (filePath) => ipcRenderer.invoke('media:thumbnails', filePath),
+
   // Missing media (moved/renamed source files). checkMissing is the only one
   // of the three that touches the filesystem directly — the other two open a
   // dialog and hand back what the user picked, same as pickMedia above.

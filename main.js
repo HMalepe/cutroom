@@ -15,6 +15,7 @@ const os = require('os');
 const builder = require('./shared/ffmpeg-builder');
 const { validateProject, PROJECT_VERSION } = require('./shared/project-schema');
 const saveState = require('./shared/save-state');
+const mediaCache = require('./shared/media-cache');
 const { commandForInput } = require('./shared/clipboard-shortcuts');
 const { matrixNameFromTags } = require('./src/chroma-math');
 const mediaRelink = require('./src/media-relink');
@@ -584,6 +585,150 @@ ipcMain.handle('media:frame', async (_e, { filePath, atSec }) => {
   const data = fs.readFileSync(tmp).toString('base64');
   try { fs.unlinkSync(tmp); } catch {}
   return `data:image/png;base64,${data}`;
+});
+
+// --------------------------------------------------------------------------
+// Waveforms and thumbnails
+// --------------------------------------------------------------------------
+
+/*
+ * Both caches live in userData, the same reasoning autosave's directory
+ * comment gives: a directory the OS already provides beats one more thing
+ * next to the project file that the user has to notice and clean up
+ * themselves — and unlike a project file, a source clip may not have a
+ * project of its own yet the first time its thumbnails are asked for.
+ *
+ * Entries are named after shared/media-cache.js's sourceCacheKey(filePath)
+ * rather than the source's own filename, because two different folders can
+ * each hold a `clip.mp4` and only the hash tells the caches apart.
+ */
+const waveformCacheDir = () => path.join(app.getPath('userData'), 'waveform-cache');
+const thumbnailCacheDir = () => path.join(app.getPath('userData'), 'thumbnail-cache');
+
+function readCache(dir, filePath, stat) {
+  const target = path.join(dir, `${mediaCache.sourceCacheKey(filePath)}.json`);
+  let record;
+  try {
+    record = JSON.parse(fs.readFileSync(target, 'utf8'));
+  } catch {
+    return null; // No entry, or one we cannot read. Either way, regenerate.
+  }
+  return mediaCache.isCacheFresh(record, stat) ? record : null;
+}
+
+/** Written through a temp file and renamed, same atomic-write idiom writeAutosave uses. */
+function writeCache(dir, filePath, record) {
+  const target = path.join(dir, `${mediaCache.sourceCacheKey(filePath)}.json`);
+  const tmp = `${target}.tmp`;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(record), 'utf8');
+    fs.renameSync(tmp, target);
+  } catch {
+    // A cache entry that fails to write just means the next request
+    // regenerates it — not worth interrupting anyone over, same call
+    // writeAutosave already makes about a failed autosave.
+    try { fs.unlinkSync(tmp); } catch {}
+  }
+}
+
+const WAVEFORM_SAMPLE_RATE = 8000;
+const WAVEFORM_PEAKS_PER_SECOND = 100;
+const THUMBNAIL_WIDTH = 120;
+
+/**
+ * Peak waveform data for the timeline: one [min, max] pair per 1/100s across
+ * the WHOLE source file, not the clip's current trim — see
+ * shared/media-cache.js's pcmToPeaks for why indexing it that way is what
+ * lets a trimmed or re-widened clip redraw from this same array instead of
+ * asking ffmpeg again. Cached to disk per source, and the renderer keeps its
+ * own in-memory copy on top so scrolling or re-rendering the timeline never
+ * reaches this handler for a source it already has.
+ */
+ipcMain.handle('media:waveform', async (_e, filePath) => {
+  if (!FFMPEG) throw new Error('ffmpeg not found.');
+  const stat = fs.statSync(filePath);
+  const cached = readCache(waveformCacheDir(), filePath, stat);
+  if (cached) return cached;
+
+  const tmp = path.join(os.tmpdir(), `cutroom-wave-${Date.now()}.pcm`);
+  try {
+    await new Promise((resolve, reject) => {
+      const args = mediaCache.waveformExtractArgs(filePath, tmp, { sampleRate: WAVEFORM_SAMPLE_RATE });
+      const p = spawn(FFMPEG, args);
+      p.on('close', c => (c === 0 ? resolve() : reject(new Error('Could not read audio for the waveform.'))));
+      p.on('error', reject);
+    });
+
+    const peaks = mediaCache.pcmToPeaks(fs.readFileSync(tmp), {
+      sampleRate: WAVEFORM_SAMPLE_RATE,
+      peaksPerSecond: WAVEFORM_PEAKS_PER_SECOND
+    });
+    const record = { size: stat.size, mtimeMs: stat.mtimeMs, peaksPerSecond: WAVEFORM_PEAKS_PER_SECOND, peaks };
+    writeCache(waveformCacheDir(), filePath, record);
+    return record;
+  } finally {
+    try { fs.unlinkSync(tmp); } catch {}
+  }
+});
+
+/**
+ * A filmstrip's worth of frames spread across the WHOLE source file, same
+ * reasoning as the waveform above. shared/media-cache.js's
+ * thumbnailTimestamps caps how many a feature-length source can ask for, and
+ * thumbnailExtractArgs grabs all of them in one ffmpeg pass via `fps=`
+ * rather than one process per frame — media:frame's single `-ss`-before-`-i`
+ * shape (above) is right for the eyedropper's one arbitrary, exact
+ * timestamp, but does not extend to "N frames, evenly spread" without N
+ * separate processes, so this is a variant rather than a reuse of it.
+ */
+ipcMain.handle('media:thumbnails', async (_e, filePath) => {
+  if (!FFMPEG) throw new Error('ffmpeg not found.');
+  const stat = fs.statSync(filePath);
+  const cached = readCache(thumbnailCacheDir(), filePath, stat);
+  if (cached) return cached;
+
+  let duration = 0;
+  if (FFPROBE) {
+    try {
+      const json = await new Promise((resolve, reject) => {
+        execFile(FFPROBE, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'json', filePath],
+          { maxBuffer: 1024 * 1024 }, (err, stdout) => (err ? reject(err) : resolve(JSON.parse(stdout))));
+      });
+      duration = Number(json.format?.duration) || 0;
+    } catch { /* Probe failed; fall through with duration 0 -> a single frame at 0. */ }
+  }
+
+  const timestamps = mediaCache.thumbnailTimestamps(duration);
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cutroom-thumbs-'));
+  try {
+    const pattern = path.join(tmpDir, 'thumb-%03d.png');
+    const args = mediaCache.thumbnailExtractArgs(filePath, pattern, {
+      count: timestamps.length,
+      durationSec: duration,
+      width: THUMBNAIL_WIDTH
+    });
+    await new Promise((resolve, reject) => {
+      const p = spawn(FFMPEG, args);
+      p.on('close', c => (c === 0 ? resolve() : reject(new Error('Could not grab thumbnail frames.'))));
+      p.on('error', reject);
+    });
+
+    // ffmpeg numbers frames in the order it emitted them, which is playback
+    // order for `fps=` — so a sorted directory listing lines back up with
+    // `timestamps` position for position.
+    const files = fs.readdirSync(tmpDir).filter(f => f.endsWith('.png')).sort();
+    const frames = files.map((f, i) => ({
+      atSec: timestamps[i] ?? timestamps[timestamps.length - 1],
+      dataUrl: `data:image/png;base64,${fs.readFileSync(path.join(tmpDir, f)).toString('base64')}`
+    }));
+
+    const record = { size: stat.size, mtimeMs: stat.mtimeMs, width: THUMBNAIL_WIDTH, frames };
+    writeCache(thumbnailCacheDir(), filePath, record);
+    return record;
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
 });
 
 // --------------------------------------------------------------------------
