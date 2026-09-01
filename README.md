@@ -1008,11 +1008,25 @@ real proportional scaling against a real rendered stage, and a caption
 actually landing at the correct position, size and legibility on screen is
 a claim only a real browser can confirm. This repository's owner re-verifies
 PRs by launching real Electron under Xvfb with Playwright (see `npm run
-test:electron`'s own section, above); a screenshot there comparing "caption
-visible at a t inside its window" against "not visible at a t outside it" —
-and comparing font size/position across the three `position` settings — is
-exactly the kind of check that tier is for, and exactly what this section's
-claims about visual correctness rest on rather than demonstrate here.
+test:electron`'s own section, above), and did so for this feature: a real
+WebGL context (`--use-angle=swiftshader`) against a real ffmpeg-generated
+clip confirmed the overlay hides and shows across a caption's start/end on
+the real playhead clock, that `scaledPx`'s real branch (not the 1:1
+fallback above) produces the exact predicted pixel size against
+`#previewStage`'s actually-measured height, that switching `position`
+between `top` and `bottom` moves the rendered box on real screen
+coordinates, that a caption with no per-word timing renders as plain static
+text rather than an approximated `\k` sweep, and that the no-WebGL fallback
+suppresses the overlay even with an active caption (checked by patching
+`HTMLCanvasElement.prototype.getContext` before the app's first WebGL call,
+since `keyerFor`'s per-pool-entry caching makes a later, mid-session
+patch a no-op). That pass is not part of this repository's own
+`test/electron/` suite — it lived in the reviewing session's own
+scratch script, the same way this project's manual pre-PR checks always
+have — so a future change here should not assume it stays proven; treating
+it as a candidate for a real `test/electron/*.test.js` case is the natural
+next step if this overlay's visual behaviour needs re-proving after a
+change lands.
 
 ### Track counts are not fixed at their starting numbers
 
@@ -1213,15 +1227,14 @@ screen and not just in the string the builder produced.
 
 Reasonable next moves, roughly by effort:
 
-- **Real proportional scaling for the caption overlay, verified in a real
-  browser.** The overlay's font size, margins and outline width already
-  scale against `#previewStage`'s own measured height (`scaledPx` in
-  `caption-preview.js`) — but jsdom never lays anything out, so every test
-  in `test/caption-overlay.test.js` only ever exercises that function's 1:1
-  fallback path. Confirming the real scaling, and the overlay's actual
-  on-screen position/legibility across all three `position` settings, needs
-  the real-Electron-under-Xvfb screenshot check "Captions in the preview"
-  names but does not itself run.
+- **A real `test/electron/*.test.js` case for the caption overlay.** Its
+  real proportional scaling, position placement, typewriter fallback and
+  no-WebGL suppression were all confirmed by hand under Xvfb (see "Captions
+  in the preview"'s "What is and is not verified"), but that pass was a
+  reviewing session's scratch script, not a permanent, repeatable test —
+  turning it into a real file alongside `test/electron/media-preview.test.js`
+  is what would keep it proven after a future change here, rather than
+  relying on the same manual check being repeated by hand again.
 
 - **The no-word-timing typewriter fallback.** `buildAssFile` still animates
   a caption with no per-word timestamps, with an old even-split-by-character
