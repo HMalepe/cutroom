@@ -15,6 +15,7 @@ const os = require('os');
 const builder = require('./shared/ffmpeg-builder');
 const { validateProject, PROJECT_VERSION } = require('./shared/project-schema');
 const saveState = require('./shared/save-state');
+const { commandForInput } = require('./shared/clipboard-shortcuts');
 const { matrixNameFromTags } = require('./src/chroma-math');
 const mediaRelink = require('./src/media-relink');
 
@@ -108,8 +109,43 @@ function createWindow() {
   win.loadFile(path.join(__dirname, 'src', 'index.html'));
   win.on('close', onWindowClose);
   win.on('closed', () => { win = null; });
+  wireClipboardShortcuts(win);
   applyWindowTitle();
   return win;
+}
+
+/**
+ * Cmd/Ctrl+C and Cmd/Ctrl+V mean two different things depending on what has
+ * focus — copy/paste text in a field, or copy/paste clips on the timeline —
+ * and the Edit menu's `copy`/`paste` roles above already own that key
+ * combo on every platform the same way `historyItem`'s Undo/Redo would if
+ * they used the `undo`/`redo` roles instead of their own accelerators. There
+ * is no equivalent free key combo to fall back to here, because the app has
+ * to answer to both meanings rather than pick one: text fields still need
+ * real clipboard support (see the Edit menu comment above), so the roles
+ * stay exactly as they are rather than being replaced with something
+ * app.js-only.
+ *
+ * `before-input-event` fires before Electron dispatches the keystroke to
+ * either the page or a menu accelerator, so it sees Cmd/Ctrl+C/V regardless
+ * of who else claims it — and not calling preventDefault() here leaves the
+ * roles' own native copy/paste running exactly as before for whatever is
+ * actually focused. app.js decides which meaning applies by checking its
+ * own document.activeElement when the command arrives (see isTypingTarget
+ * there), the same way it already reads the DOM to decide most things this
+ * process cannot see.
+ *
+ * The decision itself — which command, if any, a given keystroke maps to —
+ * is `commandForInput` in shared/clipboard-shortcuts.js, pure and tested;
+ * see that file's own comment for why the delivery mechanism here (whether
+ * before-input-event fires at all) is instead a by-hand check against a real
+ * Electron window rather than something `npm run test:electron` drives.
+ */
+function wireClipboardShortcuts(target) {
+  target.webContents.on('before-input-event', (_event, input) => {
+    const command = commandForInput(input);
+    if (command) target.webContents.send('menu:command', { command });
+  });
 }
 
 /**
