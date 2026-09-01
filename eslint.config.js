@@ -35,6 +35,16 @@ module.exports = [
     }
   },
   {
+    // test/electron/*.test.js drives a real Electron window with Playwright,
+    // and page.evaluate() callbacks inside those files run in that window's
+    // real browser context, not this Node process — the same two-worlds
+    // reason src/*.js below gets both environments' globals.
+    files: ['test/electron/**/*.js'],
+    languageOptions: {
+      globals: { document: 'readonly', window: 'readonly' }
+    }
+  },
+  {
     files: ['src/*.js'],
     languageOptions: {
       ecmaVersion: 2022,
@@ -58,7 +68,9 @@ module.exports = [
         stepClipLoop: 'readonly',
         clampPlaybackRate: 'readonly',
         TimelinePreview: 'readonly',
-        TimelineSnapping: 'readonly'
+        TimelineSnapping: 'readonly',
+        WaveformRender: 'readonly',
+        ThumbnailRender: 'readonly'
       }
     },
     rules: {

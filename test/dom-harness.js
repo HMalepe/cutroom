@@ -90,6 +90,12 @@ function boot() {
     previewCommand: async () => ({ mode: 'filter', command: 'ffmpeg ...' }),
     probe: async (p) => fakeMedia(path.basename(p)),
     grabFrame: async () => '',
+    // No source ever named here has real audio/video to extract from, so
+    // these behave the way a real main process does for a source ffmpeg
+    // can't read — reject, which app.js's ensureWaveform/ensureThumbnails
+    // already have to handle without retrying forever.
+    getWaveform: async () => { throw new Error('no fixture audio'); },
+    getThumbnails: async () => { throw new Error('no fixture video'); },
     pickMedia: async () => [],
     runExport: async () => ({ canceled: true }),
     cancelExport: async () => {},

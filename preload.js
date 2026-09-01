@@ -14,6 +14,12 @@ contextBridge.exposeInMainWorld('cutroom', {
   probe: (filePath) => ipcRenderer.invoke('media:probe', filePath),
   grabFrame: (filePath, atSec) => ipcRenderer.invoke('media:frame', { filePath, atSec }),
 
+  // Timeline waveforms and thumbnails. Both cover the whole source file, not
+  // one clip's trim, so the renderer only ever asks once per source — see
+  // main.js's "Waveforms and thumbnails" section.
+  getWaveform: (filePath) => ipcRenderer.invoke('media:waveform', filePath),
+  getThumbnails: (filePath) => ipcRenderer.invoke('media:thumbnails', filePath),
+
   // Drag-and-drop gives a File object, not a path. webUtils gets us the real
   // path on disk, which is what ffmpeg needs. It throws rather than returning
   // empty for anything that is not a real File — a dragged directory, or a
