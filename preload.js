@@ -14,6 +14,13 @@ contextBridge.exposeInMainWorld('cutroom', {
   probe: (filePath) => ipcRenderer.invoke('media:probe', filePath),
   grabFrame: (filePath, atSec) => ipcRenderer.invoke('media:frame', { filePath, atSec }),
 
+  // Missing media (moved/renamed source files). checkMissing is the only one
+  // of the three that touches the filesystem directly — the other two open a
+  // dialog and hand back what the user picked, same as pickMedia above.
+  checkMissing: (paths) => ipcRenderer.invoke('media:checkMissing', paths),
+  locateMedia: (hint) => ipcRenderer.invoke('media:locate', hint),
+  relinkFolder: (opts) => ipcRenderer.invoke('media:relinkFolder', opts),
+
   // Drag-and-drop gives a File object, not a path. webUtils gets us the real
   // path on disk, which is what ffmpeg needs. It throws rather than returning
   // empty for anything that is not a real File — a dragged directory, or a

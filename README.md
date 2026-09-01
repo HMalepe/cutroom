@@ -45,7 +45,7 @@ npm test
 
 `node --test`, no framework. Three kinds: unit tests over the pure modules
 (`ffmpeg-builder`, `history`, `templates`, `chroma-math`, `timeline-preview`,
-`timeline-snapping`, `save-state`, `dirty-state`), integration tests
+`timeline-snapping`, `save-state`, `dirty-state`, `media-relink`), integration tests
 that load the real `index.html` and `app.js` into jsdom and drive actual
 buttons and pointer events, and render tests that put the built ffmpeg command
 through a real ffmpeg and inspect the pixels. The second kind is what stops
@@ -228,6 +228,21 @@ launch offers it back. A normal quit deletes it, so a launch after an
 ordinary session never asks — that is the whole difference between a recovery
 feature people keep and one they turn off.
 
+**Missing media.** `clip.src` and a bin item's path are absolute filesystem
+paths with no indirection, so moving a source file, renaming it, or opening
+the project with a drive unmounted breaks the link. Opening a project checks
+every path it and the current media bin reference; anything gone shows up in
+a panel — bottom right, and it stays up rather than fading like a toast,
+because losing track of which of several clips is affected is worse than the
+panel being in the way. **Locate…** relinks one file by hand and fixes every
+clip and bin item that shared it, not just the first one found. **Locate
+folder…**, and an automatic check of the project file's own folder, offer
+the same fix by filename for everything at once — see "Missing media" below
+for exactly what that heuristic does and does not catch. Nothing else about
+the project is blocked while a file is missing; only using that particular
+clip is, with an error in place of a raw ffmpeg failure or a silently broken
+preview.
+
 ## Keyboard
 
 | | |
@@ -287,6 +302,13 @@ src/
                      closest-within-threshold pick. Pure, no DOM — app.js
                      converts pixels to seconds and calls it from the
                      pointermove handlers.
+  media-relink.js    Which paths a project and bin currently reference,
+                     rewriting every clip/bin item that shares one path, and
+                     the filename-only auto-match heuristic. Pure, no I/O —
+                     used by both main.js (`require`, to build the
+                     existence check and the folder match) and app.js
+                     (script tag, to decide what a relink rewrites), the
+                     same two-user split chroma-math.js already has.
   templates.js       Edit rhythms. Pure data plus one function.
   index.html         Structure.
   styles.css         Tokens at the top.
@@ -345,6 +367,86 @@ can satisfy every rule above and still be missing something the UI reads
 without checking — `captionStyle`, for one, which `renderCaptionStyle`
 dereferences directly. Widening the check to a full schema is a bigger change
 than this one.
+
+### Missing media
+
+A validated project can still be unusable in one specific way `validateProject`
+was never meant to catch: every `clip.src` and bin `media.path` is an absolute
+filesystem path with no indirection, so a source file that got moved, renamed,
+or lives on a drive that is not mounted right now breaks the moment anything
+tries to read it. Before this, that moment was buried inside an export or a
+preview, surfacing as a raw ffmpeg failure or, on the preview's no-WebGL
+fallback path, nothing at all — a `<video>` handed a dead `src` just sits
+there blank. Contrast with the gate above: a malformed project is unusable
+regardless of what a user does next, but a valid project with one moved file
+is usable for everything except that file, and refusing the whole project
+over it would be a worse failure than the one being fixed.
+
+`src/media-relink.js` is the pure half: which paths a project and bin
+currently reference (`collectSourcePaths`), how many clips and whether the
+bin share a given one (`countReferences`), rewriting every clip and bin item
+pointing at one path (`relinkProject` / `relinkBin`), and the one heuristic
+offered for finding a moved file automatically (`matchByFilename`). No I/O,
+same as `shared/project-schema.js` — but it lives in `src/`, not `shared/`,
+because it has two users on two sides of the process boundary: main.js
+`require`s it to build the existence check and the folder match, and app.js
+loads it as a plain `<script>` to decide what a relink actually rewrites.
+`chroma-math.js` is the existing example of a `src/` module used both ways;
+`shared/` stays main-only, per its own section above.
+
+Detection runs before a project is put on screen, not after — `app.js`'s
+`detectMissingMedia` is called ahead of `adoptProject`, on Open, New (in case
+a bin item carried over from the last project is what's missing) and restoring
+an autosave. Ahead, specifically, of the render that follows: the composited
+and no-WebGL fallback preview paths both only reload a clip's video element
+when the active clip *changes* (by id in the fallback, by path in the
+composited view — see "How the composited preview works" below for why the two
+differ), so a check that landed after that first draw would find an unguarded
+load already attempted, with nothing to give the guard a second chance at it.
+
+The panel this feeds is deliberately not a toast: several clips can share one
+missing file, a toast fades on its own schedule regardless of whether anything
+was done about it, and losing track of which clips are still broken is worse
+than a small panel staying in view. **Locate…** opens a single-file picker and
+relinks every clip and bin item that shared the old path in one action — a
+source file backing more than one clip is ordinary, and fixing it once has to
+fix all of them, wired through the same `edit()`/history path any other change
+to a clip uses, so a bad relink is undoable like anything else. The bin half
+is not wired to undo, for the same reason `addPaths` never is — the bin sits
+outside the edit history entirely (see "How undo works" below).
+
+**Locate folder…**, and an automatic check of the project file's own folder
+that runs silently right after detection and only surfaces if it finds
+anything, both go through the same `matchByFilename` — filename equality,
+nothing else. That is a deliberate ceiling, not a first pass at something
+smarter: a folder containing a same-named-but-different file matches with the
+same confidence as the real one, and content-hash matching would close that
+gap at the cost of reading every candidate file up front, for a feature that
+is otherwise about paths and never touches file contents. Neither this nor
+the plain existence check catches a file that exists but is no longer right
+— wrong codec, swapped content under the same name — a known, stated blind
+spot rather than a caught case, the same honesty the "Two export paths"
+section below states for stream copy's own inability to see a clip's
+resolution.
+
+The bin's own gap is worth being explicit about, because it shapes what
+detection can promise: `state.bin` is renderer-only session state that never
+round-trips through a saved project file (nothing in `project-schema.js`'s
+shape describes it), so main.js's `project:open` handler cannot check it —
+only the renderer knows what's currently in the bin. `media:checkMissing` is
+therefore a general-purpose "which of these paths exist" primitive rather
+than something folded into `project:open` itself; app.js calls it with every
+path the newly-opened project *and* the bin already hold, in one round trip,
+right before that project goes on screen.
+
+The cached result, `state.missingSources`, is what the preview guards check —
+cheap, because a preview redraws every frame and cannot afford a round trip
+to main on each one — but it can go stale: undoing a relink puts a clip back
+on a path this session already crossed off as fixed, and the cache has no way
+to hear about that on its own. Export does not trust it: `runExport` re-asks
+main for a fresh answer against every path actually on the timeline
+immediately before running ffmpeg, which is the one moment a stale "looks
+fine" would cost the most to act on.
 
 ### How undo works
 
