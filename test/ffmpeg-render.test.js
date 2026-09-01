@@ -154,6 +154,24 @@ function project3(v1clips, v2clips, v3clips, extra = {}) {
   };
 }
 
+/** Same shape as project(), with a second audio track — for proving two
+ *  audio tracks (not just the fixed one every other test in this file uses)
+ *  both really reach the mix, rather than trusting that a two-clips-on-one-
+ *  track amix (already covered in ffmpeg-builder.test.js) generalises to a
+ *  second track on its own. */
+function project2audio(v1clips, a1clips, a2clips, extra = {}) {
+  return {
+    name: 'render2audio', width: 320, height: 240, fps: 30,
+    captionsEnabled: false, captions: [],
+    tracks: [
+      { id: 'v1', kind: 'video', name: 'Video 1', clips: v1clips },
+      { id: 'a1', kind: 'audio', name: 'Audio 1', clips: a1clips },
+      { id: 'a2', kind: 'audio', name: 'Audio 2', clips: a2clips }
+    ],
+    ...extra
+  };
+}
+
 /** Build the command for a project and actually run it. Returns the output path. */
 function render(name, proj, buildOpts = {}) {
   const out = path.join(DIR, `${name}.mp4`);
@@ -186,6 +204,48 @@ function pixel(file, t, x = 156, y = 116, w = 8, h = 8) {
 
 const near = (actual, want, tol, msg) =>
   assert.ok(Math.abs(actual - want) <= tol, `${msg}: got ${actual}, wanted ${want}±${tol}`);
+
+/**
+ * Decode an exported file's audio to mono 16-bit PCM at a fixed rate, for
+ * tests that need to look inside the mix rather than just trust that the
+ * command said `amix`.
+ */
+function decodePcm(file, rate = 48000) {
+  const r = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-i', file,
+    '-map', '0:a', '-f', 's16le', '-acodec', 'pcm_s16le', '-ac', '1', '-ar', String(rate), '-'],
+    { encoding: 'buffer', maxBuffer: 1 << 28 });
+  assert.equal(r.status, 0, 'could not decode the exported audio');
+  const n = r.stdout.length / 2;
+  const samples = new Float64Array(n);
+  for (let i = 0; i < n; i++) samples[i] = r.stdout.readInt16LE(i * 2);
+  return samples;
+}
+
+/**
+ * Goertzel algorithm: the magnitude of one specific frequency bin, without
+ * computing a full FFT. Two sines mixed together (amix sums the waveforms)
+ * cannot be told apart by ear or by amplitude alone — this is what tells
+ * whether a *specific* frequency survived the mix, which is the only way to
+ * prove two audio tracks both actually reached the output rather than one
+ * silently winning or the other never being routed into the graph at all.
+ * `freq` should land on an exact bin (`samples.length * freq / rate` an
+ * integer) to avoid spectral leakage softening the reading.
+ */
+function goertzelMagnitude(samples, rate, freq) {
+  const n = samples.length;
+  const k = Math.round(n * freq / rate);
+  const w = (2 * Math.PI * k) / n;
+  const coeff = 2 * Math.cos(w);
+  let q1 = 0, q2 = 0;
+  for (let i = 0; i < n; i++) {
+    const q0 = coeff * q1 - q2 + samples[i];
+    q2 = q1;
+    q1 = q0;
+  }
+  const real = q1 - q2 * Math.cos(w);
+  const imag = q2 * Math.sin(w);
+  return Math.sqrt(real * real + imag * imag) / n;
+}
 
 // --------------------------------------------------------------------------
 // Tests
@@ -752,4 +812,42 @@ test('adelay moves every channel of a 5.1 source, not just the front pair', opts
     // The old two-entry list left the last four of these at 0.
     near(t, 1, 0.15, `${NAMES[c]} should start one second in`);
   });
+});
+
+// --------------------------------------------------------------------------
+// Multiple audio tracks
+// --------------------------------------------------------------------------
+
+test('two audio tracks both survive amix — each track\'s own tone is present in the output', opts, () => {
+  // ffmpeg-builder.test.js proves the filter graph names amix=inputs=2 for
+  // clips split across two tracks. It cannot prove ffmpeg actually mixes
+  // both into audible sound rather than, say, one track silently winning
+  // because of a routing mistake elsewhere in the graph — so this renders a
+  // real project with a 440Hz tone on Audio 1 and an 880Hz tone on Audio 2,
+  // both for the full two seconds, and looks for each frequency independently
+  // in the decoded output via Goertzel (see its own comment above). Plain
+  // amplitude cannot distinguish "both tones present" from "one tone at
+  // double the volume" — only reading the specific frequency bins can.
+  const RATE = 48000;
+  const tone440 = () => source('tone440', ['-f', 'lavfi', '-i', 'sine=frequency=440:duration=2', '-c:a', 'aac']);
+  const tone880 = () => source('tone880', ['-f', 'lavfi', '-i', 'sine=frequency=880:duration=2', '-c:a', 'aac']);
+
+  const proj = project2audio(
+    [], // no video clip — an empty video track composites as plain black, same as the karaoke test above
+    [clip(tone440(), { startSec: 0, outSec: 2, hasVideo: false, hasAudio: true })],
+    [clip(tone880(), { startSec: 0, outSec: 2, hasVideo: false, hasAudio: true })]
+  );
+  const out = render('two-audio-tracks', proj);
+
+  const samples = decodePcm(out, RATE);
+  // 2 seconds at 48000Hz = 96000 samples; 440 and 880 both divide it exactly
+  // (bins 880 and 1760), so neither reading is softened by spectral leakage.
+  const mag440 = goertzelMagnitude(samples, RATE, 440);
+  const mag880 = goertzelMagnitude(samples, RATE, 880);
+  // A frequency neither track carries, still on an exact bin, as the floor
+  // this test should be measuring against rather than an arbitrary constant.
+  const magSilent = goertzelMagnitude(samples, RATE, 660);
+
+  assert.ok(mag440 > magSilent * 5, `Audio 1's 440Hz tone should stand out from the noise floor: ${mag440} vs ${magSilent}`);
+  assert.ok(mag880 > magSilent * 5, `Audio 2's 880Hz tone should stand out from the noise floor: ${mag880} vs ${magSilent}`);
 });
