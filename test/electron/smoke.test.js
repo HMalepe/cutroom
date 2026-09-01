@@ -336,7 +336,14 @@ test('autosave writes a real file to userData, containing the project as JSON', 
     await page.evaluate((project) => globalThis.cutroom.autosave(project), fakeProject);
 
     const autosaveFile = path.join(userDataDir, saveState.AUTOSAVE_FILENAME);
-    await waitFor(() => fs.existsSync(autosaveFile), { message: 'the autosave file to appear' });
+    // writeAutosave itself is a synchronous writeFileSync+renameSync — fast
+    // on an idle machine, but this file's other tests each launch their own
+    // full Electron process, and several can be mid-launch at once on a
+    // shared CI runner. A generous margin over the file's 5000ms default
+    // costs nothing when the write is already done, and is what keeps this
+    // specifically timing-sensitive check from reading runner contention as
+    // a real regression.
+    await waitFor(() => fs.existsSync(autosaveFile), { message: 'the autosave file to appear', timeout: 15000 });
 
     const raw = fs.readFileSync(autosaveFile, 'utf8');
     let record;
