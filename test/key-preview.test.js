@@ -938,3 +938,97 @@ test('a track that drops out of the composite pauses and hides its layer, rather
     stopLoopViaBin(doc);
   }
 });
+
+// ==========================================================================
+// A third video track — poolSize() growing past the old fixed POOL_SIZE = 4
+// ==========================================================================
+
+/** Drag a clip left by overlapSec, the same gesture crossfadeOnV1 performs,
+ *  generalised to any already-selected clip element on any track. */
+function dragClipLeft(win, doc, clipEl, overlapSec) {
+  const pxPerSec = 40;
+  const dx = -overlapSec * pxPerSec;
+  const tl = doc.getElementById('tlScroll');
+  clipEl.dispatchEvent(new win.MouseEvent('pointerdown', { bubbles: true, clientX: 300, clientY: 5 }));
+  tl.dispatchEvent(new win.MouseEvent('pointermove', { bubbles: true, clientX: 300 + dx, clientY: 5 }));
+  tl.dispatchEvent(new win.MouseEvent('pointerup', { bubbles: true, clientX: 300 + dx, clientY: 5 }));
+}
+
+test('a third video track composites over the first two, in track order', opts, async () => {
+  const { win, doc } = boot();
+  win.createKeyPreview = stubKeyer;
+  try {
+    doc.getElementById('btnAddVideoTrack').click();
+    seedBin(win, doc, ['a.mp4', 'b.mp4', 'c.mp4']);
+    await flush();
+    const items = doc.querySelectorAll('#binList .bin-item');
+    items[0].dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+    doc.getElementById('btnSendV1').click();
+    items[1].dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+    doc.getElementById('btnSendV2').click();
+    items[2].dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+    doc.getElementById('btnSendV3').click();
+    await rafTick();
+
+    const canvases = [...doc.getElementById('previewStage').querySelectorAll('canvas')];
+    assert.equal(canvases.length, 3, 'one canvas per active video track');
+    assert.equal(canvases[0].id, 'keyCanvas', 'v1 is the bottom, pre-existing canvas');
+    assert.ok(
+      canvases[0].compareDocumentPosition(canvases[1]) & win.Node.DOCUMENT_POSITION_FOLLOWING,
+      'v2\'s canvas comes after v1\'s'
+    );
+    assert.ok(
+      canvases[1].compareDocumentPosition(canvases[2]) & win.Node.DOCUMENT_POSITION_FOLLOWING,
+      'v3\'s canvas comes after v2\'s, on top of both — the newest track appended above the others'
+    );
+
+    const videos = doc.querySelectorAll('#viewer video.texture-only');
+    assert.equal(videos.length, 3);
+    assert.match(videos[2].src, /c\.mp4$/, 'the clip sent to the new track plays on its own layer');
+  } finally {
+    stopLoopViaBin(doc);
+  }
+});
+
+test('a third track raises the pool past the old fixed ceiling of four, drawing all five concurrent layers', opts, async () => {
+  // The old POOL_SIZE = 4 was sized for "two video tracks, each possibly
+  // mid-crossfade" — exactly 2*2. A third track mid-crossfade alongside one
+  // of the other two needs a fifth layer that fixed number never had room
+  // for: v1 solo (1) + v2 mid-crossfade (2) + v3 mid-crossfade (2) = 5. This
+  // is poolSize()'s whole reason to exist rather than staying a constant.
+  const { win, doc } = boot();
+  win.createKeyPreview = stubKeyer;
+  try {
+    doc.getElementById('btnAddVideoTrack').click();
+    seedBin(win, doc, ['v1.mp4', 'v2a.mp4', 'v2b.mp4', 'v3a.mp4', 'v3b.mp4']);
+    await flush();
+    const items = doc.querySelectorAll('#binList .bin-item');
+
+    items[0].dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+    doc.getElementById('btnSendV1').click(); // v1: solo clip [0,10)
+    items[1].dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+    doc.getElementById('btnSendV2').click(); // v2 clip a: [0,10)
+    items[2].dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+    doc.getElementById('btnSendV2').click(); // v2 clip b: [10,20) before the drag below
+    items[3].dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+    doc.getElementById('btnSendV3').click(); // v3 clip a: [0,10)
+    items[4].dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+    doc.getElementById('btnSendV3').click(); // v3 clip b: [10,20) before the drag below
+
+    let clips = doc.querySelectorAll('#lanes .clip');
+    assert.equal(clips.length, 5, 'v1 solo, v2 pair, v3 pair');
+    dragClipLeft(win, doc, clips[2], 6); // v2's second clip -> overlap [4,10)
+    clips = doc.querySelectorAll('#lanes .clip'); // the drag re-rendered the lanes
+    dragClipLeft(win, doc, clips[4], 6); // v3's second clip -> overlap [4,10)
+
+    setPlayhead(doc, 7); // inside v1's solo span and both crossfade windows
+    await rafTick();
+
+    const canvases = [...doc.getElementById('previewStage').querySelectorAll('canvas')];
+    assert.equal(canvases.length, 5,
+      'v1 solo (1) + v2 crossfade (2) + v3 crossfade (2) — the old fixed pool of 4 would have dropped one');
+    assert.ok(canvases.every(c => c.style.display !== 'none'), 'every one of the five layers is actually shown, none silently capped out');
+  } finally {
+    stopLoopViaBin(doc);
+  }
+});

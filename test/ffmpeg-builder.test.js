@@ -96,6 +96,19 @@ test('canStreamCopy accepts the single boring clip case', () => {
 test('canStreamCopy rejects a second video track, a second clip, speed change, or chroma key', () => {
   assert.equal(canStreamCopy(baseProject()), false); // two video tracks (v1 + v2)
 
+  // A third video track has to fall off the fast path exactly the way a
+  // second one already does — this only re-checks it under three rather
+  // than trusting that the two-track coverage above generalises on its own.
+  const threeVideoTracks = baseProject({
+    tracks: [
+      { id: 'v1', kind: 'video', name: 'Video 1', clips: [makeClip()] },
+      { id: 'v2', kind: 'video', name: 'Video 2', clips: [] },
+      { id: 'v3', kind: 'video', name: 'Video 3', clips: [] },
+      { id: 'a1', kind: 'audio', name: 'Audio 1', clips: [] }
+    ]
+  });
+  assert.equal(canStreamCopy(threeVideoTracks), false);
+
   const twoClips = singleVideoTrackProject();
   twoClips.tracks[0].clips.push(makeClip(), makeClip({ startSec: 10 }));
   assert.equal(canStreamCopy(twoClips), false);
