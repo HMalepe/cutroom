@@ -104,8 +104,20 @@ alongside the tests.
 
 ## What it does
 
-**Timeline.** Three tracks: two video, one audio. Drag clips to move, drag the
-edges to trim, drag between lanes to reassign. Video 2 composites over Video 1.
+**Timeline.** Two video tracks and one audio track to start. **+ Video
+track**, in the timeline's own header, adds more: a new track always lands
+directly above the ones already there, so it composites over everything
+below it the same way Video 2 already composited over Video 1. Each video
+track head carries a **✕** to remove it again — refused, with a toast,
+while the track still has clips on it, and refused once more for a
+project's last remaining video track, since a project with none has
+nothing for the preview or the export to composite. There is no floor at
+the two tracks a project boots with: trimming back down to one is allowed,
+and is if anything the cheaper project to export (`canStreamCopy`'s fast
+path is exactly one video track). Track numbers are never reused or
+renumbered when one is removed — deleting Video 2 leaves Video 3 exactly
+"Video 3", the same way deleting a clip never renumbers the clips after it.
+Drag clips to move, drag the edges to trim, drag between lanes to reassign.
 Moving or trimming a clip snaps the edge under the drag to nearby edges of
 *other* clips (any track — keying a clip on Video 2 to a cut on Video 1 is
 ordinary), the playhead, and zero. Unlike the timeline's own beat-snap
@@ -165,7 +177,8 @@ Bauhaus Grid is beat-based: set your BPM first.
 **Preview.** Shows the timeline itself, not a clip you happened to select:
 whatever is under the playhead, keyed, colour-corrected, scaled and
 positioned — the same maths the export runs, per frame, on the GPU — with
-Video 2 composited over Video 1, exactly the order the export uses. Drag the
+every video track composited over the ones below it, exactly the order the
+export uses. Drag the
 playhead and the composite updates live; press Play and a timeline clock
 advances it, seeking every active clip's own hidden `<video>` to keep pace
 rather than the old design, where a single `<video>`'s own playback *was*
@@ -656,27 +669,36 @@ later clip outlasting the earlier one — rather than an import of it, because
 `test/timeline-preview.test.js` pins the two files' `TRANSITION_TYPES` lists
 against each other so they cannot quietly drift apart. `layersAt` runs that
 per video track, bottom to top — `project.tracks[0]` first, same order
-`buildExportCommand` composites in — so Video 2 landing over Video 1 in the
-preview is a property of iteration order, not a separate compositing step
-that could disagree with the export's.
+`buildExportCommand` composites in — so a later video track landing over an
+earlier one in the preview is a property of iteration order, not a separate
+compositing step that could disagree with the export's. Nothing about that
+order assumes exactly two video tracks; a third landing over the first two
+is the same iteration doing what it already did.
 
-app.js turns those answers into pixels through a small, fixed **layer
-pool** (`layerPool`, capped at `POOL_SIZE = 4`): each entry owns one
-`<canvas>` and one hidden `<video>`, reused for the life of the session
-rather than created and torn down at every clip or crossfade boundary.
-Recreating a WebGL context is real work and browsers cap how many can be
-live at once, so a fixed pool of four hidden, paused elements — enough for
-both video tracks to be mid-crossfade at the same instant, which is the
-most `layersAt` can ever ask for — is the more defensible choice than
-churning contexts every time the playhead crosses a cut. `#keyCanvas` is
+app.js turns those answers into pixels through a small **layer pool**
+(`layerPool`): each entry owns one `<canvas>` and one hidden `<video>`,
+reused for the life of the session rather than created and torn down at
+every clip or crossfade boundary. Recreating a WebGL context is real work
+and browsers cap how many can be live at once, so reusing a bounded set of
+hidden, paused elements is the more defensible choice than churning
+contexts every time the playhead crosses a cut. The bound itself
+(`poolSize()`) used to be the fixed `POOL_SIZE = 4` — enough for exactly
+two video tracks to be mid-crossfade at the same instant, which was the
+most `layersAt` could ever ask for while the project shape was fixed at
+two. Now that video tracks are not fixed, it is `videoTrackCount * 2`,
+recomputed on every call rather than cached, since a track can be added
+mid-session — but the pool below it still only grows: `poolEntry()` creates
+entries lazily and `layerPool` itself is never shrunk, so adding a track
+never tears down or recreates a context that already exists, it only asks
+for a couple more the next time one is actually needed. `#keyCanvas` is
 pool entry 0 and is the only one that exists in `index.html`; the rest are
 created lazily and stacked into `#previewStage` with plain CSS (each
-non-base layer positioned to fill the base layer's box exactly), so Video 2
-drawing over Video 1 — and the two halves of a crossfade dissolving into
-each other — is ordinary DOM paint order, not anything the shader itself
-had to learn. **The shader in `key-preview.js` is untouched**: every layer
-reuses the exact single-clip `createKeyPreview`/`draw` this preview already
-had, once per canvas.
+non-base layer positioned to fill the base layer's box exactly), so a video
+track drawing over the ones below it — and the two halves of a crossfade
+dissolving into each other — is ordinary DOM paint order, not anything the
+shader itself had to learn. **The shader in `key-preview.js` is
+untouched**: every layer reuses the exact single-clip
+`createKeyPreview`/`draw` this preview already had, once per canvas.
 
 A **crossfade** draws both clips and cross-dissolves them by canvas
 `opacity` for the overlap's duration, with a small label
@@ -785,6 +807,56 @@ so a bug here would have to live in application logic that does not exist;
 this reads as a software-rasteriser warm-up artefact of the test environment,
 not the app, and is noted rather than "fixed" because there is nothing in
 `key-preview.js` to change that would not be pure superstition.
+
+### Video tracks are not fixed at two
+
+`state.project.tracks` was always a plain array — the builder's `videoTracks`
+filters (`canStreamCopy`, `buildExportCommand`) and the preview's `layersAt`
+already iterated it rather than reading `tracks[0]`/`tracks[1]` by name — so
+nothing in the export or the composited preview needed to change to support
+a third video track; `test/ffmpeg-render.test.js` and `test/key-preview.test.js`
+now each carry a real three-video-track case rather than trusting that the
+existing two-track coverage generalises on its own. What needed building was
+the UI: the timeline header's **+ Video track** button, a remove chip per
+track head, and turning "Send to track" from two fixed buttons in
+`index.html` into `renderSendButtons()` — one button per current video
+track plus the fixed audio one, rebuilt alongside the rest of the timeline
+on every `renderAll()`, the same way `renderHeads()` already rebuilds the
+per-track mute/hide row.
+
+A new track is always appended directly above the last existing video
+track — never in the middle, never below — because that is the one
+placement that needs no further decision: it composites over everything
+already there the same way Video 2 already composited over Video 1, so
+"the newest track wins where it overlaps" stays true without a special
+case. Its id and number are picked by scanning every existing video
+track's id (`v`*N*) and name (`Video `*N*) for the highest *N* already in
+use and adding one, rather than by counting tracks — counting would hand
+out a number still visible on screen if an earlier track with a higher
+number had since been removed, and two tracks both reading "Video 3" in
+the head list is a worse bug than a gap in the numbering.
+
+Removing a track is refused, with a toast, while it still has clips on it
+— silently discarding footage because someone clicked the wrong chip is a
+worse failure than a click that does nothing — and refused again for a
+project's last remaining video track, since a project with none has
+nothing for the preview or the export to composite. Above that floor of
+one, removing is unconditional: nothing pins the count at the two the
+project boots with, and there is no technical reason to — `canStreamCopy`
+already treats a single video track as the fast path, so a project trimmed
+back down to one is, if anything, the cheaper case to export. Track
+numbers are never renumbered when one is removed: deleting Video 1 leaves
+Video 2 exactly "Video 2", the same way deleting a clip never renumbers
+the clips after it — a user's name for a track is not the app's to change
+out from under them.
+
+The layer pool's own generalisation — `POOL_SIZE = 4` becoming
+`videoTrackCount * 2` — is covered above, in "How the composited preview
+works".
+
+Audio is still fixed at one track. Adding a second is the smaller,
+still-open half of what the "More tracks" idea used to describe before
+this — see "Extending it" below.
 
 ### Filter order matters
 
@@ -917,13 +989,10 @@ screen and not just in the string the builder produced.
 
 Reasonable next moves, roughly by effort:
 
-- **More tracks.** `state.project.tracks` is an array; the builder already
-  loops it, and so does `layersAt`. Adding a second audio track is a one-line
-  change plus a UI button. A third *video* track needs one more thing: the
-  preview's layer pool (`POOL_SIZE` in app.js) is sized for two video tracks
-  each possibly mid-crossfade at once — a third would need a bigger pool, or
-  an explicit decision about what happens when a fourth-and-up simultaneous
-  layer is asked for.
+- **A second audio track.** Video tracks are no longer fixed at two — see
+  "Video tracks are not fixed at two", above. Audio still is: adding a
+  second is the one-line-change-plus-a-UI-button this bullet used to
+  describe for video, and is still open.
 
 - **Captions in the preview.** Left out of this PR on purpose — see "How the
   composited preview works". Whenever this is picked up, a positioned

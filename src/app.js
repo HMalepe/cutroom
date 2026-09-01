@@ -617,6 +617,37 @@ function renderBin() {
     : 'Select clips in the bin, then send them to a track. Order of selection is the order they land.';
 }
 
+/**
+ * One "→ Video N" button per current video track, plus the fixed audio one.
+ * The video half of this used to be two static buttons in index.html
+ * (`btnSendV1`/`btnSendV2`) wired to fixed ids — that stopped being possible
+ * the moment the track list could grow or shrink, so it is rebuilt here on
+ * every renderAll() instead, the same way renderHeads() already rebuilds the
+ * per-track mute/hide row. Ids follow the same `btnSend` + capitalised track
+ * id shape the old static markup used (`v1` -> `btnSendV1`), so a default
+ * two-video-track project hands back exactly the ids it always did and
+ * nothing that already looks a button up by id has to change.
+ */
+function renderSendButtons() {
+  const box = $('sendButtons');
+  box.innerHTML = '';
+  for (const track of state.project.tracks) {
+    if (track.kind !== 'video') continue;
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-sm';
+    btn.id = 'btnSend' + track.id.charAt(0).toUpperCase() + track.id.slice(1);
+    btn.textContent = `→ ${track.name}`;
+    btn.onclick = () => sendToTrack(track.id);
+    box.appendChild(btn);
+  }
+  const audio = document.createElement('button');
+  audio.className = 'btn btn-sm';
+  audio.id = 'btnSendA1';
+  audio.textContent = '→ Audio 1';
+  audio.onclick = () => sendToTrack('a1');
+  box.appendChild(audio);
+}
+
 function sendToTrack(trackId) {
   const track = state.project.tracks.find(t => t.id === trackId);
   if (!track) return;
@@ -821,8 +852,9 @@ function renderRelinkPanel() {
  * changes what the inspector edits, and those edits show up here the moment
  * the playhead is sitting over that clip, same as it always could. A layer
  * pool of canvas+<video> pairs (layerPool, below) supplies one pair per
- * active layer: normally one per video track, up to POOL_SIZE at once if
- * both tracks happen to be mid-crossfade together. Pressing play now
+ * active layer: normally one per video track, up to twice that many at once
+ * if every track happens to be mid-crossfade together (see poolSize()).
+ * Pressing play now
  * advances a timeline clock (stepTimelineClock, in timeline-preview.js) that
  * seeks every active layer's <video> to keep pace with it, rather than the
  * old design where a single <video>'s own playback WAS the clock.
@@ -864,14 +896,34 @@ function renderRelinkPanel() {
 // One canvas+<video> pair per concurrent layer. #keyCanvas (pool[0]) always
 // exists in the markup; the rest are created lazily and kept for the life of
 // the session rather than torn down at every clip boundary — recreating a
-// WebGL context is real work, and a fixed pool of four hidden, paused
-// elements is not the kind of growth "leaking" means. Two video tracks each
-// mid-crossfade is the most layers layersAt can ever hand back at once; a
-// third clip overlapping *inside* an active crossfade on one track (a
-// same-track triple overlap) is not resolved by trackStateAt either, and is
-// not attempted here — see that function's own comment.
-const POOL_SIZE = 4;
+// WebGL context is real work, and a growing-but-never-shrinking pool of
+// hidden, paused elements is not the kind of growth "leaking" means. A clip
+// overlapping *inside* an active crossfade on one track (a same-track triple
+// overlap) is not resolved by trackStateAt either, and is not attempted here
+// — see that function's own comment.
 const layerPool = [];
+
+/**
+ * How many concurrent canvas+<video> pairs the pool needs to cover. Per
+ * video track, layersAt hands back at most two clips at once — outgoing and
+ * incoming, mid-crossfade — never three, because trackStateAt only ever
+ * resolves the two clips nearest the playhead (see its own comment on
+ * same-track triple overlaps). So the true worst case, every video track
+ * mid-crossfade at the same instant, is videoTrackCount * 2. This used to be
+ * the fixed POOL_SIZE = 4, sized for the two video tracks the project always
+ * had; recomputed here instead of cached, since a track can be added mid-
+ * session and the answer has to grow with it. Recomputing costs nothing the
+ * pool itself doesn't already pay for: poolEntry() only ever creates entries
+ * up to whatever index a draw actually asks for, and layerPool is never
+ * shrunk (session-long reuse, per the comment above) — so a bigger number
+ * here does not tear down or recreate a single WebGL context that already
+ * exists, it only allows asking for a couple more the next time the
+ * timeline actually needs them.
+ */
+function poolSize() {
+  const videoTracks = state.project.tracks.filter(t => t.kind === 'video').length;
+  return Math.max(2, videoTracks * 2);
+}
 
 // A decoder free-running at 1x still drifts a frame or two from wall-clock
 // time; correcting on every tick would fight the decoder instead of letting
@@ -1087,7 +1139,7 @@ function drawComposited(layers, t) {
     badge.style.display = 'none';
   }
 
-  const used = Math.min(slots.length, POOL_SIZE);
+  const used = Math.min(slots.length, poolSize());
   for (let i = 0; i < used; i++) {
     const entry = poolEntry(i);
     const slot = slots[i];
@@ -1256,6 +1308,80 @@ function togglePlay() {
 // Timeline rendering
 // ==========================================================================
 
+/**
+ * The number to give a new video track's id (`v`N) and name (`Video `N).
+ * Scanning every existing video track's id and name for the highest N
+ * already in use, rather than counting tracks, means a number already
+ * removed from the project this session is never handed out again while a
+ * higher one is still on screen — counting would let a freshly-added track
+ * collide with one still visible if an earlier, higher-numbered track had
+ * been removed in between, and two tracks both reading "Video 3" in the
+ * head list is a worse bug than a gap in the numbering.
+ */
+function nextVideoTrackNumber(tracks) {
+  let max = 0;
+  for (const t of tracks) {
+    if (t.kind !== 'video') continue;
+    const idMatch = typeof t.id === 'string' && t.id.match(/^v(\d+)$/);
+    if (idMatch) max = Math.max(max, Number(idMatch[1]));
+    const nameMatch = typeof t.name === 'string' && t.name.match(/^Video (\d+)$/);
+    if (nameMatch) max = Math.max(max, Number(nameMatch[1]));
+  }
+  return max + 1;
+}
+
+/**
+ * Add a video track, always appended directly above the last existing video
+ * track (never in the middle, never below) — the one placement that needs no
+ * further decision, because it composites over everything already there the
+ * same way Video 2 already composited over Video 1. Inserted right after the
+ * last video track rather than at the very end of the array, so it lands
+ * above the other video tracks without jumping past the audio track in the
+ * head list.
+ */
+function addVideoTrack() {
+  edit('add video track', () => {
+    const tracks = state.project.tracks;
+    const n = nextVideoTrackNumber(tracks);
+    let insertAt = tracks.length;
+    for (let i = tracks.length - 1; i >= 0; i--) {
+      if (tracks[i].kind === 'video') { insertAt = i + 1; break; }
+    }
+    tracks.splice(insertAt, 0, { id: `v${n}`, kind: 'video', name: `Video ${n}`, clips: [] });
+  });
+  renderAll();
+}
+
+/**
+ * Remove a video track. Refused, with a toast, while it still has clips —
+ * silently discarding footage because someone clicked the wrong chip is a
+ * worse failure than a click that does nothing, so this never gets to choose
+ * between the two. Refused again for a project's last remaining video
+ * track: there is no floor at the two tracks a project boots with (one video
+ * track is `canStreamCopy`'s fast path, if anything the cheaper project to
+ * export), but a project with zero has nothing for the preview or the
+ * export to composite. Track numbers are never renumbered or shuffled down
+ * when one is removed — deleting Video 1 leaves Video 2 exactly "Video 2",
+ * the same way deleting a clip never renumbers the clips after it.
+ */
+function removeVideoTrack(trackId) {
+  const track = state.project.tracks.find(t => t.id === trackId && t.kind === 'video');
+  if (!track) return;
+  if (track.clips.length) {
+    toast(`${track.name} has clips on it — remove them first.`, 'warn');
+    return;
+  }
+  const videoCount = state.project.tracks.filter(t => t.kind === 'video').length;
+  if (videoCount <= 1) {
+    toast('A project needs at least one video track.', 'warn');
+    return;
+  }
+  edit('remove video track', () => {
+    state.project.tracks = state.project.tracks.filter(t => t.id !== trackId);
+  });
+  renderAll();
+}
+
 function renderHeads() {
   const heads = $('tlHeads');
   heads.innerHTML = '<div class="tl-heads-pad"></div>';
@@ -1283,7 +1409,15 @@ function renderHeads() {
     hide.onclick = () => { edit('hide track', () => { track.hidden = !track.hidden; }); renderAll(); };
 
     btns.append(mute);
-    if (track.kind === 'video') btns.append(hide);
+    if (track.kind === 'video') {
+      btns.append(hide);
+      const remove = document.createElement('button');
+      remove.className = 'chip';
+      remove.textContent = '✕';
+      remove.title = 'Remove this video track (only while it has no clips)';
+      remove.onclick = () => removeVideoTrack(track.id);
+      btns.append(remove);
+    }
     el.append(name, btns);
     heads.appendChild(el);
   }
@@ -2247,6 +2381,7 @@ async function runExport(previewSeconds) {
 
 function renderAll() {
   renderHeads();
+  renderSendButtons();
   renderTimeline();
   renderInspector();
   syncTimelinePreview();
@@ -2272,10 +2407,6 @@ document.addEventListener('drop', async (e) => {
   if (paths.length) addPaths(paths);
 });
 
-$('btnSendV1').onclick = () => sendToTrack('v1');
-$('btnSendV2').onclick = () => sendToTrack('v2');
-$('btnSendA1').onclick = () => sendToTrack('a1');
-
 // Transport — togglePlay itself lives in the Preview section, above, next to
 // the timeline clock it drives.
 $('btnPlay').onclick = togglePlay;
@@ -2299,6 +2430,7 @@ $('btnSetIn').onclick = setInAtPlayhead;
 $('btnSetOut').onclick = setOutAtPlayhead;
 $('btnDeleteClip').onclick = deleteSelected;
 $('btnCloseGaps').onclick = closeGaps;
+$('btnAddVideoTrack').onclick = addVideoTrack;
 
 // Zoom
 $('btnZoomIn').onclick = () => { state.pxPerSec = clamp(state.pxPerSec * 1.4, 4, 600); renderTimeline(); };

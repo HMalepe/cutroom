@@ -59,11 +59,11 @@
           Select clips in the bin, then send them to a track. Order of selection
           is the order they land.
         </div>
-        <div style="margin-top:8px; display:flex; gap:5px; flex-wrap:wrap;">
-          <button class="btn btn-sm" id="btnSendV1">→ Video 1</button>
-          <button class="btn btn-sm" id="btnSendV2">→ Video 2</button>
-          <button class="btn btn-sm" id="btnSendA1">→ Audio 1</button>
-        </div>
+        <!-- One "-> Video N" button per current video track, plus the fixed
+             audio one, is data-driven (app.js's renderSendButtons) rather
+             than static markup here, since the video track list can grow
+             and shrink. -->
+        <div style="margin-top:8px; display:flex; gap:5px; flex-wrap:wrap;" id="sendButtons"></div>
       </div>
     </div>
 
@@ -199,6 +199,9 @@
         <label for="snapBeats">Snap to beat</label>
       </div>
 
+      <span style="width:1px; height:16px; background:var(--line);"></span>
+
+      <button class="btn btn-sm btn-ghost" id="btnAddVideoTrack" title="Add another video track, composited above the ones already there">+ Video track</button>
       <button class="btn btn-sm btn-ghost" id="btnCloseGaps" title="Push every clip on the selected track flush against the one before it">Close gaps</button>
       <button class="btn btn-sm btn-ghost btn-danger" id="btnDeleteClip">Delete clip</button>
 
