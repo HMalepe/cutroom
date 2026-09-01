@@ -948,13 +948,17 @@ function renderRelinkPanel() {
  * the dissolve standing in for it here. See timeline-preview.js's
  * trackStateAt for exactly where that window and its progress come from.
  *
- * Captions are not drawn here at all, same gap the old preview had — Test 3s
- * remains the way to check those. Rendering the caption style panel's font,
- * colour, position and background as an HTML overlay was considered and cut:
- * everything else in this feature already needs proving out in a real
- * browser this harness cannot launch, and a second unverified approximation
- * layered on top of the first was worse than being honest that this PR ends
- * at the video layers.
+ * Captions draw as a positioned HTML/CSS overlay on top of #previewStage —
+ * font, size, colour, background and position from the caption style panel,
+ * plus a cheap approximation of the 'fade'/'pop'/'slide' entry animations
+ * and, when a row carries real per-word timing, the typewriter sweep. It is
+ * an approximation of buildAssFile's real libass render, not a port of it,
+ * and only appears inside the composited stage — Test 3s remains the way to
+ * check the real burned-in render, and the only way to check captions at
+ * all in the no-WebGL fallback below. See "Captions in the preview" in the
+ * README for exactly what this does and does not attempt, and
+ * syncCaptionOverlay/applyCaptionOverlay, further down this section, for
+ * the wiring.
  */
 
 // One canvas+<video> pair per concurrent layer. #keyCanvas (pool[0]) always
@@ -1106,6 +1110,7 @@ function showEmptyPane() {
   $('video').controls = false;
   $('scrub').style.display = 'none';
   $('xfadeBadge').style.display = 'none';
+  hideCaptionOverlay();
   $('viewerEmpty').style.display = 'block';
   pauseAllLayers();
 }
@@ -1134,6 +1139,7 @@ function loadPreviewFromBin(path) {
   $('previewStage').style.display = 'none';
   $('scrub').style.display = 'none';
   $('xfadeBadge').style.display = 'none';
+  hideCaptionOverlay();
   $('viewerEmpty').style.display = 'none';
   syncTimelinePreview();
 }
@@ -1149,6 +1155,14 @@ function drawPlainFallback(layers) {
   $('previewStage').style.display = 'none';
   $('scrub').style.display = 'none';
   $('xfadeBadge').style.display = 'none';
+  // No captions here, on purpose — see the header comment and "Captions in
+  // the preview" in the README. This is not the same gap the timeline clock
+  // skips for the same reason: the caption overlay needs zero WebGL, but it
+  // is sized against #previewStage's own rendered box (see .caption-overlay
+  // in styles.css), and #video has no equivalent stage wrapper to size
+  // against here. Building one just for this fallback would be the same
+  // scope creep the clock/trim-loop gap above already declined.
+  hideCaptionOverlay();
   $('viewerEmpty').style.display = 'none';
 
   const v = $('video');
@@ -1232,6 +1246,149 @@ function drawComposited(layers, t) {
     layerPool[i].canvas.style.display = 'none';
     if (!layerPool[i].video.paused) layerPool[i].video.pause();
   }
+
+  syncCaptionOverlay(t);
+}
+
+/**
+ * Captions, as an HTML/CSS approximation of the caption style panel's font,
+ * size, colour, background and position — see buildAssFile in
+ * shared/ffmpeg-builder.js for the real render this stands in for, and
+ * "Captions in the preview" in the README for exactly where the two are
+ * allowed to disagree. Driven from drawComposited, on the same t and the
+ * same redraw triggers (requestPreviewFrame/the RAF loop) as the video
+ * layers, rather than a second render path of its own — a caption overlay
+ * that updated on a different schedule than the video it sits over would
+ * drift out of sync with it exactly the way two independent clocks always
+ * do. It only ever runs inside the composited stage: hidden whenever
+ * #previewStage itself is (bin mode, the empty pane, the no-WebGL
+ * fallback), same as #xfadeBadge already is.
+ */
+function hideCaptionOverlay() {
+  $('captionOverlay').style.display = 'none';
+}
+
+function hexToRgba(hex, alpha) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || '').trim());
+  const rgb = m ? m[1] : '000000';
+  const r = parseInt(rgb.slice(0, 2), 16);
+  const g = parseInt(rgb.slice(2, 4), 16);
+  const b = parseInt(rgb.slice(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${clamp(Number(alpha), 0, 1)})`;
+}
+
+/** A cheap multi-direction text-shadow stands in for ASS's BorderStyle 1
+ *  outline — real enough to read as "outlined text" without a pixel-level
+ *  stroke renderer, which CSS has no built-in equivalent for. */
+function textOutlineShadow(color, widthPx) {
+  if (!(widthPx > 0)) return 'none';
+  return [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]]
+    .map(([dx, dy]) => `${(dx * widthPx).toFixed(2)}px ${(dy * widthPx).toFixed(2)}px 0 ${color}`)
+    .join(', ');
+}
+
+// A fixed, modest lift for the 'slide' animation, in em (relative to the
+// caption's own font size) rather than one derived from marginV the way
+// buildAssFile's own \move coordinates are: the real tag always targets a y
+// just above the BOTTOM edge regardless of which position (top/middle/
+// bottom) is actually chosen, which Alignment then reinterprets around that
+// point — reproducing that quirk for top/middle would need testing against
+// a real libass render this repository's test harness cannot run (no
+// ffmpeg here), so this approximates "slides up into wherever it already
+// sits" instead of that exact, position-dependent path.
+const SLIDE_LIFT_EM = 1.2;
+
+function applyCaptionOverlay(caption, t) {
+  const st = state.project.captionStyle || {};
+  const H = state.project.height;
+  const overlay = $('captionOverlay');
+  const textEl = $('captionOverlayText');
+
+  // #previewStage's own rendered box is exactly the composited stage's
+  // (see styles.css) — 0 here (no real layout, which is all jsdom ever
+  // reports) is what makes scaledPx fall back to treating an ASS unit as
+  // one CSS pixel; see its own comment in caption-preview.js.
+  const stageHeightPx = $('previewStage').clientHeight;
+  const px = (assUnits) => CaptionPreview.scaledPx(assUnits, stageHeightPx, H);
+
+  const position = ['top', 'middle', 'bottom'].includes(st.position) ? st.position : 'bottom';
+  overlay.className = 'caption-overlay pos-' + position;
+  overlay.style.display = 'flex';
+
+  textEl.style.fontFamily = st.font || 'Arial';
+  textEl.style.fontWeight = st.bold ? '700' : '400';
+  textEl.style.color = st.color || '#FFFFFF';
+  textEl.style.fontSize = px(st.size || 54).toFixed(2) + 'px';
+
+  // Distance from the edge the caption sits at, same field buildAssFile
+  // writes into MarginV — middle position centres regardless of it, the
+  // same way libass's own Alignment 5 does.
+  const marginPx = px(st.marginV ?? 70).toFixed(2) + 'px';
+  textEl.style.marginTop = position === 'top' ? marginPx : '';
+  textEl.style.marginBottom = position === 'bottom' ? marginPx : '';
+
+  if (st.background) {
+    textEl.style.backgroundColor = hexToRgba(st.bgColor || '#000000', st.bgOpacity ?? 0.7);
+    textEl.style.padding = '0.15em 0.4em';
+    textEl.style.borderRadius = '3px';
+    textEl.style.textShadow = 'none';
+  } else {
+    textEl.style.backgroundColor = 'transparent';
+    textEl.style.padding = '0';
+    textEl.style.borderRadius = '0';
+    textEl.style.textShadow = textOutlineShadow(st.outlineColor || '#000000', px(st.outlineWidth ?? 3));
+  }
+
+  const anim = st.animation || 'none';
+  textEl.style.opacity = '1';
+  textEl.style.transform = '';
+
+  if (anim === 'typewriter') {
+    const words = CaptionPreview.karaokeWordStates(caption, t);
+    if (words) {
+      textEl.textContent = '';
+      const unspoken = st.secondaryColor || hexToRgba(st.color || '#FFFFFF', 0.55);
+      words.forEach((w, i) => {
+        const span = document.createElement('span');
+        span.textContent = w.text;
+        span.style.color = w.spoken ? (st.color || '#FFFFFF') : unspoken;
+        textEl.appendChild(span);
+        if (i < words.length - 1) textEl.appendChild(document.createTextNode(' '));
+      });
+    } else {
+      // No real per-word timing to sweep — a hand-typed line, an imported
+      // .srt/.vtt, or a transcribed row edited after the fact (see
+      // renderCaptions, which drops `words` the moment a row is touched).
+      // buildAssFile still animates these, with the old even-split-by-
+      // character \k estimate — reproducing that formula's own timing here
+      // was judged not worth it for what this overlay is for; see the
+      // README. Shown plain instead, which is the honest state: static text
+      // that will animate for real at export.
+      textEl.textContent = caption.text;
+    }
+  } else {
+    textEl.textContent = caption.text;
+    const { opacity, scale, lift } = CaptionPreview.animationState(anim, t - caption.start, caption.end - t);
+    textEl.style.opacity = String(opacity);
+    const transforms = [];
+    if (lift) transforms.push(`translateY(${(lift * SLIDE_LIFT_EM).toFixed(3)}em)`);
+    if (scale !== 1) transforms.push(`scale(${scale.toFixed(3)})`);
+    textEl.style.transform = transforms.join(' ');
+  }
+}
+
+function syncCaptionOverlay(t) {
+  const project = state.project;
+  if (!project.captionsEnabled || !project.captions || !project.captions.length) {
+    hideCaptionOverlay();
+    return;
+  }
+  const caption = CaptionPreview.activeCaptionAt(project.captions, t);
+  if (!caption) {
+    hideCaptionOverlay();
+    return;
+  }
+  applyCaptionOverlay(caption, t);
 }
 
 /**
@@ -2433,7 +2590,7 @@ function renderCaptionStyle() {
   sizeInput.type = 'number';
   sizeInput.className = 'input';
   sizeInput.value = st.size;
-  sizeInput.onchange = () => { st.size = Number(sizeInput.value) || 54; };
+  sizeInput.onchange = () => { st.size = Number(sizeInput.value) || 54; scheduleCommandPreview(); };
   row1.appendChild(field('Size', sizeInput));
   box.appendChild(row1);
 
@@ -2445,7 +2602,7 @@ function renderCaptionStyle() {
   colour.className = 'input';
   colour.style.height = '28px';
   colour.value = st.color;
-  colour.onchange = () => { st.color = colour.value; };
+  colour.onchange = () => { st.color = colour.value; scheduleCommandPreview(); };
   row2.appendChild(field('Text colour', colour));
 
   const pos = document.createElement('select');
@@ -2456,7 +2613,7 @@ function renderCaptionStyle() {
     if (st.position === p) o.selected = true;
     pos.appendChild(o);
   }
-  pos.onchange = () => { st.position = pos.value; };
+  pos.onchange = () => { st.position = pos.value; scheduleCommandPreview(); };
   row2.appendChild(field('Position', pos));
   box.appendChild(row2);
 
@@ -2471,7 +2628,7 @@ function renderCaptionStyle() {
     if (st.animation === v) o.selected = true;
     anim.appendChild(o);
   }
-  anim.onchange = () => { st.animation = anim.value; renderCaptionStyle(); };
+  anim.onchange = () => { st.animation = anim.value; renderCaptionStyle(); scheduleCommandPreview(); };
   box.appendChild(field('Animation', anim));
 
   if (st.animation === 'typewriter') {
@@ -2485,7 +2642,7 @@ function renderCaptionStyle() {
     // "not yet sung" has no separate field until the user picks one, so the
     // swatch previews the same dimmed default buildAssFile falls back to.
     karaoke.value = st.secondaryColor || st.color;
-    karaoke.onchange = () => { st.secondaryColor = karaoke.value; };
+    karaoke.onchange = () => { st.secondaryColor = karaoke.value; scheduleCommandPreview(); };
     karaokeRow.appendChild(field('Karaoke colour (not yet spoken)', karaoke));
     box.appendChild(karaokeRow);
   }
@@ -2496,7 +2653,7 @@ function renderCaptionStyle() {
   bcb.type = 'checkbox';
   bcb.id = 'capBg';
   bcb.checked = st.background;
-  bcb.onchange = () => { edit('caption box', () => { st.background = bcb.checked; }); renderCaptionStyle(); };
+  bcb.onchange = () => { edit('caption box', () => { st.background = bcb.checked; }); renderCaptionStyle(); scheduleCommandPreview(); };
   const bl = document.createElement('label');
   bl.htmlFor = 'capBg';
   bl.textContent = 'Box behind text';
@@ -2511,7 +2668,7 @@ function renderCaptionStyle() {
     bg.className = 'input';
     bg.style.height = '28px';
     bg.value = st.bgColor;
-    bg.onchange = () => { st.bgColor = bg.value; };
+    bg.onchange = () => { st.bgColor = bg.value; scheduleCommandPreview(); };
     bgRow.appendChild(field('Box colour', bg));
     box.appendChild(bgRow);
   }
@@ -2520,7 +2677,7 @@ function renderCaptionStyle() {
   marginInput.type = 'number';
   marginInput.className = 'input';
   marginInput.value = st.marginV;
-  marginInput.onchange = () => { st.marginV = Number(marginInput.value) || 0; };
+  marginInput.onchange = () => { st.marginV = Number(marginInput.value) || 0; scheduleCommandPreview(); };
   box.appendChild(field('Distance from edge (px)', marginInput));
 }
 
@@ -2550,11 +2707,11 @@ function renderCaptions() {
     // row may have carried in from transcription, so it goes back to the
     // even-split estimate buildAssFile falls back to — the same rule the
     // text edit below follows.
-    start.onchange = () => { cap.start = Number(start.value) || 0; delete cap.words; renderCaptions(); };
+    start.onchange = () => { cap.start = Number(start.value) || 0; delete cap.words; renderCaptions(); scheduleCommandPreview(); };
     const end = document.createElement('input');
     end.className = 'cap-time';
     end.value = cap.end.toFixed(2);
-    end.onchange = () => { cap.end = Number(end.value) || 0; delete cap.words; renderCaptions(); };
+    end.onchange = () => { cap.end = Number(end.value) || 0; delete cap.words; renderCaptions(); scheduleCommandPreview(); };
     trackContinuous(start, 'caption timing');
     trackContinuous(end, 'caption timing');
     times.append(start, end);
@@ -2566,7 +2723,7 @@ function renderCaptions() {
     // Editing the words a row carries real per-word timing for makes that
     // timing describe a caption that no longer exists, so it is dropped
     // rather than left to silently mislabel whatever text replaces it.
-    text.oninput = () => { cap.text = text.value; delete cap.words; };
+    text.oninput = () => { cap.text = text.value; delete cap.words; scheduleCommandPreview(); };
     // A whole burst of typing collapses into one entry, closed on blur —
     // undo per keystroke would take a dozen presses to clear one line.
     trackContinuous(text, 'caption text');
@@ -2575,7 +2732,7 @@ function renderCaptions() {
     del.className = 'chip';
     del.textContent = '×';
     del.title = 'Remove this line';
-    del.onclick = () => { edit('remove caption', () => { caps.splice(i, 1); }); renderCaptions(); };
+    del.onclick = () => { edit('remove caption', () => { caps.splice(i, 1); }); renderCaptions(); scheduleCommandPreview(); };
 
     row.append(times, text, del);
     list.appendChild(row);
@@ -2616,6 +2773,7 @@ async function transcribeSelected() {
   });
   $('capEnabled').checked = true;
   renderCaptions();
+  scheduleCommandPreview();
   toast(`${res.captions.length} caption lines. Edit the timings below if any drift.`);
 }
 
@@ -2845,6 +3003,7 @@ $('btnImportSrt').onclick = async () => {
   });
   $('capEnabled').checked = true;
   renderCaptions();
+  scheduleCommandPreview();
   toast(`${caps.length} caption lines imported.`);
 };
 $('btnAddCaption').onclick = () => {
@@ -2852,6 +3011,7 @@ $('btnAddCaption').onclick = () => {
     state.project.captions.push({ start: state.playhead, end: state.playhead + 2, text: 'New line' });
   });
   renderCaptions();
+  scheduleCommandPreview();
 };
 
 // Project settings. These are static markup rather than built by field(), so

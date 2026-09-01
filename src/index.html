@@ -73,8 +73,10 @@
         <div class="viewer-empty" id="viewerEmpty">
           The preview shows the timeline itself: whatever is under the
           playhead, keyed, colour-corrected, scaled, positioned, trimmed and
-          sped up, Video 2 composited over Video 1. It does not show
-          captions — use <strong>Test 3s</strong> for those.
+          sped up, Video 2 composited over Video 1. Captions show as an
+          approximate HTML overlay, not a real libass render, and only while
+          the composited view itself is showing — use
+          <strong>Test 3s</strong> to check the real burned-in render.
         </div>
         <video id="video" controls style="display:none"></video>
         <!-- The composited view. #keyCanvas is the bottom-most layer and is
@@ -92,6 +94,14 @@
                xfade transition the export actually uses — see the Preview
                section of the README. -->
           <div class="xfade-badge" id="xfadeBadge" style="display:none"></div>
+          <!-- An HTML/CSS approximation of the caption style panel's font,
+               size, colour, background and position — see "Captions in the
+               preview" in the README for exactly what this does and does
+               not attempt, and why it only exists inside this stage rather
+               than over the no-WebGL fallback's plain <video> too. -->
+          <div class="caption-overlay" id="captionOverlay" style="display:none">
+            <div class="caption-overlay-text" id="captionOverlayText"></div>
+          </div>
         </div>
       </div>
       <div class="transport">
@@ -266,6 +276,7 @@
 <script src="chroma-math.js"></script>
 <script src="key-preview.js"></script>
 <script src="timeline-preview.js"></script>
+<script src="caption-preview.js"></script>
 <script src="timeline-snapping.js"></script>
 <script src="waveform-render.js"></script>
 <script src="thumbnail-render.js"></script>

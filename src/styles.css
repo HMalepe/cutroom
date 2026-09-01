@@ -316,6 +316,30 @@ button { cursor: pointer; }
   pointer-events: none;
 }
 
+/* The caption overlay — an HTML/CSS approximation of the caption style
+   panel's font, size, colour, background and position, positioned the same
+   way .xfade-badge is: an absolutely-positioned child of the stage rather
+   than anything laid out inline. See "Captions in the preview" in the
+   README for what this does and does not attempt. */
+.caption-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+  overflow: hidden;
+}
+.caption-overlay.pos-top { align-items: flex-start; }
+.caption-overlay.pos-middle { align-items: center; }
+.caption-overlay.pos-bottom { align-items: flex-end; }
+.caption-overlay-text {
+  max-width: 88%;
+  text-align: center;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.25;
+}
+
 .scrub {
   flex: 1;
   min-width: 60px;

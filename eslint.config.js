@@ -68,6 +68,7 @@ module.exports = [
         stepClipLoop: 'readonly',
         clampPlaybackRate: 'readonly',
         TimelinePreview: 'readonly',
+        CaptionPreview: 'readonly',
         TimelineSnapping: 'readonly',
         WaveformRender: 'readonly',
         ThumbnailRender: 'readonly',
