@@ -97,6 +97,12 @@ function boot() {
     getWaveform: async () => { throw new Error('no fixture audio'); },
     getThumbnails: async () => { throw new Error('no fixture video'); },
     pickMedia: async () => [],
+    // Missing media. Defaulting to "nothing is missing" is what lets every
+    // test that doesn't care about this feature ignore it entirely; tests
+    // that do override these per-test, the same way openProject is stubbed.
+    checkMissing: async () => [],
+    locateMedia: async () => null,
+    relinkFolder: async () => null,
     runExport: async () => ({ canceled: true }),
     cancelExport: async () => {},
     onExportProgress: () => () => {},

@@ -16,7 +16,9 @@ const builder = require('./shared/ffmpeg-builder');
 const { validateProject, PROJECT_VERSION } = require('./shared/project-schema');
 const saveState = require('./shared/save-state');
 const mediaCache = require('./shared/media-cache');
+const { commandForInput } = require('./shared/clipboard-shortcuts');
 const { matrixNameFromTags } = require('./src/chroma-math');
+const mediaRelink = require('./src/media-relink');
 
 let win = null;
 let currentExport = null;
@@ -108,8 +110,43 @@ function createWindow() {
   win.loadFile(path.join(__dirname, 'src', 'index.html'));
   win.on('close', onWindowClose);
   win.on('closed', () => { win = null; });
+  wireClipboardShortcuts(win);
   applyWindowTitle();
   return win;
+}
+
+/**
+ * Cmd/Ctrl+C and Cmd/Ctrl+V mean two different things depending on what has
+ * focus — copy/paste text in a field, or copy/paste clips on the timeline —
+ * and the Edit menu's `copy`/`paste` roles above already own that key
+ * combo on every platform the same way `historyItem`'s Undo/Redo would if
+ * they used the `undo`/`redo` roles instead of their own accelerators. There
+ * is no equivalent free key combo to fall back to here, because the app has
+ * to answer to both meanings rather than pick one: text fields still need
+ * real clipboard support (see the Edit menu comment above), so the roles
+ * stay exactly as they are rather than being replaced with something
+ * app.js-only.
+ *
+ * `before-input-event` fires before Electron dispatches the keystroke to
+ * either the page or a menu accelerator, so it sees Cmd/Ctrl+C/V regardless
+ * of who else claims it — and not calling preventDefault() here leaves the
+ * roles' own native copy/paste running exactly as before for whatever is
+ * actually focused. app.js decides which meaning applies by checking its
+ * own document.activeElement when the command arrives (see isTypingTarget
+ * there), the same way it already reads the DOM to decide most things this
+ * process cannot see.
+ *
+ * The decision itself — which command, if any, a given keystroke maps to —
+ * is `commandForInput` in shared/clipboard-shortcuts.js, pure and tested;
+ * see that file's own comment for why the delivery mechanism here (whether
+ * before-input-event fires at all) is instead a by-hand check against a real
+ * Electron window rather than something `npm run test:electron` drives.
+ */
+function wireClipboardShortcuts(target) {
+  target.webContents.on('before-input-event', (_event, input) => {
+    const command = commandForInput(input);
+    if (command) target.webContents.send('menu:command', { command });
+  });
 }
 
 /**
@@ -692,6 +729,84 @@ ipcMain.handle('media:thumbnails', async (_e, filePath) => {
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
+});
+
+// --------------------------------------------------------------------------
+// Missing media
+// --------------------------------------------------------------------------
+
+/*
+ * `clip.src` and bin `media.path` are absolute paths with no indirection —
+ * see src/media-relink.js's header for the full shape of the problem. The
+ * renderer cannot check the filesystem itself (contextIsolation, no Node in
+ * that world), so it asks here.
+ *
+ * Detection is deliberately not folded into project:open's own handler. The
+ * media bin is renderer-only state that never round-trips through a saved
+ * project file — nothing in project-schema.js's shape describes it — so a
+ * bin item going missing has nothing to do with which project is open. One
+ * general-purpose check, called by the renderer right after adopting a
+ * project (open, or a recovered autosave) with every path it cares about at
+ * that moment — the newly-loaded project's clips and the bin as it already
+ * stands — covers both without main needing to know what a "clip" is.
+ */
+ipcMain.handle('media:checkMissing', async (_e, paths) => {
+  return (paths || []).filter(p => typeof p === 'string' && p && !fs.existsSync(p));
+});
+
+/**
+ * "Locate…" on one missing file. `hint` is a directory to open the dialog in
+ * — the missing file's own last-known folder, when that much still exists,
+ * so the user isn't dropped at the OS default and made to navigate back to
+ * roughly where they already know the file to be.
+ */
+ipcMain.handle('media:locate', async (_e, hint) => {
+  const dir = hint && fs.existsSync(hint) ? hint : app.getPath('documents');
+  const res = await dialog.showOpenDialog(win, {
+    defaultPath: dir,
+    properties: ['openFile'],
+    filters: [
+      { name: 'Media', extensions: ['mp4', 'mov', 'mkv', 'webm', 'avi', 'm4v',
+        'png', 'jpg', 'jpeg', 'webp', 'mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus'] },
+      { name: 'All files', extensions: ['*'] }
+    ]
+  });
+  if (res.canceled) return null;
+  return res.filePaths[0];
+});
+
+/**
+ * The folder-scoped convenience from the same dialog: match every missing
+ * path against a folder's contents by filename (matchByFilename — filename
+ * only, see its own comment for why that is the whole heuristic). Two
+ * callers share this, which is why the folder itself is optional:
+ *
+ *   - The panel's "Locate folder…" button passes nothing, so this opens the
+ *     directory picker itself.
+ *   - The automatic check against the project file's own folder (a moved
+ *     file is often sitting right beside the .cutroom.json that references
+ *     it) passes `projectFilePath` and gets no dialog at all — it runs
+ *     silently and the renderer only surfaces it if something actually
+ *     matched.
+ *
+ * An unreadable folder (permissions, or it was itself moved a second later)
+ * comes back as zero matches rather than an error — nothing was relinked, so
+ * there is nothing to report beyond that.
+ */
+ipcMain.handle('media:relinkFolder', async (_e, { missing, dir, projectFilePath } = {}) => {
+  let folder = dir;
+  if (!folder && projectFilePath) folder = path.dirname(projectFilePath);
+  if (!folder) {
+    const res = await dialog.showOpenDialog(win, { properties: ['openDirectory'] });
+    if (res.canceled) return null;
+    folder = res.filePaths[0];
+  }
+
+  let names;
+  try { names = fs.readdirSync(folder); } catch { return { dir: folder, matches: [] }; }
+  const available = names.map(n => path.join(folder, n));
+  const matches = mediaRelink.matchByFilename(missing || [], available);
+  return { dir: folder, matches };
 });
 
 // --------------------------------------------------------------------------

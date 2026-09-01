@@ -59,11 +59,11 @@
           Select clips in the bin, then send them to a track. Order of selection
           is the order they land.
         </div>
-        <div style="margin-top:8px; display:flex; gap:5px; flex-wrap:wrap;">
-          <button class="btn btn-sm" id="btnSendV1">→ Video 1</button>
-          <button class="btn btn-sm" id="btnSendV2">→ Video 2</button>
-          <button class="btn btn-sm" id="btnSendA1">→ Audio 1</button>
-        </div>
+        <!-- One "-> Video N" button per current video track, plus the fixed
+             audio one, is data-driven (app.js's renderSendButtons) rather
+             than static markup here, since the video track list can grow
+             and shrink. -->
+        <div style="margin-top:8px; display:flex; gap:5px; flex-wrap:wrap;" id="sendButtons"></div>
       </div>
     </div>
 
@@ -199,8 +199,12 @@
         <label for="snapBeats">Snap to beat</label>
       </div>
 
+      <span style="width:1px; height:16px; background:var(--line);"></span>
+
+      <button class="btn btn-sm btn-ghost" id="btnAddVideoTrack" title="Add another video track, composited above the ones already there">+ Video track</button>
       <button class="btn btn-sm btn-ghost" id="btnCloseGaps" title="Push every clip on the selected track flush against the one before it">Close gaps</button>
-      <button class="btn btn-sm btn-ghost btn-danger" id="btnDeleteClip">Delete clip</button>
+      <button class="btn btn-sm btn-ghost" id="btnDuplicateClip" title="Duplicate the selected clip(s) right after themselves (Ctrl/Cmd+D)">Duplicate</button>
+      <button class="btn btn-sm btn-ghost btn-danger" id="btnDeleteClip" title="Remove the selected clip(s), leaving a gap. Shift+Delete closes it.">Delete clip</button>
 
       <span class="topbar-spacer"></span>
       <div class="progress" id="progress" style="max-width:180px; display:none;">
@@ -237,6 +241,26 @@
 
 </div>
 
+<!-- ------------------------------------------------------------------ -->
+<!-- Missing media. Hidden by default (relink-panel with nothing in
+     #relinkList); app.js shows it the moment a project or bin path stops
+     resolving on disk, and keeps it up until every entry is relinked —
+     collapsible, the same as #cmdPanel below, but never auto-dismissing the
+     way a toast would. See "Missing media" in the README. -->
+<div class="relink-panel" id="relinkPanel" style="display:none">
+  <div class="relink-head" id="relinkHead">
+    <span class="relink-title">⚠ Missing media</span>
+    <span class="relink-count" id="relinkCount">0</span>
+    <span class="topbar-spacer"></span>
+    <button class="btn btn-sm btn-ghost" id="btnRelinkFolder">Locate folder…</button>
+    <span class="tpl-tag" id="relinkToggle">hide</span>
+  </div>
+  <div class="relink-body" id="relinkBody">
+    <div class="relink-auto" id="relinkAuto" style="display:none"></div>
+    <div id="relinkList"></div>
+  </div>
+</div>
+
 <div class="toast-stack" id="toasts"></div>
 
 <script src="chroma-math.js"></script>
@@ -245,6 +269,7 @@
 <script src="timeline-snapping.js"></script>
 <script src="waveform-render.js"></script>
 <script src="thumbnail-render.js"></script>
+<script src="media-relink.js"></script>
 <script src="history.js"></script>
 <script src="dirty-state.js"></script>
 <script src="templates.js"></script>

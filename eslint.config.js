@@ -70,7 +70,8 @@ module.exports = [
         TimelinePreview: 'readonly',
         TimelineSnapping: 'readonly',
         WaveformRender: 'readonly',
-        ThumbnailRender: 'readonly'
+        ThumbnailRender: 'readonly',
+        MediaRelink: 'readonly'
       }
     },
     rules: {
