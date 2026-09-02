@@ -952,7 +952,9 @@ function renderRelinkPanel() {
  * Captions draw as a positioned HTML/CSS overlay on top of #previewStage —
  * font, size, colour, background and position from the caption style panel,
  * plus a cheap approximation of the 'fade'/'pop'/'slide' entry animations
- * and, when a row carries real per-word timing, the typewriter sweep. It is
+ * and the typewriter sweep — per real word when a row carries per-word
+ * timing, per character (mirroring buildAssFile's own even-split fallback)
+ * otherwise. It is
  * an approximation of buildAssFile's real libass render, not a port of it,
  * and only appears inside the composited stage — Test 3s remains the way to
  * check the real burned-in render, and the only way to check captions at
@@ -1361,11 +1363,18 @@ function applyCaptionOverlay(caption, t) {
       // .srt/.vtt, or a transcribed row edited after the fact (see
       // renderCaptions, which drops `words` the moment a row is touched).
       // buildAssFile still animates these, with the old even-split-by-
-      // character \k estimate — reproducing that formula's own timing here
-      // was judged not worth it for what this overlay is for; see the
-      // README. Shown plain instead, which is the honest state: static text
-      // that will animate for real at export.
-      textEl.textContent = caption.text;
+      // character \k estimate, so mirror that here rather than showing
+      // static text — see charSplitKaraokeStates's own comment in
+      // caption-preview.js for the formula this is reproducing.
+      const chars = CaptionPreview.charSplitKaraokeStates(caption, t);
+      textEl.textContent = '';
+      const unspoken = st.secondaryColor || hexToRgba(st.color || '#FFFFFF', 0.55);
+      chars.forEach(c => {
+        const span = document.createElement('span');
+        span.textContent = c.char;
+        span.style.color = c.spoken ? (st.color || '#FFFFFF') : unspoken;
+        textEl.appendChild(span);
+      });
     }
   } else {
     textEl.textContent = caption.text;

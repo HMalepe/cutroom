@@ -190,6 +190,127 @@ test('karaokeWordStates carries the word text through unchanged', () => {
 });
 
 // ==========================================================================
+// charSplitKaraokeStates
+// ==========================================================================
+
+test('a caption with no text gives null, distinct from an empty-string one', () => {
+  assert.equal(CP.charSplitKaraokeStates(cap({ text: undefined }), 1), null, 'not even a string');
+  assert.deepEqual(CP.charSplitKaraokeStates(cap({ text: '' }), 1), [], 'a string, just an empty one');
+});
+
+test('empty, missing or malformed input gives null rather than throwing', () => {
+  assert.equal(CP.charSplitKaraokeStates(null, 1), null);
+  assert.equal(CP.charSplitKaraokeStates(undefined, 1), null);
+  assert.equal(CP.charSplitKaraokeStates({}, 1), null);
+});
+
+test('the first character is spoken from the caption\'s own start onward, matching karaokeWordStates\' first-word convention', () => {
+  const c = cap({ start: 2, end: 4, text: 'Hi' }); // dur=2s, 2 chars -> 100cs/char = 1s/char
+  assert.deepEqual(CP.charSplitKaraokeStates(c, 2).map(s => s.spoken), [true, false]);
+});
+
+test('a later character becomes spoken once elapsed time reaches its own index times the per-character duration', () => {
+  const c = cap({ start: 0, end: 2, text: 'Hi' }); // 100cs/char = 1s/char
+  assert.deepEqual(CP.charSplitKaraokeStates(c, 0.99).map(s => s.spoken), [true, false]);
+  assert.deepEqual(CP.charSplitKaraokeStates(c, 1).map(s => s.spoken), [true, true]);
+});
+
+test('every character stays spoken well past the caption\'s own end, the same as karaokeWordStates', () => {
+  const c = cap({ start: 0, end: 2, text: 'Hi' });
+  assert.deepEqual(CP.charSplitKaraokeStates(c, 100).map(s => s.spoken), [true, true]);
+});
+
+test('charSplitKaraokeStates carries each character through unchanged, in order', () => {
+  const c = cap({ start: 0, end: 1, text: 'Hi!' });
+  assert.deepEqual(CP.charSplitKaraokeStates(c, 0).map(s => s.char), ['H', 'i', '!']);
+});
+
+test('a caption shorter than the 0.1s floor uses the floor, matching buildAssFile\'s own clamp', () => {
+  // dur clamps to 0.1s regardless of how short start..end actually is, the
+  // same Math.max(0.1, ...) buildAssFile's own fallback branch applies.
+  const short = cap({ start: 0, end: 0.001, text: 'Hi' }); // floor -> dur=0.1s, 2 chars -> 5cs/char = 0.05s/char
+  assert.deepEqual(CP.charSplitKaraokeStates(short, 0.04).map(s => s.spoken), [true, false]);
+  assert.deepEqual(CP.charSplitKaraokeStates(short, 0.05).map(s => s.spoken), [true, true]);
+});
+
+test('a newline counts as two characters in the per-character duration, the same quirk buildAssFile\'s \\N conversion produces', () => {
+  // "a\nb": divisor is the ASS-escaped length (a, \, N, b = 4), not the real
+  // character count (a, \n, b = 3) — so with dur=4s the increment is 1s/char
+  // but there are only 3 real slots to walk through, and the last one (b)
+  // is already spoken by t=2s rather than t=3s.
+  const c = cap({ start: 0, end: 4, text: 'a\nb' });
+  const states = CP.charSplitKaraokeStates(c, 0);
+  assert.deepEqual(states.map(s => s.char), ['a', '\n', 'b']);
+  assert.deepEqual(CP.charSplitKaraokeStates(c, 0.99).map(s => s.spoken), [true, false, false]);
+  assert.deepEqual(CP.charSplitKaraokeStates(c, 1).map(s => s.spoken), [true, true, false]);
+  assert.deepEqual(CP.charSplitKaraokeStates(c, 2).map(s => s.spoken), [true, true, true]);
+});
+
+// ==========================================================================
+// charSplitKaraokeStates / buildAssFile: pinned so the two cannot drift
+// ==========================================================================
+
+test('charSplitKaraokeStates\' per-character duration matches the literal \\k value buildAssFile writes for the fallback', () => {
+  // Same role the FADE_SEC/POP_SEC/SLIDE_SEC pin test plays above: this
+  // recomputes buildAssFile's even-split-by-character formula by hand
+  // (shared/ never reaches the renderer), so the ONLY thing that keeps the
+  // two honest is a test that checks the real, current buildAssFile output
+  // rather than a copy of the formula pasted into the test itself.
+  const project = {
+    width: 1080, height: 1920,
+    captionStyle: { animation: 'typewriter' },
+    captions: [{ start: 0, end: 1, text: 'Hi' }]
+  };
+  const ass = builder.buildAssFile(project);
+  const kMatch = ass.match(/,,\{\\k(\d+)\}Hi$/m);
+  assert.ok(kMatch, 'buildAssFile should still write a single \\k tag for the no-word-timing fallback');
+  const secPerChar = Number(kMatch[1]) / 100;
+
+  const caption = project.captions[0];
+  // Character 0 is spoken immediately; character 1 only once secPerChar —
+  // the exact duration buildAssFile's own \k tag carries — has elapsed.
+  assert.deepEqual(CP.charSplitKaraokeStates(caption, 0).map(s => s.spoken), [true, false]);
+  assert.deepEqual(
+    CP.charSplitKaraokeStates(caption, secPerChar - 0.001).map(s => s.spoken),
+    [true, false]
+  );
+  assert.deepEqual(
+    CP.charSplitKaraokeStates(caption, secPerChar).map(s => s.spoken),
+    [true, true]
+  );
+});
+
+test('charSplitKaraokeStates still matches buildAssFile\'s \\k value for a longer, uneven line', () => {
+  // dur=3.4s over 18 visible characters -> 340/18 = 18.888..., which rounds
+  // to 19 rather than truncating to 18 — chosen deliberately so a rounding
+  // mistake (floor instead of round) shows up as a wrong boundary rather
+  // than hiding inside a margin wide enough to tolerate either.
+  const project = {
+    width: 1080, height: 1920,
+    captionStyle: { animation: 'typewriter' },
+    captions: [{ start: 5, end: 8.4, text: 'Hello there friend' }]
+  };
+  const ass = builder.buildAssFile(project);
+  const kMatch = ass.match(/,,\{\\k(\d+)\}Hello there friend$/m);
+  assert.ok(kMatch);
+  assert.equal(Number(kMatch[1]), 19, 'sanity: buildAssFile still rounds up here');
+  const secPerChar = Number(kMatch[1]) / 100;
+
+  const caption = project.captions[0];
+  // Character index 1 ('e') switches exactly one per-character duration
+  // after the caption's own start — the same tight boundary check the "Hi"
+  // pin test above uses.
+  assert.deepEqual(
+    CP.charSplitKaraokeStates(caption, caption.start + secPerChar - 0.001).map(s => s.spoken).slice(0, 2),
+    [true, false]
+  );
+  assert.deepEqual(
+    CP.charSplitKaraokeStates(caption, caption.start + secPerChar).map(s => s.spoken).slice(0, 2),
+    [true, true]
+  );
+});
+
+// ==========================================================================
 // scaledPx
 // ==========================================================================
 
