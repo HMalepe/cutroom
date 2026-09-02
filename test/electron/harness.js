@@ -67,8 +67,18 @@ async function waitFor(fn, { timeout = 5000, interval = 50, message = 'condition
  * because this and most CI containers run Chromium as root, where the
  * sandbox's setuid helper cannot work — the same accommodation headless
  * Electron-in-CI setups make everywhere.
+ *
+ * `initScript`, when given, is registered on the app's BrowserContext
+ * (`app.context().addInitScript(...)`) before `firstWindow()` is ever
+ * awaited — the one ordering that has a chance of landing before the main
+ * window's first navigation finishes, since by the time a caller has a
+ * `page` to call `page.addInitScript` on, that page may already have run
+ * its first script. Needed for a test that has to patch something (WebGL
+ * context creation, say) before app.js's own boot-time code gets to run
+ * for the first time — see test/electron/caption-preview.test.js's
+ * no-WebGL-fallback case, where a mid-session patch would be a no-op.
  */
-async function launchApp(extraArgs = [], { userDataDir } = {}) {
+async function launchApp(extraArgs = [], { userDataDir, initScript } = {}) {
   // A caller re-launching against the same dir (to prove a disk cache — the
   // waveform/thumbnail cache, or a real autosave recovery file — survives a
   // fresh process) passes one in; everyone else gets a clean one per launch.
@@ -87,6 +97,7 @@ async function launchApp(extraArgs = [], { userDataDir } = {}) {
       ...extraArgs
     ]
   });
+  if (initScript) await app.context().addInitScript(initScript);
   const page = await app.firstWindow();
   return { app, page, userDataDir };
 }

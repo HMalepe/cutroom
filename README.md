@@ -1020,29 +1020,32 @@ exactly `scaledPx`'s 1:1 fallback path — the size/margin/outline assertions
 in `test/caption-overlay.test.js` are checking that fallback arithmetic, not
 real proportional scaling against a real rendered stage, and a caption
 actually landing at the correct position, size and legibility on screen is
-a claim only a real browser can confirm. This repository's owner re-verifies
-PRs by launching real Electron under Xvfb with Playwright (see `npm run
-test:electron`'s own section, above), and did so for this feature: a real
-WebGL context (`--use-angle=swiftshader`) against a real ffmpeg-generated
-clip confirmed the overlay hides and shows across a caption's start/end on
-the real playhead clock, that `scaledPx`'s real branch (not the 1:1
-fallback above) produces the exact predicted pixel size against
-`#previewStage`'s actually-measured height, that switching `position`
-between `top` and `bottom` moves the rendered box on real screen
-coordinates, and that the no-WebGL fallback suppresses the overlay even with
-an active caption (checked by patching
-`HTMLCanvasElement.prototype.getContext` before the app's first WebGL call,
-since `keyerFor`'s per-pool-entry caching makes a later, mid-session
-patch a no-op). That pass predates `charSplitKaraokeStates` — it confirmed
-the no-per-word-timing case as it stood at the time, plain static text, not
-the character sweep that replaced it — so the typewriter fallback's real
-on-screen behaviour is unconfirmed under a real browser until it is
-re-checked. That pass is not part of this repository's own `test/electron/`
-suite — it lived in the reviewing session's own scratch script, the same way
-this project's manual pre-PR checks always have — so a future change here
-should not assume it stays proven; treating it as a candidate for a real
-`test/electron/*.test.js` case is the natural next step if this overlay's
-visual behaviour needs re-proving after a change lands.
+a claim only a real browser can confirm. `test/electron/caption-preview.test.js`
+is that confirmation, launching real Electron under Xvfb with Playwright
+(see `npm run test:electron`'s own section, above) against a real
+ffmpeg-generated clip: a real WebGL context — `--use-angle=swiftshader`
+plus `--enable-unsafe-swiftshader`, which recent Chromium requires before it
+will hand out software WebGL at all — confirms `scaledPx`'s real branch
+(not the 1:1 fallback above) produces the exact predicted pixel size
+against `#previewStage`'s actually-measured height; that the overlay hides
+and shows across a caption's start/end and the gap between two captions on
+the real playhead clock, driven by a real pointerdown on the ruler with the
+click's x computed against `#tlInner`'s own measured position rather than
+assumed to start at the browser window's left edge; that switching
+`position` between `top` and `bottom` moves the rendered box on real screen
+coordinates; that a caption with no per-word timing sweeps by real
+per-character `<span>`s (`charSplitKaraokeStates`, above) rather than
+showing static text; and that the no-WebGL fallback suppresses the overlay
+even with an active caption, checked by patching
+`HTMLCanvasElement.prototype.getContext` on the page's own `BrowserContext`
+before the window's first navigation, since `keyerFor`'s per-pool-entry
+caching makes a patch applied after the app's first (real) WebGL attempt a
+silent no-op. This lives as a permanent, checked-in file precisely because
+that timing quirk — and the `--enable-unsafe-swiftshader` flag itself — are
+exactly the kind of thing a manual pre-PR check re-derives correctly once
+and then forgets; running it on every change is what a future change to
+this overlay gets re-proven against, rather than a re-verification someone
+has to remember to redo by hand.
 
 ### Track counts are not fixed at their starting numbers
 
@@ -1241,16 +1244,11 @@ screen and not just in the string the builder produced.
 
 ## Extending it
 
-Reasonable next moves, roughly by effort:
-
-- **A real `test/electron/*.test.js` case for the caption overlay.** Its
-  real proportional scaling, position placement, typewriter fallback and
-  no-WebGL suppression were all confirmed by hand under Xvfb (see "Captions
-  in the preview"'s "What is and is not verified"), but that pass was a
-  reviewing session's scratch script, not a permanent, repeatable test —
-  turning it into a real file alongside `test/electron/media-preview.test.js`
-  is what would keep it proven after a future change here, rather than
-  relying on the same manual check being repeated by hand again.
+Nothing is currently on this list — every gap named here as this project
+went along (a second audio track, captions in the preview, the caption
+overlay's real-browser proof, its no-word-timing typewriter fallback) has
+been closed. The next reasonable move is whatever the next real gap turns
+out to be, not a bullet kept around for its own sake.
 
 ## Licence
 
