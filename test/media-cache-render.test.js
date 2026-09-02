@@ -25,7 +25,10 @@ const {
   pcmToPeaks,
   waveformExtractArgs,
   thumbnailTimestamps,
-  thumbnailExtractArgs
+  thumbnailExtractArgs,
+  keyframeProbeArgs,
+  parseKeyframeTimestamps,
+  averageKeyframeIntervalSec
 } = require('../shared/media-cache');
 const { extractWaveformPeaks } = require('../shared/waveform-extract');
 
@@ -193,4 +196,82 @@ test('thumbnailExtractArgs (count <= 1) grabs exactly one frame with no fps filt
   assert.equal(files.length, 1);
   const bytes = fs.readFileSync(path.join(DIR, files[0]));
   assert.equal(bytes.readUInt32BE(16), 80);
+});
+
+// --------------------------------------------------------------------------
+// Keyframe interval — mirrors the profiling experiment that motivated the
+// sparse-keyframe warning (1s vs. 30s GOP, real seek latency measured under
+// Xvfb) but with much shorter fixtures: this only needs enough real
+// keyframes to measure a real gap, not enough runtime to reproduce the
+// profiling's own seek-latency numbers.
+// --------------------------------------------------------------------------
+
+const near = (actual, want, tol, msg) =>
+  assert.ok(Math.abs(actual - want) <= tol, `${msg}: got ${actual}, wanted ${want}±${tol}`);
+
+/** A synthetic source with a specific, exact keyframe interval, built once and reused. */
+const keyframeSources = new Map();
+function keyframeSource(name, { durationSec, gopSec }) {
+  if (!keyframeSources.has(name)) {
+    const file = path.join(DIR, `${name}.mp4`);
+    const fps = 30;
+    const gopFrames = Math.round(gopSec * fps);
+    const r = spawnSync('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', `testsrc2=duration=${durationSec}:size=320x240:rate=${fps}`,
+      '-c:v', 'libx264', '-g', String(gopFrames), '-keyint_min', String(gopFrames),
+      '-sc_threshold', '0', '-pix_fmt', 'yuv420p', file
+    ], { encoding: 'utf8' });
+    assert.equal(r.status, 0, `keyframe fixture ${name} failed:\n${r.stderr}`);
+    keyframeSources.set(name, file);
+  }
+  return keyframeSources.get(name);
+}
+
+/** Run keyframeProbeArgs through a real ffprobe and reduce it the way main.js's probeKeyframeInterval does. */
+function measureKeyframeInterval(file, windowSec) {
+  const args = keyframeProbeArgs(file, { windowSec });
+  const r = spawnSync('ffprobe', args, { encoding: 'utf8' });
+  assert.equal(r.status, 0, `ffprobe rejected the keyframe probe args:\n${r.stderr}`);
+  return averageKeyframeIntervalSec(parseKeyframeTimestamps(r.stdout));
+}
+
+test('a dense-GOP fixture measures a real, small average keyframe interval', opts, () => {
+  // 15s of source, a keyframe every 1s -> ~15 keyframes, ~1s apart.
+  const src = keyframeSource('dense-gop', { durationSec: 15, gopSec: 1 });
+  const interval = measureKeyframeInterval(src, 60);
+  assert.ok(interval !== null, 'a 1s-GOP source should yield a measured interval');
+  near(interval, 1, 0.2, 'dense-GOP average keyframe interval');
+});
+
+test('a sparse-GOP fixture measures a real, large average keyframe interval', opts, () => {
+  // 15s of source, a keyframe every 10s -> keyframes at ~0, 10, ~10s apart.
+  const src = keyframeSource('sparse-gop', { durationSec: 15, gopSec: 10 });
+  const interval = measureKeyframeInterval(src, 60);
+  assert.ok(interval !== null, 'a 10s-GOP source should still yield a measured interval');
+  near(interval, 10, 1.5, 'sparse-GOP average keyframe interval');
+});
+
+test('the dense and sparse fixtures land on opposite sides of the app.js sparse-keyframe threshold', opts, () => {
+  // Pins the two fixtures above against SPARSE_KEYFRAME_THRESHOLD_SEC
+  // (app.js) without importing app.js itself (contextIsolation means it is
+  // not reachable from a plain node test — see dom-harness.js's own use of
+  // jsdom for that boundary). 8 is that threshold, duplicated here as a
+  // literal on purpose: if it drifts, this test's job is to make that
+  // visible, not to silently track it.
+  const SPARSE_KEYFRAME_THRESHOLD_SEC = 8;
+  const dense = measureKeyframeInterval(keyframeSource('dense-gop', { durationSec: 15, gopSec: 1 }), 60);
+  const sparse = measureKeyframeInterval(keyframeSource('sparse-gop', { durationSec: 15, gopSec: 10 }), 60);
+  assert.ok(dense <= SPARSE_KEYFRAME_THRESHOLD_SEC, `dense fixture (${dense}s) should read as not sparse`);
+  assert.ok(sparse > SPARSE_KEYFRAME_THRESHOLD_SEC, `sparse fixture (${sparse}s) should read as sparse`);
+});
+
+test('a clip too short to contain a second keyframe in the sampled window measures null, not a misleading number', opts, () => {
+  // A single 10s GOP on a 3s clip: only one keyframe (at t=0) ever exists,
+  // let alone falls inside the sampled window. This is the "insufficient
+  // data" case main.js's probeKeyframeInterval is documented to return null
+  // for, rather than reporting a 0s (or otherwise fabricated) interval.
+  const src = keyframeSource('too-short-for-two-keyframes', { durationSec: 3, gopSec: 10 });
+  const interval = measureKeyframeInterval(src, 60);
+  assert.equal(interval, null, 'fewer than 2 keyframes in the window should measure as null, not a number');
 });

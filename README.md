@@ -877,6 +877,61 @@ this reads as a software-rasteriser warm-up artefact of the test environment,
 not the app, and is noted rather than "fixed" because there is nothing in
 `key-preview.js` to change that would not be pure superstition.
 
+### When scrubbing the preview is slow, and why this only warns about it
+
+The preview seeks the real source `<video>` directly — no proxy file, no
+partial decode, just `currentTime` set on the browser's own element (see
+`syncVideoToTime`/`drawComposited` in `app.js`). That is what makes it trust
+the export's own numbers instead of a second, separately-maintained
+rendering path, but it also means scrub latency is Chromium's decoder's
+problem, not this codebase's, and Chromium's decoder has a real limit: a
+seek can only start from a keyframe, and on `<video>.currentTime` it
+re-renders from that GOP's own start regardless of how small the jump is.
+
+That was measured, not assumed. Two synthetic 10-minute fixtures of
+identical duration, one keyframe every 1 second and one every 30 seconds
+(`ffmpeg -f lavfi -i testsrc2=duration=600:... -g <N> -keyint_min <N>
+-sc_threshold 0`), driven through real Electron under Xvfb with
+`--use-angle=swiftshader` for a real WebGL context. With a 1-second GOP,
+every seek tried — small, large, forward, backward — landed under 70ms. With
+a 30-second GOP, *every* seek cost 200–960ms, including a 1-second forward
+jump landing in the same GOP as the playhead's current position. Duration
+did not predict this at all: the two fixtures were the same length. Keyframe
+spacing is the entire story — a beautifully-encoded 3-hour interview has none
+of this problem, and a badly-transcoded 90-second clip can have all of it.
+
+What this feature does about it is exactly one thing: says so, at import.
+`main.js`'s `media:probe` handler (`probeKeyframeInterval`) runs a second,
+bounded ffprobe pass — keyframes only (`-skip_frame nokey`), and only the
+first `KEYFRAME_PROBE_WINDOW_SEC` (60) seconds of the stream
+(`-read_intervals`), so this stays a cheap early read rather than the
+whole-file packet scan that made `media:waveform` slow before it was fixed to
+stream (see "Tests", above, on that fix) — and returns the source's average
+keyframe interval as `keyframeIntervalSec`, or `null` if the sampled window
+did not contain two keyframes to measure a gap from. `app.js`'s `addPaths`
+is what decides whether that number is worth mentioning:
+`SPARSE_KEYFRAME_THRESHOLD_SEC` (8 seconds, next to `addPaths` itself) is
+picked the same way `DRIFT_THRESHOLD` and `WAVEFORM_SAMPLE_RATE` were —
+most delivery-format encodes keyframe every 1–4 seconds, so 8 gives real
+margin above ordinary footage without flagging it, while still catching the
+30-second-and-up encodes the profiling above actually measured as slow. A
+toast names the file and warns that scrubbing it may be slow; the import
+proceeds exactly as it would otherwise. Nothing is blocked, transcoded, or
+silently absorbed — the same posture the ffmpeg-missing and missing-media
+toasts already take elsewhere in this app for a real problem this codebase
+has decided not to hide.
+
+What this does *not* do is fix the problem. A proxy/transcode pipeline —
+generating a densely-keyframed stand-in for the preview to scrub, the export
+still cutting the original — was considered and rejected, for now: it is
+real, ongoing infrastructure (storage, invalidation, a second encode per
+import) for a problem that, so far, only some sources have, and that a toast
+already makes visible rather than mysterious. If sparse-keyframe sources turn
+out to be common enough that "scrub, wince, remember why" stops being
+acceptable, that pipeline is the next step — `keyframeIntervalSec` already
+being a real, per-source number on every bin item is what would let it decide
+which sources actually need transcoding rather than paying for all of them.
+
 ### Captions in the preview
 
 Captions were left out of the composited preview when it first landed — see

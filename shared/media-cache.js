@@ -1,12 +1,14 @@
 /*
  * media-cache.js
  * ---------------------------------------------------------------------------
- * Everything the waveform and thumbnail features need that is pure enough to
- * test without a real ffmpeg: the disk cache's freshness check, the PCM ->
- * peaks downsample (both the whole-buffer version and the incremental
- * accumulator main.js streams ffmpeg's stdout through), the peaks array's
- * binary on-disk encoding, the filmstrip's timestamp policy, and the ffmpeg
- * argument arrays main.js spawns. Kept separate from shared/ffmpeg-builder.js
+ * Everything the waveform, thumbnail and keyframe-spacing features need that
+ * is pure enough to test without a real ffmpeg: the disk cache's freshness
+ * check, the PCM -> peaks downsample (both the whole-buffer version and the
+ * incremental accumulator main.js streams ffmpeg's stdout through), the
+ * peaks array's binary on-disk encoding, the filmstrip's timestamp policy,
+ * the ffmpeg/ffprobe argument arrays main.js spawns, and the average-gap math
+ * media:probe uses to turn a sampled window of keyframe timestamps into one
+ * number. Kept separate from shared/ffmpeg-builder.js
  * because that file's job is a whole Project's worth of clips folded into
  * one export graph — this one is a single source file's worth of
  * extraction, generated once per file rather than once per export. Pure
@@ -237,6 +239,68 @@ function thumbnailExtractArgs(filePath, outPattern, { count, durationSec, width 
   return ['-y', '-i', filePath, '-vf', `fps=${fps},scale=${width}:-2`, '-frames:v', String(count), outPattern];
 }
 
+/**
+ * ffprobe args to list keyframe presentation timestamps for a source's video
+ * stream, decoding only keyframes (`-skip_frame nokey`) rather than every
+ * frame — cheap regardless of the source's own length, unlike the full-decode
+ * mistake this codebase's waveform extraction used to make before it was
+ * fixed to stream (see shared/waveform-extract.js). `-read_intervals`
+ * bounds the packet scan itself to roughly the file's first `windowSec`
+ * seconds, so this stays cheap on a multi-hour source too: without it,
+ * ffprobe walks the entire packet index just to answer a question this
+ * feature only needs an early sample for.
+ */
+function keyframeProbeArgs(filePath, { windowSec } = {}) {
+  const window = Number.isFinite(windowSec) && windowSec > 0 ? windowSec : 60;
+  return [
+    '-v', 'error',
+    '-skip_frame', 'nokey',
+    '-select_streams', 'v:0',
+    '-show_entries', 'frame=pts_time',
+    '-read_intervals', `%+${window}`,
+    '-of', 'csv=p=0',
+    filePath
+  ];
+}
+
+/**
+ * Parse ffprobe's `csv=p=0` output for `frame=pts_time` into a plain number
+ * array: one timestamp per line, blank lines dropped. Only the first
+ * comma-separated field is read, not the whole line -- a keyframe carrying
+ * SEI/side-data (real x264 output does this on the first frame of a GOP)
+ * makes ffprobe emit `side_data_list` as a second, empty CSV field on that
+ * line (`0.000000,`), which `Number()` on the raw line would silently read
+ * as NaN and drop -- exactly the keyframe a GOP-interval measurement can
+ * least afford to lose.
+ */
+function parseKeyframeTimestamps(stdout) {
+  return String(stdout)
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line => Number(line.split(',')[0]))
+    .filter(Number.isFinite);
+}
+
+/**
+ * Average gap between consecutive keyframes, from timestamps sampled over a
+ * bounded early window (see keyframeProbeArgs above) rather than a whole
+ * source — good enough for "is this source's GOP sparse", the only question
+ * this feature asks, without the cost of a full packet scan.
+ *
+ * Fewer than 2 keyframes in that window is not "a sparse interval of zero" —
+ * it is not enough data to measure an interval at all (a clip shorter than
+ * the window, or a first GOP that already outruns it), so this returns null
+ * rather than a number that would either understate a real problem or flag a
+ * short, perfectly ordinary clip as sparse from nothing but bad luck on
+ * sample size.
+ */
+function averageKeyframeIntervalSec(timestamps) {
+  const ts = (timestamps || []).filter(Number.isFinite).slice().sort((a, b) => a - b);
+  if (ts.length < 2) return null;
+  return (ts[ts.length - 1] - ts[0]) / (ts.length - 1);
+}
+
 module.exports = {
   sourceCacheKey,
   isCacheFresh,
@@ -246,5 +310,8 @@ module.exports = {
   bufferToPeaks,
   waveformExtractArgs,
   thumbnailTimestamps,
-  thumbnailExtractArgs
+  thumbnailExtractArgs,
+  keyframeProbeArgs,
+  parseKeyframeTimestamps,
+  averageKeyframeIntervalSec
 };
