@@ -15,6 +15,9 @@ const {
   sourceCacheKey,
   isCacheFresh,
   pcmToPeaks,
+  createPeaksAccumulator,
+  peaksToBuffer,
+  bufferToPeaks,
   waveformExtractArgs,
   thumbnailTimestamps,
   thumbnailExtractArgs
@@ -102,12 +105,121 @@ test('pcmToPeaks returns an empty array for an empty buffer', () => {
 });
 
 // --------------------------------------------------------------------------
+// createPeaksAccumulator
+// --------------------------------------------------------------------------
+
+/** Feeds `buf` through a fresh accumulator, split at the given byte offsets. */
+function accumulate(buf, opts, splitPoints) {
+  const acc = createPeaksAccumulator(opts);
+  let start = 0;
+  for (const end of [...splitPoints, buf.length]) {
+    acc.push(buf.subarray(start, end));
+    start = end;
+  }
+  return acc.finish();
+}
+
+/** A deterministic pile of pseudo-random s16le samples, LCG-seeded so failures reproduce. */
+function pseudoRandomPcm(sampleCount, seed = 1) {
+  const buf = Buffer.alloc(sampleCount * 2);
+  let state = seed;
+  for (let i = 0; i < sampleCount; i++) {
+    state = (state * 1103515245 + 12345) & 0x7fffffff;
+    const sample = (state % 65536) - 32768;
+    buf.writeInt16LE(sample, i * 2);
+  }
+  return buf;
+}
+
+test('createPeaksAccumulator fed as one whole chunk matches pcmToPeaks exactly', () => {
+  const buf = pcm([0, 100, -100, 32767, -32768, 0, 0, 0]);
+  const opts = { sampleRate: 8, peaksPerSecond: 1 };
+  assert.deepEqual(accumulate(buf, opts, []), pcmToPeaks(buf, opts));
+});
+
+test('createPeaksAccumulator carries a running min/max across a chunk boundary inside one bucket', () => {
+  // One bucket of 4 samples, split so no single chunk sees the whole bucket.
+  const buf = pcm([10, -20000, 5, 32000]);
+  const opts = { sampleRate: 4, peaksPerSecond: 1 };
+  const peaks = accumulate(buf, opts, [2, 5]); // split after sample 1, and mid-sample at byte 5
+  assert.deepEqual(peaks, pcmToPeaks(buf, opts));
+});
+
+test('createPeaksAccumulator handles a 16-bit sample split across two chunks (odd byte boundary)', () => {
+  const buf = pcm([1000, -2000, 3000, -4000, 5000]);
+  const opts = { sampleRate: 5, peaksPerSecond: 1 };
+  // Split at every odd byte offset across the buffer, including ones that
+  // land exactly between the two bytes of a sample.
+  for (let cut = 1; cut < buf.length; cut++) {
+    const peaks = accumulate(buf, opts, [cut]);
+    assert.deepEqual(peaks, pcmToPeaks(buf, opts), `mismatch splitting at byte ${cut}`);
+  }
+});
+
+test('createPeaksAccumulator matches pcmToPeaks across many buckets and many chunk splits', () => {
+  const buf = pseudoRandomPcm(5000, 42);
+  const opts = { sampleRate: 500, peaksPerSecond: 5 }; // samplesPerBucket = 100 -> 50 buckets
+  const expected = pcmToPeaks(buf, opts);
+
+  // Split into single-byte chunks: the most adversarial case for both the
+  // odd-byte carry and the running min/max carrying across many buckets.
+  const singleByteSplits = Array.from({ length: buf.length - 1 }, (_, i) => i + 1);
+  assert.deepEqual(accumulate(buf, opts, singleByteSplits), expected);
+
+  // A handful of arbitrary, unevenly-sized chunk splits.
+  assert.deepEqual(accumulate(buf, opts, [1, 7, 8, 250, 251, 4001, 9999]), expected);
+
+  // Fed as one chunk, matching whole-buffer pcmToPeaks trivially.
+  assert.deepEqual(accumulate(buf, opts, []), expected);
+});
+
+test('createPeaksAccumulator returns an empty array when nothing is ever pushed', () => {
+  const acc = createPeaksAccumulator({ sampleRate: 8000, peaksPerSecond: 100 });
+  assert.deepEqual(acc.finish(), []);
+});
+
+test('createPeaksAccumulator flushes a trailing partial bucket, matching pcmToPeaks', () => {
+  const buf = pcm([10, 20, 30, 40, 50]); // 5 samples at 2/sec -> buckets of [2, 2, 1]
+  const opts = { sampleRate: 2, peaksPerSecond: 1 };
+  assert.deepEqual(accumulate(buf, opts, [3]), pcmToPeaks(buf, opts));
+});
+
+// --------------------------------------------------------------------------
+// peaksToBuffer / bufferToPeaks
+// --------------------------------------------------------------------------
+
+test('peaksToBuffer/bufferToPeaks round-trip a peaks array exactly', () => {
+  const peaks = [-1, 1, 0, 0, -0.5, 0.899999976158142];
+  const roundTripped = Array.from(bufferToPeaks(peaksToBuffer(peaks)));
+  assert.deepEqual(roundTripped, Array.from(Float32Array.from(peaks)));
+});
+
+test('peaksToBuffer/bufferToPeaks round-trips an empty peaks array to an empty typed array', () => {
+  const result = bufferToPeaks(peaksToBuffer([]));
+  assert.equal(result.length, 0);
+});
+
+test('bufferToPeaks copes with a buffer that is not 4-byte aligned in its backing ArrayBuffer', () => {
+  const peaks = [0.25, -0.75, 1, -1];
+  const encoded = peaksToBuffer(peaks);
+  // Prefix one unrelated byte so encoded's data starts at a misaligned offset.
+  const misaligned = Buffer.concat([Buffer.from([0xff]), encoded]).subarray(1);
+  assert.notEqual(misaligned.byteOffset % 4, 0, 'test setup should actually produce a misaligned view');
+  assert.deepEqual(Array.from(bufferToPeaks(misaligned)), Array.from(Float32Array.from(peaks)));
+});
+
+// --------------------------------------------------------------------------
 // waveformExtractArgs
 // --------------------------------------------------------------------------
 
 test('waveformExtractArgs asks for mono, the given sample rate, and raw s16le', () => {
   const args = waveformExtractArgs('/in.mp4', '/out.pcm', { sampleRate: 8000 });
   assert.deepEqual(args, ['-y', '-i', '/in.mp4', '-vn', '-ac', '1', '-ar', '8000', '-f', 's16le', '/out.pcm']);
+});
+
+test('waveformExtractArgs asks ffmpeg to write to stdout when outPath is "-"', () => {
+  const args = waveformExtractArgs('/in.mp4', '-', { sampleRate: 8000 });
+  assert.deepEqual(args, ['-y', '-i', '/in.mp4', '-vn', '-ac', '1', '-ar', '8000', '-f', 's16le', '-']);
 });
 
 // --------------------------------------------------------------------------

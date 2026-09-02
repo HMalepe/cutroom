@@ -25,6 +25,7 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 const { electronSkipReason, waitFor, launchApp, closeApp } = require('./harness');
+const { sourceCacheKey } = require('../../shared/media-cache');
 
 function probe(bin) {
   try {
@@ -146,4 +147,78 @@ test('the disk cache survives a fresh process: a second launch does not regenera
 
   assert.equal(fs.statSync(waveFile).mtimeMs, waveMtimeBefore, 'waveform cache file was rewritten on the second launch');
   assert.equal(fs.statSync(thumbFile).mtimeMs, thumbMtimeBefore, 'thumbnail cache file was rewritten on the second launch');
+});
+
+test('the waveform cache is written as a binary peaks file plus small JSON metadata, not one big JSON file', opts, async () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cutroom-electron-media-cache-format-'));
+  const src = fixture();
+
+  const { app, page } = await launchApp([], { userDataDir });
+  try {
+    await addAndPlaceFixture(app, page, src);
+    await waitFor(
+      () => page.evaluate(() => Boolean(document.querySelector('.clip-thumb-frame'))),
+      { timeout: 15000, message: 'both caches to finish generating' }
+    );
+  } finally {
+    await closeApp(app);
+  }
+
+  const waveDir = path.join(userDataDir, 'waveform-cache');
+  const hash = sourceCacheKey(src);
+  const metaFile = path.join(waveDir, `${hash}.meta.json`);
+  const peaksFile = path.join(waveDir, `${hash}.peaks.bin`);
+  assert.ok(fs.existsSync(metaFile), 'expected a <hash>.meta.json sidecar');
+  assert.ok(fs.existsSync(peaksFile), 'expected a <hash>.peaks.bin binary peaks file');
+  assert.ok(!fs.existsSync(path.join(waveDir, `${hash}.json`)),
+    'should not write the old single-JSON-file format any more');
+
+  const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+  assert.ok(Number.isFinite(meta.size) && Number.isFinite(meta.mtimeMs) && Number.isFinite(meta.peaksPerSecond));
+  assert.equal(meta.peaks, undefined, 'the peaks array should live in the .bin file, not the JSON metadata');
+
+  const peaksBytes = fs.statSync(peaksFile).size;
+  assert.equal(peaksBytes % 4, 0, 'peaks file should be a whole number of Float32 entries');
+  assert.ok(peaksBytes > 0);
+});
+
+test('a garbage or old-format waveform cache file is ignored and cleanly regenerated, not misread', opts, async () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cutroom-electron-media-cache-corrupt-'));
+  const src = fixture();
+  const hash = sourceCacheKey(src);
+  const waveDir = path.join(userDataDir, 'waveform-cache');
+  fs.mkdirSync(waveDir, { recursive: true });
+
+  // Plant both an old-format single-JSON cache entry (what this feature used
+  // to write) and garbage sitting at the new format's own filenames, so a
+  // regression that started trusting either without validating it would
+  // either crash decoding non-Float32 bytes or hand back stale/wrong peaks
+  // instead of the real, freshly-decoded waveform this test checks for.
+  fs.writeFileSync(path.join(waveDir, `${hash}.json`), JSON.stringify({
+    size: 1, mtimeMs: 1, peaksPerSecond: 100, peaks: [0, 0]
+  }));
+  fs.writeFileSync(path.join(waveDir, `${hash}.meta.json`), JSON.stringify({
+    size: fs.statSync(src).size, mtimeMs: fs.statSync(src).mtimeMs, peaksPerSecond: 100
+  }));
+  fs.writeFileSync(path.join(waveDir, `${hash}.peaks.bin`), Buffer.from([1, 2, 3])); // not a multiple of 4
+
+  const { app, page } = await launchApp([], { userDataDir });
+  try {
+    await addAndPlaceFixture(app, page, src);
+    const wavePainted = await waitFor(async () => page.evaluate(() => {
+      const canvas = document.querySelector('.clip-waveform');
+      if (!canvas || !canvas.width || !canvas.height) return false;
+      const data = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+      for (let i = 3; i < data.length; i += 4) if (data[i] > 0) return true;
+      return false;
+    }), { timeout: 15000, message: 'a real waveform to be drawn despite the corrupt cache on disk' });
+    assert.equal(wavePainted, true, 'expected the app to regenerate a real waveform rather than crash or use garbage data');
+  } finally {
+    await closeApp(app);
+  }
+
+  // The corrupt/undersized peaks.bin should have been overwritten by a real one.
+  const peaksBytes = fs.statSync(path.join(waveDir, `${hash}.peaks.bin`)).size;
+  assert.equal(peaksBytes % 4, 0);
+  assert.ok(peaksBytes > 3, 'expected the 3-byte garbage file to be replaced with real peaks data');
 });

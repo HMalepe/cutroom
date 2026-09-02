@@ -1,13 +1,15 @@
 'use strict';
 
 /*
- * Runs shared/media-cache.js's ffmpeg argument builders through a real
- * ffmpeg, the same relationship test/ffmpeg-render.test.js has to
+ * Runs shared/media-cache.js's ffmpeg argument builders, and
+ * shared/waveform-extract.js's streaming extraction, through a real ffmpeg —
+ * the same relationship test/ffmpeg-render.test.js has to
  * ffmpeg-builder.test.js: the pure-module tests prove the argument arrays
- * are the ones intended, this file proves ffmpeg actually accepts them and
- * hands back something usable — a real PCM stream that pcmToPeaks turns
- * into a sensible envelope, and real PNG frames at the requested width and
- * count.
+ * and bucketing math are the ones intended, this file proves ffmpeg actually
+ * accepts them and hands back something usable — a real PCM stream that
+ * pcmToPeaks turns into a sensible envelope, a streamed extraction that
+ * matches it bit-for-bit without ever buffering the whole decode, and real
+ * PNG frames at the requested width and count.
  *
  * CI has no ffmpeg, so the whole file skips cleanly when it is not on PATH.
  */
@@ -25,6 +27,7 @@ const {
   thumbnailTimestamps,
   thumbnailExtractArgs
 } = require('../shared/media-cache');
+const { extractWaveformPeaks } = require('../shared/waveform-extract');
 
 function probe(bin) {
   try {
@@ -106,6 +109,53 @@ test('waveformExtractArgs fails the way main.js expects when the source has no a
   // main.js's spawn().on('close', ...) rejection actually keys off of.
   assert.notEqual(r.status, 0);
   assert.ok(!fs.existsSync(out) || fs.readFileSync(out).length === 0);
+});
+
+test('extractWaveformPeaks (streaming stdout) matches pcmToPeaks (whole-buffer-to-file) for the same real decode', opts, async () => {
+  const src = source();
+  const sampleRate = 8000;
+  const peaksPerSecond = 100;
+
+  // The old path this replaces: decode to a file, read the whole file, bucket it.
+  const out = path.join(DIR, 'wave-whole-buffer.pcm');
+  const fileArgs = waveformExtractArgs(src, out, { sampleRate });
+  const r = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', ...fileArgs], { encoding: 'utf8' });
+  assert.equal(r.status, 0, `ffmpeg rejected the whole-buffer args:\n${r.stderr}`);
+  const wholeBufferPeaks = pcmToPeaks(fs.readFileSync(out), { sampleRate, peaksPerSecond });
+
+  // The new path: ffmpeg's stdout streamed straight into the accumulator.
+  const streamedPeaks = await extractWaveformPeaks('ffmpeg', src, { sampleRate, peaksPerSecond });
+
+  assert.ok(wholeBufferPeaks.length > 0);
+  assert.deepEqual(streamedPeaks, wholeBufferPeaks,
+    'streaming extraction should produce bit-identical peaks to the old whole-buffer path');
+});
+
+test('extractWaveformPeaks never buffers anywhere near the whole decode at once', opts, async () => {
+  const src = source();
+  const sampleRate = 8000;
+
+  let maxChunk = 0;
+  let chunkCount = 0;
+  let totalBytes = 0;
+  await extractWaveformPeaks('ffmpeg', src, {
+    sampleRate,
+    peaksPerSecond: 100,
+    onChunk: (n) => { maxChunk = Math.max(maxChunk, n); chunkCount++; totalBytes += n; }
+  });
+
+  // 6s of mono s16le at 8000Hz is ~96000 bytes total. If a regression ever
+  // buffered the whole decode into one Buffer before handing it off (the
+  // exact bug this fix removes), onChunk would fire once with ~totalBytes
+  // and chunkCount would be 1 — this is the test that would catch that.
+  assert.ok(totalBytes > 50000, `expected a real amount of PCM, got ${totalBytes} bytes total`);
+  assert.ok(chunkCount > 1, `expected delivery across multiple stdout chunks, got ${chunkCount}`);
+  assert.ok(maxChunk < totalBytes / 2,
+    `expected no single chunk to hold a large fraction of the decode; largest was ${maxChunk} of ${totalBytes} total bytes`);
+  // A generous bound well above a typical pipe buffer (usually 64KB on Linux)
+  // but far below what a several-minute-or-longer source would produce if
+  // this ever regressed back to whole-file buffering.
+  assert.ok(maxChunk < 262144, `single stdout chunk was ${maxChunk} bytes, larger than expected for streamed delivery`);
 });
 
 // --------------------------------------------------------------------------
