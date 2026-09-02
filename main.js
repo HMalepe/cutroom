@@ -511,6 +511,13 @@ ipcMain.handle('media:pick', async (_e, kind) => {
   return res.filePaths;
 });
 
+// A source's own GOP is very rarely wider than this even when sparse — a
+// 30s-keyframe file, the pathological case the composited preview actually
+// struggles with, still puts 2 keyframes inside a 60s window. Wide enough to
+// get a real sample on ordinary footage, narrow enough that this stays a
+// quick early read rather than a scan of a whole multi-hour file.
+const KEYFRAME_PROBE_WINDOW_SEC = 60;
+
 /**
  * ffprobe tells us duration, dimensions, and crucially whether an audio
  * stream exists. Guessing that from the extension is how you end up with a
@@ -522,6 +529,17 @@ ipcMain.handle('media:pick', async (_e, kind) => {
  * for matrix coefficients (the thing that actually matters here); primaries
  * and transfer describe gamut and gamma, which chroma-math.js does not model,
  * so they are not requested.
+ *
+ * A second, separate ffprobe call measures the video stream's average
+ * keyframe interval — see probeKeyframeInterval below for why this has to be
+ * its own call rather than another `-show_entries` on the one above, and why
+ * it does not fail the whole probe if it goes wrong. This is app.js's cue
+ * (see addPaths) that scrubbing this source in the composited preview may be
+ * slow: the preview seeks the real `<video>` element directly (no proxy, no
+ * partial decode — see "How the composited preview works" in the README),
+ * and Chromium's decoder re-renders from a GOP's own start on every seek
+ * regardless of how small the jump is. A sparse GOP means every seek pays
+ * for a full re-render from the last keyframe, however close the target.
  */
 ipcMain.handle('media:probe', async (_e, filePath) => {
   if (!FFPROBE) throw new Error('ffprobe not found. Install ffmpeg first.');
@@ -562,9 +580,42 @@ ipcMain.handle('media:probe', async (_e, filePath) => {
       colorSpace: v?.color_space,
       colorPrimaries: v?.color_primaries,
       colorRange: v?.color_range
-    })
+    }),
+    keyframeIntervalSec: v ? await probeKeyframeInterval(filePath) : null
   };
 });
+
+/**
+ * Average keyframe interval over KEYFRAME_PROBE_WINDOW_SEC of a source's
+ * video stream, or null if that window did not contain enough keyframes to
+ * measure a gap from (see averageKeyframeIntervalSec's own comment) — a
+ * still image counted by media:probe as having no video stream never reaches
+ * this at all.
+ *
+ * A separate ffprobe call rather than folded into the one above: the first
+ * call reads container/stream metadata only, essentially free; this one asks
+ * ffprobe to actually walk decoded frames (`-skip_frame nokey`), which is a
+ * different, heavier code path even bounded by `-read_intervals` to an early
+ * window. Keeping them separate means a source ffprobe can describe but
+ * cannot usefully frame-scan (an odd or truncated file, say) loses only the
+ * keyframe measurement, not the whole probe the bin import depends on.
+ */
+async function probeKeyframeInterval(filePath) {
+  const args = mediaCache.keyframeProbeArgs(filePath, { windowSec: KEYFRAME_PROBE_WINDOW_SEC });
+  try {
+    const stdout = await new Promise((resolve, reject) => {
+      execFile(FFPROBE, args, { maxBuffer: 1024 * 1024 }, (err, out) => {
+        if (err) return reject(err);
+        resolve(out);
+      });
+    });
+    return mediaCache.averageKeyframeIntervalSec(mediaCache.parseKeyframeTimestamps(stdout));
+  } catch {
+    // A source ffprobe cannot frame-scan is not a reason to fail the whole
+    // import — see the header comment above.
+    return null;
+  }
+}
 
 /**
  * Grab a single frame as a PNG data URL.

@@ -619,6 +619,16 @@ async function checkEnv() {
 // Media bin
 // ==========================================================================
 
+// The composited preview seeks the real source <video> directly (see "How
+// the composited preview works" in the README) — no proxy, no partial
+// decode. Chromium's decoder re-renders from a GOP's own start on every
+// seek regardless of jump size, so a source with a wide keyframe interval
+// pays for a full GOP re-render on every scrub, even a 1-second nudge. Most
+// delivery-format encodes keyframe every 1-4 seconds; 8s gives real margin
+// above ordinary footage without flagging it, while still catching the
+// 30s-and-up encodes actually measured to cost hundreds of ms per seek.
+const SPARSE_KEYFRAME_THRESHOLD_SEC = 8;
+
 async function addPaths(paths) {
   if (!paths || !paths.length) return;
   let added = 0;
@@ -631,6 +641,10 @@ async function addPaths(paths) {
       if (!media.duration || media.duration < 0.02) media.duration = 4;
       state.bin.push(media);
       added++;
+      if (media.keyframeIntervalSec > SPARSE_KEYFRAME_THRESHOLD_SEC) {
+        toast(`${media.name} has a wide keyframe interval (~${media.keyframeIntervalSec.toFixed(1)}s).`, 'warn',
+          'Scrubbing this source in the preview may be slow, since every seek re-renders from its last keyframe.');
+      }
     } catch (err) {
       toast(`Could not read ${p.split(/[\\/]/).pop()}`, 'err', String(err.message || err));
     }

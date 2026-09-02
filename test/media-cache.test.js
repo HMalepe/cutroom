@@ -20,7 +20,10 @@ const {
   bufferToPeaks,
   waveformExtractArgs,
   thumbnailTimestamps,
-  thumbnailExtractArgs
+  thumbnailExtractArgs,
+  keyframeProbeArgs,
+  parseKeyframeTimestamps,
+  averageKeyframeIntervalSec
 } = require('../shared/media-cache');
 
 // --------------------------------------------------------------------------
@@ -270,4 +273,74 @@ test('thumbnailExtractArgs uses fps = count/duration and caps output with -frame
 test('thumbnailExtractArgs does not divide by zero for a degenerate duration with count > 1', () => {
   const args = thumbnailExtractArgs('/in.mp4', '/out-%03d.png', { count: 3, durationSec: 0, width: 120 });
   assert.ok(Number.isFinite(Number(args[4].match(/fps=([\d.]+)/)[1])));
+});
+
+// --------------------------------------------------------------------------
+// keyframeProbeArgs / parseKeyframeTimestamps / averageKeyframeIntervalSec
+// --------------------------------------------------------------------------
+
+test('keyframeProbeArgs decodes only keyframes and bounds the read to the given window', () => {
+  const args = keyframeProbeArgs('/in.mp4', { windowSec: 60 });
+  assert.deepEqual(args, [
+    '-v', 'error',
+    '-skip_frame', 'nokey',
+    '-select_streams', 'v:0',
+    '-show_entries', 'frame=pts_time',
+    '-read_intervals', '%+60',
+    '-of', 'csv=p=0',
+    '/in.mp4'
+  ]);
+});
+
+test('keyframeProbeArgs defaults the window when none is given, rather than an unbounded scan', () => {
+  const args = keyframeProbeArgs('/in.mp4');
+  assert.equal(args[args.indexOf('-read_intervals') + 1], '%+60');
+});
+
+test('keyframeProbeArgs falls back to the default window for a nonsense value instead of asking ffprobe to read a negative/zero span', () => {
+  for (const bad of [0, -5, NaN, undefined]) {
+    const args = keyframeProbeArgs('/in.mp4', { windowSec: bad });
+    assert.equal(args[args.indexOf('-read_intervals') + 1], '%+60');
+  }
+});
+
+test('parseKeyframeTimestamps reads one float per line and drops blanks', () => {
+  assert.deepEqual(parseKeyframeTimestamps('0.000000\n1.001000\n2.002000\n'), [0, 1.001, 2.002]);
+  assert.deepEqual(parseKeyframeTimestamps('0.5\n\n1.5\n'), [0.5, 1.5]);
+});
+
+test('parseKeyframeTimestamps drops lines that are not a real number rather than emitting NaN', () => {
+  assert.deepEqual(parseKeyframeTimestamps('1.0\nN/A\n2.0\n'), [1, 2]);
+});
+
+test('parseKeyframeTimestamps reads only the first field when a line carries a trailing side_data_list comma', () => {
+  // A real x264 keyframe (typically the first one) reports side_data_list,
+  // which ffprobe's csv=p=0 renders as a second, empty field on that line.
+  // Number('0.000000,') is NaN -- if this were read whole rather than
+  // field-by-field, exactly that keyframe would be silently dropped.
+  assert.deepEqual(parseKeyframeTimestamps('0.000000,\n10.000000\n'), [0, 10]);
+});
+
+test('averageKeyframeIntervalSec averages the gaps between a dense run of keyframes', () => {
+  // 1s apart throughout: mean gap is exactly 1.
+  assert.equal(averageKeyframeIntervalSec([0, 1, 2, 3, 4, 5]), 1);
+});
+
+test('averageKeyframeIntervalSec divides total span by (count - 1), not by count', () => {
+  // 0, 30 — one gap of 30s, not "30 / 2 keyframes".
+  assert.equal(averageKeyframeIntervalSec([0, 30]), 30);
+});
+
+test('averageKeyframeIntervalSec sorts out-of-order timestamps before measuring gaps', () => {
+  assert.equal(averageKeyframeIntervalSec([5, 0, 10]), 5);
+});
+
+test('averageKeyframeIntervalSec returns null for fewer than 2 keyframes — insufficient data, not a measured zero', () => {
+  assert.equal(averageKeyframeIntervalSec([]), null);
+  assert.equal(averageKeyframeIntervalSec([0]), null);
+});
+
+test('averageKeyframeIntervalSec ignores non-finite entries when deciding whether there is enough data', () => {
+  assert.equal(averageKeyframeIntervalSec([0, NaN, Infinity]), null);
+  assert.equal(averageKeyframeIntervalSec([0, NaN, 4]), 4);
 });
