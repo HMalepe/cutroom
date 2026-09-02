@@ -416,18 +416,31 @@ test('typewriter with real per-word timing renders one span per word, coloured b
   }
 });
 
-test('typewriter on a caption with no per-word timing shows plain text — a documented gap, not a crash', opts, async () => {
+test('typewriter on a caption with no per-word timing sweeps by character instead of showing static text', opts, async () => {
   const { win, doc } = boot();
   win.createKeyPreview = stubKeyer;
   try {
     await selectAClip(win, doc);
-    addAndEditCaption(win, doc, { atPlayhead: 0, start: 0, end: 3, text: 'no word timing here' });
+    // 'Hi' over 1s (start 0, end 1) -> buildAssFile's own even-split fallback
+    // computes 50cs = 0.5s per character (see the pin test in
+    // test/caption-preview.test.js), so at t=0 only 'H' has landed and at
+    // t=0.5 both characters have.
+    addAndEditCaption(win, doc, { atPlayhead: 0, start: 0, end: 1, text: 'Hi' });
     enableCaptions(win, doc);
     setCapField(win, doc, 'Animation', 'typewriter');
     setPlayhead(doc, 0);
 
-    assert.equal(doc.querySelectorAll('#captionOverlayText span').length, 0);
-    assert.equal(doc.getElementById('captionOverlayText').textContent, 'no word timing here');
+    let spans = [...doc.querySelectorAll('#captionOverlayText span')];
+    assert.equal(spans.length, 2);
+    assert.deepEqual(spans.map(s => s.textContent), ['H', 'i']);
+    const primary = rgbFromHex('#FFFFFF');
+    assert.equal(spans[0].style.color, primary, 'spoken from the caption\'s own start onward');
+    assert.notEqual(spans[1].style.color, primary, 'not yet spoken');
+
+    setPlayhead(doc, 0.5);
+    spans = [...doc.querySelectorAll('#captionOverlayText span')];
+    assert.equal(spans[0].style.color, primary);
+    assert.equal(spans[1].style.color, primary, 'spoken once its own per-character duration has elapsed');
   } finally {
     stopLoop(doc);
   }
