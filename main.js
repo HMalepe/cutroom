@@ -16,6 +16,7 @@ const builder = require('./shared/ffmpeg-builder');
 const { validateProject, PROJECT_VERSION } = require('./shared/project-schema');
 const saveState = require('./shared/save-state');
 const mediaCache = require('./shared/media-cache');
+const { extractWaveformPeaks } = require('./shared/waveform-extract');
 const { commandForInput } = require('./shared/clipboard-shortcuts');
 const { matrixNameFromTags } = require('./src/chroma-math');
 const mediaRelink = require('./src/media-relink');
@@ -632,6 +633,76 @@ function writeCache(dir, filePath, record) {
   }
 }
 
+/*
+ * The waveform cache does not use readCache/writeCache above — those store
+ * a record as one JSON file, and a waveform record's `peaks` field is a
+ * multi-million-entry numeric array for a long source, over which
+ * JSON.stringify/parse is itself a significant synchronous cost (see
+ * shared/media-cache.js's peaksToBuffer/bufferToPeaks comment). Instead a
+ * waveform entry is two files: `<hash>.meta.json`, the same tiny
+ * `{size, mtimeMs, peaksPerSecond}` shape readCache would have stored, cheap
+ * to parse because it no longer carries the peaks array; and
+ * `<hash>.peaks.bin`, that array as raw Float32 bytes, read back as a
+ * typed-array view with no parsing loop at all.
+ *
+ * Naming these differently from readCache/writeCache's `<hash>.json` is what
+ * keeps an old-format cache entry left over from before this change from
+ * ever being misread as the new format: readWaveformCache below only ever
+ * looks for `<hash>.meta.json` + `<hash>.peaks.bin`, so a stray old `<hash>.json`
+ * is silently ignored rather than fed to Float32Array as if it were binary.
+ * (It is also never cleaned up here — harmless dead weight, not worth the
+ * risk of deleting a file this code did not just prove is safe to delete.)
+ */
+function waveformCachePaths(dir, filePath) {
+  const base = path.join(dir, mediaCache.sourceCacheKey(filePath));
+  return { meta: `${base}.meta.json`, peaks: `${base}.peaks.bin` };
+}
+
+function readWaveformCache(dir, filePath, stat) {
+  const { meta, peaks } = waveformCachePaths(dir, filePath);
+  let record;
+  try {
+    record = JSON.parse(fs.readFileSync(meta, 'utf8'));
+  } catch {
+    return null; // No entry, or one we cannot read. Either way, regenerate.
+  }
+  if (!mediaCache.isCacheFresh(record, stat)) return null;
+
+  let peaksBuffer;
+  try {
+    peaksBuffer = fs.readFileSync(peaks);
+  } catch {
+    return null; // Metadata survived without its peaks file; treat as absent.
+  }
+  // A length that is not a multiple of 4 cannot be valid Float32 data —
+  // truncated write, disk corruption, or (defensively) some future format
+  // change — so it is a cache miss, not a crash waiting in bufferToPeaks.
+  if (peaksBuffer.length % Float32Array.BYTES_PER_ELEMENT !== 0) return null;
+
+  return { ...record, peaks: mediaCache.bufferToPeaks(peaksBuffer) };
+}
+
+/** Peaks file written before the metadata file, so a reader that finds fresh metadata never finds a missing/partial peaks file — same atomic-write idiom writeCache above uses, just across two files instead of one. */
+function writeWaveformCache(dir, filePath, record) {
+  const { meta, peaks } = waveformCachePaths(dir, filePath);
+  const { peaks: peaksArray, ...metaRecord } = record;
+  const peaksTmp = `${peaks}.tmp`;
+  const metaTmp = `${meta}.tmp`;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(peaksTmp, mediaCache.peaksToBuffer(peaksArray));
+    fs.renameSync(peaksTmp, peaks);
+    fs.writeFileSync(metaTmp, JSON.stringify(metaRecord), 'utf8');
+    fs.renameSync(metaTmp, meta);
+  } catch {
+    // A cache entry that fails to write just means the next request
+    // regenerates it — not worth interrupting anyone over, same call
+    // writeAutosave already makes about a failed autosave.
+    try { fs.unlinkSync(peaksTmp); } catch {}
+    try { fs.unlinkSync(metaTmp); } catch {}
+  }
+}
+
 const WAVEFORM_SAMPLE_RATE = 8000;
 const WAVEFORM_PEAKS_PER_SECOND = 100;
 const THUMBNAIL_WIDTH = 120;
@@ -644,32 +715,28 @@ const THUMBNAIL_WIDTH = 120;
  * asking ffmpeg again. Cached to disk per source, and the renderer keeps its
  * own in-memory copy on top so scrolling or re-rendering the timeline never
  * reaches this handler for a source it already has.
+ *
+ * A cache miss streams ffmpeg's stdout straight into a peaks accumulator via
+ * shared/waveform-extract.js rather than decoding the whole source to a temp
+ * file and reading that file into one Buffer — for a multi-hour source the
+ * old shape held tens to hundreds of MB in memory at once and blocked this
+ * process (window management, every other IPC channel) for however long
+ * that took. Streaming keeps memory bounded by the accumulator's bucket
+ * count, not the source's duration.
  */
 ipcMain.handle('media:waveform', async (_e, filePath) => {
   if (!FFMPEG) throw new Error('ffmpeg not found.');
   const stat = fs.statSync(filePath);
-  const cached = readCache(waveformCacheDir(), filePath, stat);
+  const cached = readWaveformCache(waveformCacheDir(), filePath, stat);
   if (cached) return cached;
 
-  const tmp = path.join(os.tmpdir(), `cutroom-wave-${Date.now()}.pcm`);
-  try {
-    await new Promise((resolve, reject) => {
-      const args = mediaCache.waveformExtractArgs(filePath, tmp, { sampleRate: WAVEFORM_SAMPLE_RATE });
-      const p = spawn(FFMPEG, args);
-      p.on('close', c => (c === 0 ? resolve() : reject(new Error('Could not read audio for the waveform.'))));
-      p.on('error', reject);
-    });
-
-    const peaks = mediaCache.pcmToPeaks(fs.readFileSync(tmp), {
-      sampleRate: WAVEFORM_SAMPLE_RATE,
-      peaksPerSecond: WAVEFORM_PEAKS_PER_SECOND
-    });
-    const record = { size: stat.size, mtimeMs: stat.mtimeMs, peaksPerSecond: WAVEFORM_PEAKS_PER_SECOND, peaks };
-    writeCache(waveformCacheDir(), filePath, record);
-    return record;
-  } finally {
-    try { fs.unlinkSync(tmp); } catch {}
-  }
+  const peaks = await extractWaveformPeaks(FFMPEG, filePath, {
+    sampleRate: WAVEFORM_SAMPLE_RATE,
+    peaksPerSecond: WAVEFORM_PEAKS_PER_SECOND
+  });
+  const record = { size: stat.size, mtimeMs: stat.mtimeMs, peaksPerSecond: WAVEFORM_PEAKS_PER_SECOND, peaks };
+  writeWaveformCache(waveformCacheDir(), filePath, record);
+  return record;
 });
 
 /**

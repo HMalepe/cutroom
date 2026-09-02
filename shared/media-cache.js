@@ -3,12 +3,18 @@
  * ---------------------------------------------------------------------------
  * Everything the waveform and thumbnail features need that is pure enough to
  * test without a real ffmpeg: the disk cache's freshness check, the PCM ->
- * peaks downsample, the filmstrip's timestamp policy, and the ffmpeg argument
- * arrays main.js spawns. Kept separate from shared/ffmpeg-builder.js because
- * that file's job is a whole Project's worth of clips folded into one export
- * graph — this one is a single source file's worth of extraction, generated
- * once per file rather than once per export. Pure functions, no I/O, same
- * reason ffmpeg-builder.js is pure: it is the easiest thing here to test.
+ * peaks downsample (both the whole-buffer version and the incremental
+ * accumulator main.js streams ffmpeg's stdout through), the peaks array's
+ * binary on-disk encoding, the filmstrip's timestamp policy, and the ffmpeg
+ * argument arrays main.js spawns. Kept separate from shared/ffmpeg-builder.js
+ * because that file's job is a whole Project's worth of clips folded into
+ * one export graph — this one is a single source file's worth of
+ * extraction, generated once per file rather than once per export. Pure
+ * functions, no I/O, same reason ffmpeg-builder.js is pure: it is the
+ * easiest thing here to test. (Actually spawning ffmpeg and streaming its
+ * stdout lives in shared/waveform-extract.js instead, since that part
+ * cannot be pure — kept small and separate so this file's own tests stay
+ * child-process-free.)
  */
 
 'use strict';
@@ -77,11 +83,114 @@ function pcmToPeaks(buffer, { sampleRate, peaksPerSecond }) {
 }
 
 /**
- * The ffmpeg command that produces the raw PCM `pcmToPeaks` above expects:
- * mono, so a stereo mix does not need averaging on our side; a low sample
- * rate, because a peak envelope for a several-pixel-wide bar does not need
- * CD quality to look right; and `-f s16le` straight to a file rather than a
- * container, so the only thing on disk is the samples themselves.
+ * A stateful, incremental counterpart to pcmToPeaks above: same bucketing,
+ * fed PCM in pieces instead of one already-complete Buffer. This is what
+ * lets a caller pipe ffmpeg's stdout straight into bucketing as chunks
+ * arrive, rather than buffering a whole source's decoded audio -- tens to
+ * hundreds of MB for a multi-hour recording -- into one Buffer before
+ * bucketing can even start.
+ *
+ * push(chunk) can be called any number of times with chunks of any size: a
+ * bucket boundary has nothing to do with a chunk boundary, and neither does
+ * a 16-bit sample's own two bytes. A chunk that ends between them leaves
+ * exactly one byte carried forward to be prefixed onto the next push(),
+ * rather than dropped or misread as a whole sample by itself. finish()
+ * flushes whatever bucket is left in progress (a sample count that is not a
+ * multiple of samplesPerBucket always ends mid-bucket, same as the trailing
+ * partial bucket pcmToPeaks handles) and returns the same peaks array
+ * pcmToPeaks(wholeBuffer, opts) would have for the same PCM, whatever the
+ * chunking -- that equivalence, not just "produces plausible-looking
+ * numbers", is what the tests for this pin down.
+ */
+function createPeaksAccumulator({ sampleRate, peaksPerSecond }) {
+  const BYTES_PER_SAMPLE = 2; // s16le
+  const samplesPerBucket = Math.max(1, Math.round(sampleRate / peaksPerSecond));
+  const peaks = [];
+
+  let leftover = null; // the one odd byte carried over from the previous chunk, or null
+  let min = Infinity;
+  let max = -Infinity;
+  let countInBucket = 0;
+
+  function flushBucket() {
+    peaks.push(min, max);
+    min = Infinity;
+    max = -Infinity;
+    countInBucket = 0;
+  }
+
+  function push(chunk) {
+    const buf = leftover ? Buffer.concat([leftover, chunk]) : chunk;
+    leftover = null;
+    const usable = buf.length - (buf.length % BYTES_PER_SAMPLE);
+    if (usable < buf.length) leftover = buf.subarray(usable);
+
+    for (let i = 0; i < usable; i += BYTES_PER_SAMPLE) {
+      const v = buf.readInt16LE(i) / 32768;
+      if (v < min) min = v;
+      if (v > max) max = v;
+      if (++countInBucket === samplesPerBucket) flushBucket();
+    }
+  }
+
+  function finish() {
+    // A trailing odd byte across the whole stream is dropped rather than
+    // treated as a sample, same as pcmToPeaks's Math.floor(length / 2).
+    if (countInBucket > 0) flushBucket();
+    return peaks;
+  }
+
+  return { push, finish };
+}
+
+/**
+ * Binary on-disk encoding for a peaks array, used in place of JSON for this
+ * one field: a waveform's peaks array is one [min, max] pair per 1/100s
+ * across a whole source, which for a multi-hour recording is millions of
+ * numbers. JSON.stringify/parse over an array that size is itself a
+ * significant, synchronous, main-thread-blocking cost -- separate from how
+ * the PCM was decoded -- paid on every cache write AND every cache hit (the
+ * common case, since caching is the whole point). A Float32Array read back
+ * as a raw byte view costs nothing beyond the read() itself: no parsing
+ * loop, no per-number string round-trip. Float32 rather than Float64
+ * because these values are normalized to [-1, 1] for display -- a canvas
+ * bar a few dozen pixels tall cannot show more precision than float32
+ * already carries, so float64 would only double the file size for nothing.
+ * Int16 would halve it again, but only by pushing a scale-back-by-32767
+ * convention onto every future reader of this file; float32 keeps the
+ * on-disk numbers identical to the in-memory ones.
+ *
+ * bufferToPeaks assumes `buffer.length` is a multiple of 4 -- the caller
+ * (main.js's readWaveformCache) is what decides a file that fails that
+ * check is corrupt/old-format and should be treated as a cache miss rather
+ * than handed here.
+ */
+function peaksToBuffer(peaks) {
+  return Buffer.from(Float32Array.from(peaks).buffer);
+}
+
+function bufferToPeaks(buffer) {
+  // fs.readFileSync's Buffer is not guaranteed to start at a multiple-of-4
+  // offset within its backing ArrayBuffer, and Float32Array requires that
+  // alignment -- copy on the rare occasion it does not, which for a cache
+  // file this small is cheap insurance rather than the cost this format
+  // change exists to avoid.
+  const aligned = buffer.byteOffset % Float32Array.BYTES_PER_ELEMENT === 0
+    ? buffer
+    : Buffer.from(buffer);
+  return new Float32Array(aligned.buffer, aligned.byteOffset, aligned.length / Float32Array.BYTES_PER_ELEMENT);
+}
+
+/**
+ * The ffmpeg command that produces the raw PCM `pcmToPeaks`/
+ * `createPeaksAccumulator` above expect: mono, so a stereo mix does not need
+ * averaging on our side; a low sample rate, because a peak envelope for a
+ * several-pixel-wide bar does not need CD quality to look right; and
+ * `-f s16le` rather than a container, so the only thing produced is the
+ * samples themselves. `outPath` of `'-'` asks ffmpeg to write that raw PCM
+ * to stdout instead of a file -- what shared/waveform-extract.js pipes
+ * straight into createPeaksAccumulator so a multi-hour source is never
+ * fully decoded to disk-then-memory before bucketing can start.
  */
 function waveformExtractArgs(filePath, outPath, { sampleRate }) {
   return ['-y', '-i', filePath, '-vn', '-ac', '1', '-ar', String(sampleRate), '-f', 's16le', outPath];
@@ -132,6 +241,9 @@ module.exports = {
   sourceCacheKey,
   isCacheFresh,
   pcmToPeaks,
+  createPeaksAccumulator,
+  peaksToBuffer,
+  bufferToPeaks,
   waveformExtractArgs,
   thumbnailTimestamps,
   thumbnailExtractArgs
