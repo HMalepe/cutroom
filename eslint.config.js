@@ -41,7 +41,12 @@ module.exports = [
     // reason src/*.js below gets both environments' globals.
     files: ['test/electron/**/*.js'],
     languageOptions: {
-      globals: { document: 'readonly', window: 'readonly' }
+      globals: {
+        document: 'readonly',
+        window: 'readonly',
+        getComputedStyle: 'readonly',
+        HTMLCanvasElement: 'readonly'
+      }
     }
   },
   {
