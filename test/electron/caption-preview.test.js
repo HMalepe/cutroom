@@ -295,10 +295,13 @@ test('switching the style panel\'s position between top and bottom moves the rea
 });
 
 // --------------------------------------------------------------------------
-// 4. No per-word timing renders plain text, not a \k-style sweep
+// 4. No per-word timing sweeps by real character, not a \k-style word sweep
+//    nor plain static text — see charSplitKaraokeStates in
+//    src/caption-preview.js, added after this file's first version (which
+//    predates it) asserted the old plain-text behavior it replaced.
 // --------------------------------------------------------------------------
 
-test('typewriter on a caption with no per-word timing renders plain text with zero spans', opts, async () => {
+test('typewriter on a caption with no per-word timing sweeps by real character span', opts, async () => {
   const { app, page } = await launchApp(WEBGL_ARGS);
   try {
     await addAndPlaceFixture(app, page, fixture());
@@ -307,18 +310,30 @@ test('typewriter on a caption with no per-word timing renders plain text with ze
     // Hand-typed via "+ Add line" — never carries cap.words, the same as an
     // imported .srt/.vtt or a transcribed row whose text or timing was
     // edited afterward (renderCaptions drops `words` the moment a row is
-    // touched).
-    await addAndEditCaption(page, { start: 1, end: 3, text: 'No word timing here' });
+    // touched). 'Hi' over 1s (start 0, end 1) is the same case
+    // test/caption-preview.test.js's own pin test uses: buildAssFile's
+    // even-split fallback computes 50cs = 0.5s per character, so at t=0
+    // only 'H' has landed and at t=0.5 both characters have.
+    await addAndEditCaption(page, { start: 0, end: 1, text: 'Hi' });
     await enableCaptions(page);
     await setCapSelect(page, 1, 'typewriter');
-    await seekTo(page, 1.5);
+    await seekTo(page, 0);
 
     await waitFor(async () => (await overlayState(page)).display === 'flex',
       { message: 'the caption to become active' });
 
-    const { text, spans } = await overlayState(page);
-    assert.equal(spans, 0, 'a caption with no cap.words should render zero <span> children, not a karaoke sweep');
-    assert.equal(text, 'No word timing here', 'plain static text, not karaoke markup');
+    let state = await overlayState(page);
+    assert.equal(state.spans, 2, 'a caption with no cap.words should still render one <span> per character');
+    const spanColors = () => page.evaluate(() =>
+      [...document.querySelectorAll('#captionOverlayText span')].map(s => s.style.color));
+    let colors = await spanColors();
+    assert.notEqual(colors[0], colors[1], '"H" (spoken) and "i" (not yet) should differ in colour at t=0');
+
+    await seekTo(page, 0.5);
+    await waitFor(async () => {
+      const c = await spanColors();
+      return c[0] === c[1];
+    }, { message: 'both characters to share the "spoken" colour once the per-character duration has elapsed' });
   } finally {
     await closeApp(app);
   }

@@ -3,9 +3,10 @@
  * ---------------------------------------------------------------------------
  * Decides what the caption overlay should be showing at a given instant:
  * which caption row (if any) is active, the entry-animation state for
- * 'fade'/'pop'/'slide', which words are "spoken" for a real per-word
- * typewriter sweep, and the ASS-to-CSS unit conversion the overlay's sizing
- * rides on. Pure and DOM-free, the same split timeline-preview.js draws
+ * 'fade'/'pop'/'slide', which words (or, lacking real word timing,
+ * characters) are "spoken" for the typewriter sweep, and the ASS-to-CSS
+ * unit conversion the overlay's sizing rides on. Pure and DOM-free, the
+ * same split timeline-preview.js draws
  * between deciding what's active and app.js drawing it — the caption
  * overlay's own DOM wiring (src/app.js's syncCaptionOverlay/
  * applyCaptionOverlay) is what turns these answers into an actual styled
@@ -107,17 +108,63 @@
    * is the trigger instant rather than the (later) point its own \k
    * duration ends — so "spoken" here is exactly `t >= word.start`.
    *
-   * Returns null, not an empty array, for a caption with no `words`, so the
-   * caller can tell "no real per-word timing to show" apart from "zero
-   * words" — a hand-typed line, an imported .srt/.vtt, or a transcribed row
-   * whose text or timing was subsequently hand-edited all land here, and
-   * none of them have a word-by-word sweep to approximate; see the README
-   * for why that is a stated gap rather than an attempt at the old
-   * even-split-by-character fallback buildAssFile itself uses for them.
+   * Returns null, not an empty array, for a caption with no `words` — a
+   * hand-typed line, an imported .srt/.vtt, or a transcribed row whose text
+   * or timing was subsequently hand-edited all land here — so the caller
+   * can tell "no real per-word timing to show" apart from "zero words" and
+   * fall back to charSplitKaraokeStates below, which approximates the same
+   * case buildAssFile's own even-split-by-character estimate covers.
    */
   function karaokeWordStates(caption, t) {
     if (!caption || !Array.isArray(caption.words)) return null;
     return caption.words.map(w => ({ text: w.text, spoken: t >= w.start }));
+  }
+
+  /**
+   * Per-character spoken/unspoken state for the typewriter animation when a
+   * caption has no real per-word timing — the fallback karaokeWordStates
+   * hands back null for. This mirrors buildAssFile's own even-split-by-
+   * character `\k` estimate for that same case (see its comment in
+   * shared/ffmpeg-builder.js) rather than importing it: `shared/` is
+   * main-process-only and never reaches the renderer, the same reason
+   * FADE_SEC/POP_SEC/SLIDE_SEC above are a hand-kept duplicate rather than
+   * an import. The formula, copied rather than re-derived:
+   *
+   *   dur       = max(0.1, caption.end - caption.start)   // same floor
+   *   visible   = caption.text with "\n" counted as the TWO characters
+   *               "\N" becomes in the ASS file, not one — buildAssFile
+   *               measures the escaped/converted text's length, and this
+   *               copies that quirk exactly rather than the more obvious
+   *               real character count, so a caption with a line break in
+   *               it cannot make the two formulas quietly disagree
+   *   csPerChar = round(dur * 100 / max(1, visible))       // same rounding
+   *
+   * test/caption-preview.test.js pins the resulting per-character duration
+   * against buildAssFile's own literal `\k` output, the same role the
+   * FADE_SEC/POP_SEC/SLIDE_SEC pin test plays just above.
+   *
+   * Each character of the REAL text (the `visible` count above is only ever
+   * used as the divisor, never as what gets returned) is "spoken" once
+   * elapsed local time reaches its own index times that per-character
+   * duration — index 0 is always already spoken the instant the caption
+   * becomes active, the same "lit from its own start onward" convention
+   * karaokeWordStates uses for a caption's first real word.
+   *
+   * Returns null for a caption with no `text` at all (nothing to spell
+   * out), and an empty array for one whose text is the empty string — the
+   * same null-vs-[] distinction karaokeWordStates draws for `words`.
+   */
+  function charSplitKaraokeStates(caption, t) {
+    if (!caption || typeof caption.text !== 'string') return null;
+    const dur = Math.max(0.1, (caption.end ?? 0) - (caption.start ?? 0));
+    const visible = caption.text.replace(/\n/g, '\\N').length;
+    const csPerChar = Math.round((dur * 100) / Math.max(1, visible));
+    const secPerChar = csPerChar / 100;
+    const elapsed = t - caption.start;
+    return caption.text.split('').map((ch, i) => ({
+      char: ch,
+      spoken: elapsed >= i * secPerChar
+    }));
   }
 
   /**
@@ -142,7 +189,7 @@
 
   root.CaptionPreview = {
     FADE_SEC, POP_SEC, SLIDE_SEC,
-    activeCaptionAt, animationState, karaokeWordStates, scaledPx
+    activeCaptionAt, animationState, karaokeWordStates, charSplitKaraokeStates, scaledPx
   };
 
   if (typeof module !== 'undefined') {

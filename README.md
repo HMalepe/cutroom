@@ -956,22 +956,33 @@ position-dependent quirk exactly would need testing against a real libass
 render this repository's harness cannot run (no ffmpeg here) — so this
 approximates "slides up into wherever it already sits" instead.
 
-**Typewriter/karaoke** is attempted only for a caption that carries real
-per-word timing (`cap.words`, from a transcription — see "Word-level
-captions and karaoke", below). `karaokeWordStates` marks a word "spoken"
-from `t >= word.start` onward, matching the real `\k` tag's own trigger
-instant (a hard, non-reverting switch from `SecondaryColour` to
-`PrimaryColour`, not a gradual sweep) rather than the later point its own
-`\k` duration ends — the overlay renders one `<span>` per word, coloured
-accordingly. A caption with no `words` — hand-typed, imported, or a
-transcribed row whose text or timing was hand-edited afterward (`app.js`'s
-`renderCaptions` drops `words` the moment a row is touched) — shows plain,
-static text instead. `buildAssFile` still animates that case for real, with
-an old even-split-by-character `\k` estimate; reproducing that formula's own
-timing here was judged not worth it for what this overlay is for, and cut
-loudly rather than silently, the same discipline the crossfade dissolve's
-own scope cut already modeled: a stated, documented gap rather than an
-attempt at a second approximation of an approximation.
+**Typewriter/karaoke** has two paths, matching `buildAssFile`'s own two
+paths through the same animation. For a caption that carries real per-word
+timing (`cap.words`, from a transcription — see "Word-level captions and
+karaoke", below), `karaokeWordStates` marks a word "spoken" from
+`t >= word.start` onward, matching the real `\k` tag's own trigger instant
+(a hard, non-reverting switch from `SecondaryColour` to `PrimaryColour`, not
+a gradual sweep) rather than the later point its own `\k` duration ends —
+the overlay renders one `<span>` per word, coloured accordingly.
+
+A caption with no `words` — hand-typed, imported, or a transcribed row whose
+text or timing was hand-edited afterward (`app.js`'s `renderCaptions` drops
+`words` the moment a row is touched) — falls back to `buildAssFile`'s own
+fallback: an old even-split-by-character `\k` estimate, one tag covering the
+whole line with a duration of `dur / characterCount`. `caption-preview.js`'s
+`charSplitKaraokeStates` recomputes that exact formula — `dur =
+max(0.1, caption.end - caption.start)`, divided by the caption's own text
+length counted the same quirky way `buildAssFile` counts it (a `\n` as the
+two characters `\N` becomes in the ASS file, not one) — rather than
+importing it, the same `shared/`-is-main-process-only reason
+`FADE_SEC`/`POP_SEC`/`SLIDE_SEC` are a hand-kept duplicate rather than an
+import a few paragraphs up. Each real character is "spoken" once local
+elapsed time reaches its own index times that per-character duration, and
+the overlay renders one `<span>` per character on the same coloured-spans
+path the word case uses. `test/caption-preview.test.js` pins the derived
+per-character duration against `buildAssFile`'s own literal `\k` output, the
+same role the `FADE_SEC`/`POP_SEC`/`SLIDE_SEC` pin test plays for the entry
+animations, so the two cannot silently drift apart.
 
 **The no-WebGL fallback does not show captions either**, and for a
 different reason than the clock/trim-loop gap it already declines to close:
@@ -986,9 +997,11 @@ path exactly as small and already-understood as it was before this feature
 existed.
 
 **What is and is not verified.** `test/caption-preview.test.js` covers
-`activeCaptionAt`, `animationState`, `karaokeWordStates` and `scaledPx` as
-pure functions, mutation-tested by hand against the code they cover, plus a
-pin against `buildAssFile`'s real output for the three animation timings.
+`activeCaptionAt`, `animationState`, `karaokeWordStates`,
+`charSplitKaraokeStates` and `scaledPx` as pure functions, mutation-tested by
+hand against the code they cover, plus a pin against `buildAssFile`'s real
+output for the three entry-animation timings and for the typewriter's
+per-word and per-character `\k` values alike.
 `test/caption-overlay.test.js` drives the real `app.js` in jsdom — through
 the UI exactly the way a person would use it (the ruler, the caption row's
 own inputs, the style panel's own fields), never reaching into app.js's
@@ -996,8 +1009,9 @@ private `state` — to prove the *wiring*: the right caption shows across
 start/end boundaries and a gap between two rows, `captionsEnabled` and an
 empty caption list both show nothing, style-panel and caption-row edits
 reach the overlay without an extra trigger, the background box toggles a
-real `background-color`, and typewriter renders spoken/unspoken spans (or
-plain text without word timing). jsdom's DOM does support real CSS text
+real `background-color`, and typewriter renders spoken/unspoken spans either
+way — one per word with real per-word timing, one per character without it.
+jsdom's DOM does support real CSS text
 properties — `color`, `background-color`, class names, inline style
 strings — unlike its faked `<canvas>`, so those assertions mean what they
 say. What they do not prove: jsdom has no layout engine at all, so
@@ -1019,19 +1033,19 @@ the real playhead clock, driven by a real pointerdown on the ruler with the
 click's x computed against `#tlInner`'s own measured position rather than
 assumed to start at the browser window's left edge; that switching
 `position` between `top` and `bottom` moves the rendered box on real screen
-coordinates; that a caption with no per-word timing renders as plain static
-text with zero `<span>` children rather than an approximated `\k` sweep;
-and that the no-WebGL fallback suppresses the overlay even with an active
-caption, checked by patching `HTMLCanvasElement.prototype.getContext` on
-the page's own `BrowserContext` before the window's first navigation, since
-`keyerFor`'s per-pool-entry caching makes a patch applied after the app's
-first (real) WebGL attempt a silent no-op. This lives as a permanent,
-checked-in file precisely because that timing quirk — and the
-`--enable-unsafe-swiftshader` flag itself — are exactly the kind of thing a
-manual pre-PR check re-derives correctly once and then forgets; running it
-on every change is what a future change to this overlay gets re-proven
-against, rather than a re-verification someone has to remember to redo by
-hand.
+coordinates; that a caption with no per-word timing sweeps by real
+per-character `<span>`s (`charSplitKaraokeStates`, above) rather than
+showing static text; and that the no-WebGL fallback suppresses the overlay
+even with an active caption, checked by patching
+`HTMLCanvasElement.prototype.getContext` on the page's own `BrowserContext`
+before the window's first navigation, since `keyerFor`'s per-pool-entry
+caching makes a patch applied after the app's first (real) WebGL attempt a
+silent no-op. This lives as a permanent, checked-in file precisely because
+that timing quirk — and the `--enable-unsafe-swiftshader` flag itself — are
+exactly the kind of thing a manual pre-PR check re-derives correctly once
+and then forgets; running it on every change is what a future change to
+this overlay gets re-proven against, rather than a re-verification someone
+has to remember to redo by hand.
 
 ### Track counts are not fixed at their starting numbers
 
@@ -1230,14 +1244,11 @@ screen and not just in the string the builder produced.
 
 ## Extending it
 
-Reasonable next moves, roughly by effort:
-
-- **The no-word-timing typewriter fallback.** `buildAssFile` still animates
-  a caption with no per-word timestamps, with an old even-split-by-character
-  `\k` estimate; the preview overlay shows that case as plain static text
-  instead of attempting to reproduce that formula's own sweep — a stated,
-  deliberate gap (see "Captions in the preview"), and a candidate to close
-  if it turns out to matter in practice.
+Nothing is currently on this list — every gap named here as this project
+went along (a second audio track, captions in the preview, the caption
+overlay's real-browser proof, its no-word-timing typewriter fallback) has
+been closed. The next reasonable move is whatever the next real gap turns
+out to be, not a bullet kept around for its own sake.
 
 ## Licence
 
